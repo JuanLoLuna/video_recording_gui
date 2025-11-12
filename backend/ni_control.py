@@ -42,17 +42,30 @@ if sys.platform.startswith("win"):
         def stop(self):
             if not self._started:
                 return
-            with self._lock:
-                try:
-                    self.set_low() if self.cfg.idle_low else self.set_high()
-                except Exception:
-                    pass
-                try:
-                    self._task.close()
-                except Exception:
-                    pass
-            self._task = None
+
+            # snapshot & mark stopped early (prevents set_* usage elsewhere)
+            t = self._task
             self._started = False
+            self._task = None
+
+            if t is None:
+                return
+
+            try:
+                with self._lock:
+                    # set known idle state without calling set_high/low (avoids re-entrancy)
+                    idle_val = False if self.cfg.idle_low else True
+                    try:
+                        t.write(idle_val, auto_start=True)
+                    except Exception:
+                        pass
+                    try:
+                        t.close()
+                    except Exception:
+                        pass
+            except Exception:
+                # swallow everything on shutdown
+                pass
 
         def set_high(self):
             with self._lock:
