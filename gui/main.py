@@ -142,7 +142,7 @@ class MainWindow(QWidget):
                 return
 
             # This controls PREVIEW fps, not camera fps.
-            # 33 ms ~ 30 fps, 16 ms ~ 60 fps.
+            # 33 ms ~ 30 fps, 16 ms ~ 60 fps, 8 ms ~ 90 fps.
             self.timer.start(8)
             self.preview_running = True
             self.preview_button.setText("Stop Preview")
