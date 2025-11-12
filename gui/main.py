@@ -13,6 +13,7 @@ from enum import Enum, auto
 from datetime import datetime
 
 from backend.camera_control import detect_first_camera, CameraController
+from backend.ni_control import NIDaqDO, DOLine
 
 class AppState(Enum):
     IDLE = auto()
@@ -63,6 +64,22 @@ class MainWindow(QWidget):
         self.detect_button = QPushButton("Detect camera")
         self.detect_button.clicked.connect(self.on_detect_clicked)
         layout.addWidget(self.detect_button)
+
+        # --- Sync / NI-DAQ status ---
+        self.sync_label = QLabel("Sync not available — no DAQ connected")
+        layout.addWidget(self.sync_label)
+
+        self.connect_daq_button = QPushButton("Connect DAQ")
+        self.connect_daq_button.clicked.connect(self.on_connect_daq_clicked)
+        layout.addWidget(self.connect_daq_button)
+
+        # Disable the button on non-Windows
+        if not sys.platform.startswith("win"):
+            self.connect_daq_button.setEnabled(False)
+            self.sync_label.setText("Sync not available on this OS")
+
+        # Handle to the DAQ controller (set on connect)
+        self.daq = None
 
         # --- Image preview label ---
         self.image_label = QLabel("No video")
@@ -133,6 +150,20 @@ class MainWindow(QWidget):
             self.state = AppState.IDLE
 
         self._apply_state()
+
+    def on_connect_daq_clicked(self):
+        """Connect to NI-DAQ and update UI."""
+        try:
+            cfg = DOLine(line="Dev1/port0/line0", idle_low=True)
+            self.daq = NIDaqDO(cfg)
+            self.daq.start()
+            # Success → update UI and disable button
+            self.sync_label.setText("Sync available — DAQ connected")
+            self.connect_daq_button.setEnabled(False)
+        except Exception as e:
+            # Keep it silent in UI per your preference; show brief text
+            self.sync_label.setText(f"Sync not available — {e.__class__.__name__}")
+            self.daq = None
 
     def on_preview_clicked(self):
         if not self.preview_running:
