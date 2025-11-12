@@ -35,8 +35,9 @@ if sys.platform.startswith("win"):
                 self.cfg.line,
                 line_grouping=LineGrouping.CHAN_PER_LINE,
             )
-            self.set_low() if self.cfg.idle_low else self.set_high()
             self._started = True
+            # Set the port to a known state
+            self.set_low() if self.cfg.idle_low else self.set_high()
 
         def stop(self):
             if not self._started:
