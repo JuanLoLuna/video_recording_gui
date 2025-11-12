@@ -68,12 +68,22 @@ if sys.platform.startswith("win"):
                 pass
 
         def set_high(self):
+            if not self._started or self._task is None:
+                return
             with self._lock:
-                self._task.write(True, auto_start=True)
+                t = self._task
+                if t is None:
+                    return
+                t.write(True, auto_start=True)
 
         def set_low(self):
+            if not self._started or self._task is None:
+                return
             with self._lock:
-                self._task.write(False, auto_start=True)
+                t = self._task
+                if t is None:
+                    return
+                t.write(False, auto_start=True)
 
 else:
     # --- Stub version for macOS/Linux ---
