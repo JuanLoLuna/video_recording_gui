@@ -1,3 +1,4 @@
+import atexit
 import sys
 import cv2
 from PySide6.QtWidgets import (
@@ -249,16 +250,41 @@ class MainWindow(QWidget):
         ))
 
     def closeEvent(self, event):
-        if self.state == AppState.RECORDING:
-            self.camera.stop_recording()
-        if self.preview_running:
-            self.timer.stop()
-        self.camera.stop()
+        """Ensure all hardware and timers are properly stopped."""
+        try:
+            if self.state == AppState.RECORDING:
+                self.camera.stop_recording()
+            if self.preview_running:
+                self.timer.stop()
+            self.camera.stop()
+        except Exception as e:
+            print(f"Error during camera cleanup: {e}")
+
+        # --- Stop DAQ cleanly ---
+        try:
+            if self.daq is not None:
+                self.daq.stop()
+                print("DAQ disconnected cleanly.")
+        except Exception as e:
+            print(f"Error stopping DAQ: {e}")
+
         super().closeEvent(event)
 
 def main():
     app = QApplication(sys.argv)
     window = MainWindow()
+
+    # Register cleanup on crash or normal exit
+    def _cleanup_on_exit():
+        try:
+            if getattr(window, "daq", None) is not None:
+                window.daq.stop()
+                print("DAQ disconnected (atexit).")
+        except Exception as e:
+            print("Error during DAQ atexit cleanup:", e)
+
+    atexit.register(_cleanup_on_exit)
+
     window.show()
     sys.exit(app.exec())
 
