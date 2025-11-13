@@ -174,11 +174,25 @@ class MainWindow(QWidget):
             # Success → update UI and disable button
             self.sync_label.setText("Sync available — DAQ connected")
             self.connect_daq_button.setEnabled(False)
+            self.test_pulse_button.setEnabled(True)
+
         except Exception as e:
             # Keep it silent in UI per your preference; show brief text
             self.sync_label.setText(f"Sync not available — {e.__class__.__name__}")
             self.daq = None
             self.pulse_manager = None
+            self.test_pulse_button.setEnabled(False)
+
+    def on_test_pulse_clicked(self):
+        """Send a single TTL pulse through PulseManager."""
+        try:
+            if self.pulse_manager is not None:
+                self.pulse_manager.request_pulse()
+                self.sync_label.setText("Test pulse sent!")
+            else:
+                self.sync_label.setText("DAQ not connected.")
+        except Exception as e:
+            self.sync_label.setText(f"Pulse failed: {e}")
 
     def on_preview_clicked(self):
         if not self.preview_running:
