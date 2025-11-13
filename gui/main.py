@@ -220,7 +220,7 @@ class MainWindow(QWidget):
 
         # Map count -> pulse width
         width = SYNC_WIDTH_RECORD * (self.manual_sync_count + 1)
-        label = f"manual_sync_{self.manual_sync_count * SYNC_WIDTH_RECORD * 1000}_ms"
+        label = f"manual_sync_{width * 1000:.0f}_ms"
 
         try:
             # hardware pulse
