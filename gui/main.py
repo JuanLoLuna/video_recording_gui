@@ -15,6 +15,7 @@ from datetime import datetime
 
 from backend.camera_control import detect_first_camera, CameraController
 from backend.ni_control import NIDaqDO, DOLine
+from backend.pulse_manager import PulseManager
 
 class AppState(Enum):
     IDLE = auto()
@@ -79,8 +80,15 @@ class MainWindow(QWidget):
             self.connect_daq_button.setEnabled(False)
             self.sync_label.setText("Sync not available on this OS")
 
+        # --- TEMPORARY: Test Pulse button ---
+        self.test_pulse_button = QPushButton("Send Test Pulse")
+        self.test_pulse_button.setEnabled(False)  # disabled until DAQ connected
+        self.test_pulse_button.clicked.connect(self.on_test_pulse_clicked)
+        layout.addWidget(self.test_pulse_button)
+
         # Handle to the DAQ controller (set on connect)
         self.daq = None
+        self.pulse_manager = None
 
         # --- Image preview label ---
         self.image_label = QLabel("No video")
@@ -158,6 +166,11 @@ class MainWindow(QWidget):
             cfg = DOLine(line="Dev1/port0/line0", idle_low=True)
             self.daq = NIDaqDO(cfg)
             self.daq.start()
+
+            # Start PulseManager on top of the DAQ
+            self.pulse_manager = PulseManager(daq=self.daq, default_width_s=0.010)
+            self.pulse_manager.start()
+
             # Success → update UI and disable button
             self.sync_label.setText("Sync available — DAQ connected")
             self.connect_daq_button.setEnabled(False)
@@ -165,6 +178,7 @@ class MainWindow(QWidget):
             # Keep it silent in UI per your preference; show brief text
             self.sync_label.setText(f"Sync not available — {e.__class__.__name__}")
             self.daq = None
+            self.pulse_manager = None
 
     def on_preview_clicked(self):
         if not self.preview_running:
@@ -251,22 +265,37 @@ class MainWindow(QWidget):
 
     def closeEvent(self, event):
         """Ensure all hardware and timers are properly stopped."""
+        # Stop recording/preview/camera first
         try:
             if self.state == AppState.RECORDING:
                 self.camera.stop_recording()
+        except Exception as e:
+            print("Error stopping recording on close:", e)
+        try:
             if self.preview_running:
                 self.timer.stop()
+        except Exception as e:
+            print("Error stopping timer on close:", e)
+        try:
             self.camera.stop()
         except Exception as e:
-            print(f"Error during camera cleanup: {e}")
+            print("Error stopping camera on close:", e)
 
-        # --- Stop DAQ cleanly ---
+        # Then stop PulseManager (which also stops DAQ)
+        try:
+            if self.pulse_manager is not None:
+                self.pulse_manager.stop()
+                self.pulse_manager = None
+        except Exception as e:
+            print("Error stopping PulseManager on close:", e)
+
+        # If for some reason PulseManager was never started but DAQ was:
         try:
             if self.daq is not None:
                 self.daq.stop()
-                print("DAQ disconnected cleanly.")
+                self.daq = None
         except Exception as e:
-            print(f"Error stopping DAQ: {e}")
+            print("Error stopping DAQ on close:", e)
 
         super().closeEvent(event)
 
