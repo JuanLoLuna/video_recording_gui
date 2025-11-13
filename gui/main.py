@@ -122,7 +122,7 @@ class MainWindow(QWidget):
         self._apply_state()
 
         # count manual sync pulses during a run
-        self.manual_sync_count = 1
+        self.manual_sync_count = 0
 
     def _apply_state(self):
         if self.state == AppState.IDLE:
@@ -290,7 +290,7 @@ class MainWindow(QWidget):
                     label="record_start",
                 )
 
-                self.manual_sync_count = 1  # reset manual counter
+                self.manual_sync_count = 0  # reset manual counter
 
                 self.state = AppState.RECORDING
                 self._apply_state()
