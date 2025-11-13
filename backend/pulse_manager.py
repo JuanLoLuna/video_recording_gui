@@ -13,7 +13,7 @@ from backend.ni_control import NIDaqDO, DOLine
 @dataclass
 class PulseRequest:
     width_s: float
-    label: Optional[str] = None  # optional tag, e.g. "record_start" / "manual_sync"
+    label: Optional[str] = None
 
 
 class PulseManager:
@@ -22,11 +22,9 @@ class PulseManager:
 
     - Non-blocking API:
         request_pulse(width_s=..., label="...")
-
     - Uses NIDaqDO for the actual hardware.
     - Keeps track of whether a pulse is currently active (is_pulse_active).
     """
-
     def __init__(self, daq: Optional[NIDaqDO] = None, default_width_s: float = 0.005):
         """
         Args:
