@@ -131,6 +131,14 @@ class CameraController:
             continuous_entry = acq_mode.GetEntryByName("Continuous")
             acq_mode.SetIntValue(continuous_entry.GetValue())
 
+            # Set acquisition frame rate
+            frame_rate_enable = PySpin.CBooleanPtr(nodemap.GetNode("AcquisitionFrameRateEnable"))
+            if PySpin.IsWritable(frame_rate_enable):
+                frame_rate_enable.SetValue(True)
+            frame_rate = PySpin.CFloatPtr(nodemap.GetNode("AcquisitionFrameRate"))
+            if PySpin.IsWritable(frame_rate):
+                frame_rate.SetValue(30.0)  # target 30 fps
+
             self.cam.BeginAcquisition()
             self.acquiring = True
             self._stop_event.clear()
