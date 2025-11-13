@@ -122,7 +122,7 @@ class MainWindow(QWidget):
         self._apply_state()
 
         # count manual sync pulses during a run
-        self.manual_sync_count = 0
+        self.manual_sync_count = 1
 
     def _apply_state(self):
         if self.state == AppState.IDLE:
@@ -193,17 +193,34 @@ class MainWindow(QWidget):
             self.sync_button.setEnabled(False)
 
     def on_sync_pulse_clicked(self):
-        """Send a sync pulse and mark its window in the metadata."""
+        """Send a sync pulse.
+
+        - If recording: send a sync pulse AND mark its window in the metadata.
+        - If NOT recording: send a simple test pulse only (no logging).
+        """
+        # If NOT recording, just send a test pulse (no logging window)
         if self.state != AppState.RECORDING:
-            self.sync_label.setText("Sync only valid while recording.")
+            if self.pulse_manager is not None and sys.platform.startswith("win"):
+                try:
+                    # Use a short test pulse
+                    self.pulse_manager.request_pulse(
+                        width_s=SYNC_WIDTH_RECORD,
+                        label="test_pulse",
+                    )
+                    self.sync_label.setText("Test pulse sent (no logging, not recording).")
+                except Exception as e:
+                    self.sync_label.setText(f"Test pulse failed: {e}")
+            else:
+                self.sync_label.setText("DAQ not connected.")
             return
 
-        # increment which manual sync this is
+        # === Recording case: send sync pulse and mark window ===
+        # Increment which manual sync this is
         self.manual_sync_count += 1
 
-        # map count -> pulse width
-        width = 0.100 * (self.manual_sync_count + 1)
-        label = f"manual_sync_{self.manual_sync_count}"
+        # Map count -> pulse width
+        width = SYNC_WIDTH_RECORD * (self.manual_sync_count + 1)
+        label = f"manual_sync_{self.manual_sync_count * SYNC_WIDTH_RECORD * 1000}_ms"
 
         try:
             # hardware pulse
@@ -273,7 +290,7 @@ class MainWindow(QWidget):
                     label="record_start",
                 )
 
-                self.manual_sync_count = 0  # reset manual counter
+                self.manual_sync_count = 1  # reset manual counter
 
                 self.state = AppState.RECORDING
                 self._apply_state()
