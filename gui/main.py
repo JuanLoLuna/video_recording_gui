@@ -5,6 +5,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QWidget,
     QVBoxLayout,
+    QHBoxLayout,
     QPushButton,
     QLabel,
 )
@@ -80,12 +81,6 @@ class MainWindow(QWidget):
             self.connect_daq_button.setEnabled(False)
             self.sync_label.setText("Sync not available on this OS")
 
-        # --- TEMPORARY: Test Pulse button ---
-        self.test_pulse_button = QPushButton("Send Test Pulse")
-        self.test_pulse_button.setEnabled(False)  # disabled until DAQ connected
-        self.test_pulse_button.clicked.connect(self.on_test_pulse_clicked)
-        layout.addWidget(self.test_pulse_button)
-
         # Handle to the DAQ controller (set on connect)
         self.daq = None
         self.pulse_manager = None
@@ -96,15 +91,24 @@ class MainWindow(QWidget):
         self.image_label.setFixedSize(640, 480)
         layout.addWidget(self.image_label)
 
-        # --- Preview button ---
+        # --- Controls row: Preview / Record / Sync ---
         self.preview_button = QPushButton("Start Preview")
         self.preview_button.clicked.connect(self.on_preview_clicked)
-        layout.addWidget(self.preview_button)
 
-        # --- Record button ---
         self.record_button = QPushButton("Start Recording")
         self.record_button.clicked.connect(self.on_record_clicked)
-        layout.addWidget(self.record_button)
+
+        # Sync pulse button (formerly "test pulse")
+        self.sync_button = QPushButton("Sync Pulse")
+        self.sync_button.setEnabled(False)  # enabled after DAQ connects
+        self.sync_button.clicked.connect(self.on_sync_pulse_clicked)
+
+        controls_row = QHBoxLayout()
+        controls_row.addWidget(self.preview_button)
+        controls_row.addWidget(self.record_button)
+        controls_row.addWidget(self.sync_button)
+
+        layout.addLayout(controls_row)
 
         # --- Camera controller + timer ---
         self.camera = CameraController()
@@ -174,21 +178,21 @@ class MainWindow(QWidget):
             # Success → update UI and disable button
             self.sync_label.setText("Sync available — DAQ connected")
             self.connect_daq_button.setEnabled(False)
-            self.test_pulse_button.setEnabled(True)
+            self.sync_button.setEnabled(True)
 
         except Exception as e:
             # Keep it silent in UI per your preference; show brief text
             self.sync_label.setText(f"Sync not available — {e.__class__.__name__}")
             self.daq = None
             self.pulse_manager = None
-            self.test_pulse_button.setEnabled(False)
+            self.sync_button.setEnabled(False)
 
-    def on_test_pulse_clicked(self):
-        """Send a single TTL pulse through PulseManager."""
+    def on_sync_pulse_clicked(self):
+        """Send a single TTL sync pulse through PulseManager."""
         try:
             if self.pulse_manager is not None:
-                self.pulse_manager.request_pulse()
-                self.sync_label.setText("Test pulse sent!")
+                self.pulse_manager.request_pulse(label="manual_sync")
+                self.sync_label.setText("Sync pulse sent!")
             else:
                 self.sync_label.setText("DAQ not connected.")
         except Exception as e:
