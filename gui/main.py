@@ -18,6 +18,8 @@ from backend.camera_control import detect_first_camera, CameraController
 from backend.ni_control import NIDaqDO, DOLine
 from backend.pulse_manager import PulseManager
 
+SYNC_WIDTH_RECORD = 0.100  # 100 ms
+
 class AppState(Enum):
     IDLE = auto()
     CAMERA_DETECTED = auto()
@@ -119,6 +121,9 @@ class MainWindow(QWidget):
         self.state = AppState.IDLE
         self._apply_state()
 
+        # count manual sync pulses during a run
+        self.manual_sync_count = 0
+
     def _apply_state(self):
         if self.state == AppState.IDLE:
             self.detect_button.setEnabled(True)
@@ -188,13 +193,27 @@ class MainWindow(QWidget):
             self.sync_button.setEnabled(False)
 
     def on_sync_pulse_clicked(self):
-        """Send a single TTL sync pulse through PulseManager."""
+        """Send a sync pulse and mark its window in the metadata."""
+        if self.state != AppState.RECORDING:
+            self.sync_label.setText("Sync only valid while recording.")
+            return
+
+        # increment which manual sync this is
+        self.manual_sync_count += 1
+
+        # map count -> pulse width
+        width = 0.100 * (self.manual_sync_count + 1)
+        label = f"manual_sync_{self.manual_sync_count}"
+
         try:
-            if self.pulse_manager is not None:
-                self.pulse_manager.request_pulse(label="manual_sync")
-                self.sync_label.setText("Sync pulse sent!")
-            else:
-                self.sync_label.setText("DAQ not connected.")
+            # hardware pulse
+            if self.pulse_manager is not None and sys.platform.startswith("win"):
+                self.pulse_manager.request_pulse(width_s=width, label=label)
+
+            # logging window
+            self.camera.notify_sync_pulse_window(width_s=width, label=label)
+
+            self.sync_label.setText(f"Sync pulse sent ({label}, {width * 1000:.0f} ms).")
         except Exception as e:
             self.sync_label.setText(f"Pulse failed: {e}")
 
@@ -238,6 +257,24 @@ class MainWindow(QWidget):
             self.status_label.setText(msg)
 
             if ok:
+                # 1) fire a 100 ms hardware pulse
+                if self.pulse_manager is not None and sys.platform.startswith("win"):
+                    try:
+                        self.pulse_manager.request_pulse(
+                            width_s=SYNC_WIDTH_RECORD,
+                            label="record_start",
+                        )
+                    except Exception as e:
+                        print("Record-start pulse failed:", e)
+
+                # 2) tell the camera to mark frames in this window
+                self.camera.notify_sync_pulse_window(
+                    width_s=SYNC_WIDTH_RECORD,
+                    label="record_start",
+                )
+
+                self.manual_sync_count = 0  # reset manual counter
+
                 self.state = AppState.RECORDING
                 self._apply_state()
 

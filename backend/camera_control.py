@@ -94,6 +94,11 @@ class CameraController:
         self.metadata_records = []
         self.frame_counter = 0
 
+        # --- Sync marker state (for CSV logging) ---
+        self._sync_lock = threading.Lock()
+        self._sync_window_end = 0.0  # wall-clock time until which sync_pulse=True
+        self._sync_label = None  # label for the current sync window
+
     # ------------------------------------------------------------------
     # Camera start/stop
     # ------------------------------------------------------------------
@@ -322,7 +327,14 @@ class CameraController:
                 # Write metadata CSV (simple csv module, no pandas)
                 if self.record_filename and self.metadata_records:
                     csv_path = self.record_filename.rsplit(".", 1)[0] + "_metadata.csv"
-                    fieldnames = ["record_frame_index", "camera_frame_id", "timestamp_us", "system_time"]
+                    fieldnames = [
+                        "record_frame_index",
+                        "camera_frame_id",
+                        "timestamp_us",
+                        "system_time",
+                        "sync_pulse",
+                        "sync_label",
+                    ]
 
                     try:
                         with open(csv_path, "w", newline="") as f:
@@ -344,6 +356,8 @@ class CameraController:
                                         else int(rec.get("timestamp_us"))
                                     ),
                                     "system_time": float(rec.get("system_time", 0.0)),
+                                    "sync_pulse": bool(rec.get("sync_pulse", False)),
+                                    "sync_label": "" if rec.get("sync_label") is None else str(rec.get("sync_label")),
                                 }
                                 writer.writerow(row)
                     except Exception as exc:
@@ -372,6 +386,12 @@ class CameraController:
             # If recording, append frame + log metadata
             # --------------------------------------------------
             if self.recording_active and self.avi_recorder is not None:
+                # Determine if this frame is within a sync window
+                now = time.time()
+                with self._sync_lock:
+                    sync_this_frame = now <= self._sync_window_end
+                    sync_label = self._sync_label if sync_this_frame else None
+
                 # Increment only for recorded frames
                 self.frame_counter += 1
                 try:
@@ -405,6 +425,8 @@ class CameraController:
                         "camera_frame_id": int(frame_id) if frame_id is not None else None,
                         "timestamp_us": int(timestamp_us) if timestamp_us is not None else None,
                         "system_time": float(time.time()),
+                        "sync_pulse": bool(sync_this_frame),
+                        "sync_label": sync_label,
                     }
                 )
 
@@ -434,3 +456,20 @@ class CameraController:
             if self._latest_frame is None:
                 return None
             return self._latest_frame.copy()
+
+    # ------------------------------------------------------------------
+    # Sync pulse logic for logging
+    # ------------------------------------------------------------------
+    def notify_sync_pulse_window(self, width_s: float, label: str):
+        """
+        Notify that a sync pulse is active for the next `width_s` seconds.
+        Any recorded frame whose system_time is <= this window end
+        will be logged with sync_pulse=True and this label.
+        """
+        now = time.time()
+        end_time = now + float(width_s)
+
+        with self._sync_lock:
+            # extend window if overlapping pulses
+            self._sync_window_end = max(self._sync_window_end, end_time)
+            self._sync_label = label
