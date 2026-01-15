@@ -284,11 +284,13 @@ class MainWindow(QWidget):
                     except Exception as e:
                         print("Record-start pulse failed:", e)
 
-                # 2) tell the camera to mark frames in this window
-                self.camera.notify_sync_pulse_window(
-                    width_s=SYNC_WIDTH_RECORD,
-                    label="record_start",
-                )
+                # 2) tell the camera to mark frames in this window only
+                # if we actually sent a hardware pulse
+                if self.pulse_manager is not None and sys.platform.startswith("win"):
+                    self.camera.notify_sync_pulse_window(
+                        width_s=SYNC_WIDTH_RECORD,
+                        label="record_start",
+                    )
 
                 self.manual_sync_count = 0  # reset manual counter
 
