@@ -296,9 +296,9 @@ class MainWindow(QWidget):
     def on_record_clicked(self):
         # Start recording
         if self.state == AppState.PREVIEWING:
-            # Simple auto filename: recording_YYYYmmdd_HHMMSS.avi
+            # SpinVideo adds its own suffix; avoid a double ".avi"
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"recording_{timestamp}.avi"
+            filename = f"recording_{timestamp}"
 
             ok, msg = self.camera.start_recording(filename, fps=30.0)
             self.status_label.setText(msg)
