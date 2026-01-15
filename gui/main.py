@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QPushButton,
     QLabel,
+    QComboBox,
 )
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QImage, QPixmap
@@ -19,6 +20,25 @@ from backend.ni_control import NIDaqDO, DOLine
 from backend.pulse_manager import PulseManager
 
 SYNC_WIDTH_RECORD = 0.100  # 100 ms
+
+ADL_OPTIONS = [
+    (1, "Pick up coins from purses"),
+    (2, "Pick up wooden blocks"),
+    (3, "Pick up nuts and put in bolts"),
+    (4, "Unscrew lid of jars"),
+    (5, "Cut play-doh"),
+    (6, "Writing"),
+    (7, "Pick up telephone and put in ear"),
+    (8, "Pour water from pure pack"),
+    (9, "Pour water from jug"),
+    (10, "Pour water from cup"),
+    (11, "Typing on smartphone"),
+    (12, "Scrolling on smartphone"),
+    (13, "Typing on keyboard"),
+    (14, "Start sensors recording"),
+    (15, "Dynamometer hand grip baseline"),
+    (16, "Dynamometer hand grip active"),
+]
 
 class AppState(Enum):
     IDLE = auto()
@@ -60,6 +80,7 @@ class MainWindow(QWidget):
         super().__init__()
 
         self.setWindowTitle("Camera Preview")
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         layout = QVBoxLayout(self)
 
@@ -111,6 +132,15 @@ class MainWindow(QWidget):
         controls_row.addWidget(self.sync_button)
 
         layout.addLayout(controls_row)
+
+        # --- ADL dropdown (bottom of GUI) ---
+        adl_row = QHBoxLayout()
+        self.adl_dropdown = QComboBox()
+        self.adl_dropdown.addItem("Select ADL...", None)
+        for adl_id, adl_label in ADL_OPTIONS:
+            self.adl_dropdown.addItem(adl_label, adl_id)
+        adl_row.addWidget(self.adl_dropdown)
+        layout.addLayout(adl_row)
 
         # --- Camera controller + timer ---
         self.camera = CameraController()
@@ -336,6 +366,26 @@ class MainWindow(QWidget):
             self.image_label.size(), Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation
         ))
+
+    def keyPressEvent(self, event):
+        if event.isAutoRepeat():
+            return
+        if self.state != AppState.RECORDING:
+            return
+
+        if event.key() == Qt.Key.Key_S:
+            label_event = "label_start"
+        elif event.key() == Qt.Key.Key_E:
+            label_event = "label_end"
+        else:
+            return
+
+        adl_id = self.adl_dropdown.currentData()
+        adl_label = self.adl_dropdown.currentText() if adl_id is not None else None
+        self.camera.notify_label_event(label_event, adl_id, adl_label)
+        self.status_label.setText(
+            f"Logged {label_event} ({adl_label if adl_label else 'no ADL selected'})."
+        )
 
     def closeEvent(self, event):
         """Ensure all hardware and timers are properly stopped."""

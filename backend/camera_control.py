@@ -98,6 +98,11 @@ class CameraController:
         self._sync_lock = threading.Lock()
         self._sync_window_end = 0.0  # wall-clock time until which sync_pulse=True
         self._sync_label = None  # label for the current sync window
+        # --- Label event state (for CSV logging) ---
+        self._label_lock = threading.Lock()
+        self._pending_label_event = None  # "label_start" / "label_end"
+        self._pending_adl_id = None
+        self._pending_adl_label = None
 
     # ------------------------------------------------------------------
     # Camera start/stop
@@ -342,6 +347,8 @@ class CameraController:
                         "system_time",
                         "sync_pulse",
                         "sync_label",
+                        "adl_id",
+                        "adl_label",
                     ]
 
                     try:
@@ -366,6 +373,11 @@ class CameraController:
                                     "system_time": float(rec.get("system_time", 0.0)),
                                     "sync_pulse": bool(rec.get("sync_pulse", False)),
                                     "sync_label": "" if rec.get("sync_label") is None else str(rec.get("sync_label")),
+                                    "adl_id": (
+                                        "" if rec.get("adl_id") is None
+                                        else int(rec.get("adl_id"))
+                                    ),
+                                    "adl_label": "" if rec.get("adl_label") is None else str(rec.get("adl_label")),
                                 }
                                 writer.writerow(row)
                     except Exception as exc:
@@ -399,6 +411,18 @@ class CameraController:
                 with self._sync_lock:
                     sync_this_frame = now <= self._sync_window_end
                     sync_label = self._sync_label if sync_this_frame else None
+                with self._label_lock:
+                    if self._pending_label_event is not None:
+                        label_event = self._pending_label_event
+                        adl_id = self._pending_adl_id
+                        adl_label = self._pending_adl_label
+                        self._pending_label_event = None
+                        self._pending_adl_id = None
+                        self._pending_adl_label = None
+                    else:
+                        label_event = None
+                        adl_id = None
+                        adl_label = None
 
                 # Increment only for recorded frames
                 self.frame_counter += 1
@@ -434,7 +458,9 @@ class CameraController:
                         "timestamp_us": int(timestamp_us) if timestamp_us is not None else None,
                         "system_time": float(time.time()),
                         "sync_pulse": bool(sync_this_frame),
-                        "sync_label": sync_label,
+                        "sync_label": label_event if label_event else sync_label,
+                        "adl_id": adl_id,
+                        "adl_label": adl_label,
                     }
                 )
 
@@ -481,3 +507,13 @@ class CameraController:
             # extend window if overlapping pulses
             self._sync_window_end = max(self._sync_window_end, end_time)
             self._sync_label = label
+
+    def notify_label_event(self, label: str, adl_id, adl_label):
+        """
+        Notify that a label event occurred; it will be attached to the next
+        recorded frame as sync_label plus ADL metadata.
+        """
+        with self._label_lock:
+            self._pending_label_event = label
+            self._pending_adl_id = adl_id
+            self._pending_adl_label = adl_label
