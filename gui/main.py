@@ -1,5 +1,14 @@
 import atexit
 import sys
+from pathlib import Path
+
+# Allow direct script execution via `python gui/main.py` by exposing the repo root.
+if __package__ in (None, ""):
+    repo_root = Path(__file__).resolve().parents[1]
+    repo_root_str = str(repo_root)
+    if repo_root_str not in sys.path:
+        sys.path.insert(0, repo_root_str)
+
 import cv2
 from PySide6.QtWidgets import (
     QApplication,
