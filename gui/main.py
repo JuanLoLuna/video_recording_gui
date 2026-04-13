@@ -25,7 +25,7 @@ from enum import Enum, auto
 from datetime import datetime
 
 from backend.camera_control import detect_first_camera, CameraController
-from backend.ni_control import NIDaqDO, DOLine
+from backend.ni_control import NIDaqDO, DOLine, list_do_lines
 from backend.pulse_manager import PulseManager
 
 SYNC_WIDTH_RECORD = 0.100  # 100 ms
@@ -104,12 +104,26 @@ class MainWindow(QWidget):
         self.sync_label = QLabel("Sync not available — no DAQ connected")
         layout.addWidget(self.sync_label)
 
-        self.connect_daq_button = QPushButton("Connect DAQ")
-        self.connect_daq_button.clicked.connect(self.on_connect_daq_clicked)
-        layout.addWidget(self.connect_daq_button)
+        daq_row = QHBoxLayout()
+        self.daq_line_combo = QComboBox()
+        self.daq_line_combo.addItem("No lines detected", None)
+        self.daq_line_combo.setMinimumWidth(200)
+        daq_row.addWidget(self.daq_line_combo)
 
-        # Disable the button on non-Windows
+        self.scan_daq_button = QPushButton("Scan")
+        self.scan_daq_button.clicked.connect(self.on_scan_daq_clicked)
+        daq_row.addWidget(self.scan_daq_button)
+
+        self.connect_daq_button = QPushButton("Connect")
+        self.connect_daq_button.setEnabled(False)
+        self.connect_daq_button.clicked.connect(self.on_connect_daq_clicked)
+        daq_row.addWidget(self.connect_daq_button)
+
+        layout.addLayout(daq_row)
+
+        # Disable DAQ controls on non-Windows
         if not sys.platform.startswith("win"):
+            self.scan_daq_button.setEnabled(False)
             self.connect_daq_button.setEnabled(False)
             self.sync_label.setText("Sync not available on this OS")
 
@@ -208,25 +222,42 @@ class MainWindow(QWidget):
 
         self._apply_state()
 
+    def on_scan_daq_clicked(self):
+        """Scan for connected NI-DAQ devices and populate the dropdown."""
+        self.daq_line_combo.clear()
+        lines = list_do_lines()
+        if lines:
+            for line in lines:
+                self.daq_line_combo.addItem(line, line)
+            self.connect_daq_button.setEnabled(True)
+            self.sync_label.setText(f"Found {len(lines)} DO line(s) — select one and click Connect")
+        else:
+            self.daq_line_combo.addItem("No lines detected", None)
+            self.connect_daq_button.setEnabled(False)
+            self.sync_label.setText("No NI devices found — check connections and drivers")
+
     def on_connect_daq_clicked(self):
-        """Connect to NI-DAQ and update UI."""
+        """Connect to the selected NI-DAQ line and update UI."""
+        selected_line = self.daq_line_combo.currentData()
+        if selected_line is None:
+            self.sync_label.setText("No DO line selected")
+            return
         try:
-            cfg = DOLine(line="Dev1/port0/line0", idle_low=True)
+            cfg = DOLine(line=selected_line, idle_low=True)
             self.daq = NIDaqDO(cfg)
             self.daq.start()
 
-            # Start PulseManager on top of the DAQ
             self.pulse_manager = PulseManager(daq=self.daq, default_width_s=0.010)
             self.pulse_manager.start()
 
-            # Success → update UI and disable button
-            self.sync_label.setText("Sync available — DAQ connected")
+            self.sync_label.setText(f"Sync available — connected to {selected_line}")
             self.connect_daq_button.setEnabled(False)
+            self.scan_daq_button.setEnabled(False)
+            self.daq_line_combo.setEnabled(False)
             self.sync_button.setEnabled(True)
 
         except Exception as e:
-            # Keep it silent in UI per your preference; show brief text
-            self.sync_label.setText(f"Sync not available — {e.__class__.__name__}")
+            self.sync_label.setText(f"Sync not available — {e.__class__.__name__}: {e}")
             self.daq = None
             self.pulse_manager = None
             self.sync_button.setEnabled(False)

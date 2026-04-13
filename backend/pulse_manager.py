@@ -35,7 +35,9 @@ class PulseManager:
         if self.default_width_s <= 0:
             raise ValueError("default_width_s must be > 0.")
 
-        self.daq = daq or NIDaqDO(DOLine(line="Dev1/port0/line0", idle_low=True))
+        if daq is None:
+            raise ValueError("A configured NIDaqDO instance is required.")
+        self.daq = daq
 
         self._queue: "queue.Queue[PulseRequest]" = queue.Queue()
         self._stop_event = threading.Event()

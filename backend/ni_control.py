@@ -16,6 +16,41 @@ class DOLine:
     idle_low: bool = True
 
 
+def list_do_lines() -> list[str]:
+    """Return all digital-output line names across every connected NI device.
+
+    On non-Windows platforms (no nidaqmx driver) this returns an empty list.
+    Example return value: ["Dev1/port0/line0", "Dev1/port0/line1", "Dev2/port0/line0"]
+    """
+    if not sys.platform.startswith("win"):
+        return []
+    try:
+        import nidaqmx.system
+        system = nidaqmx.system.System.local()
+        lines: list[str] = []
+        for device in system.devices:
+            for line in device.do_lines:
+                lines.append(line.name)
+        return lines
+    except Exception:
+        return []
+
+
+def list_devices() -> list[str]:
+    """Return the names of all connected NI devices (e.g. ['Dev1', 'Dev2']).
+
+    On non-Windows platforms this returns an empty list.
+    """
+    if not sys.platform.startswith("win"):
+        return []
+    try:
+        import nidaqmx.system
+        system = nidaqmx.system.System.local()
+        return [d.name for d in system.devices]
+    except Exception:
+        return []
+
+
 if sys.platform.startswith("win"):
     import nidaqmx
     from nidaqmx.constants import LineGrouping
