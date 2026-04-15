@@ -30,24 +30,30 @@ from backend.pulse_manager import PulseManager
 
 SYNC_WIDTH_RECORD = 0.100  # 100 ms
 
-ADL_OPTIONS = [
-    (1, "Pick up coins from purses"),
-    (2, "Pick up wooden blocks"),
-    (3, "Pick up nuts and put in bolts"),
-    (4, "Unscrew lid of jars"),
-    (5, "Cut play-doh"),
-    (6, "Writing"),
-    (7, "Pick up telephone and put in ear"),
-    (8, "Pour water from pure pack"),
-    (9, "Pour water from jug"),
-    (10, "Pour water from cup"),
-    (11, "Typing on smartphone"),
-    (12, "Scrolling on smartphone"),
-    (13, "Typing on keyboard"),
-    (14, "Start sensors recording"),
-    (15, "Dynamometer hand grip baseline"),
-    (16, "Dynamometer hand grip active"),
-]
+EXPERIMENT_LABELS = {
+    "Long Term ADLs": [
+        (1, "Pick up coins from purses"),
+        (2, "Pick up wooden blocks"),
+        (3, "Pick up nuts and put in bolts"),
+        (4, "Unscrew lid of jars"),
+        (5, "Cut play-doh"),
+        (6, "Writing"),
+        (7, "Pick up telephone and put in ear"),
+        (8, "Pour water from pure pack"),
+        (9, "Pour water from jug"),
+        (10, "Pour water from cup"),
+        (11, "Typing on smartphone"),
+        (12, "Scrolling on smartphone"),
+        (13, "Typing on keyboard"),
+        (14, "Start sensors recording"),
+        (15, "Dynamometer hand grip baseline"),
+        (16, "Dynamometer hand grip active"),
+    ],
+    "OCD Sleeve": [
+        (101, "Symptom provocation"),
+        (102, "Relax"),
+    ],
+}
 
 class AppState(Enum):
     IDLE = auto()
@@ -156,13 +162,17 @@ class MainWindow(QWidget):
 
         layout.addLayout(controls_row)
 
-        # --- ADL dropdown (bottom of GUI) ---
+        # --- Experiment + label dropdowns (bottom of GUI) ---
         adl_row = QHBoxLayout()
+        self.experiment_dropdown = QComboBox()
+        for experiment_name in EXPERIMENT_LABELS:
+            self.experiment_dropdown.addItem(experiment_name)
+        self.experiment_dropdown.currentIndexChanged.connect(self.on_experiment_changed)
+        adl_row.addWidget(self.experiment_dropdown)
+
         self.adl_dropdown = QComboBox()
-        self.adl_dropdown.addItem("Select ADL...", None)
-        for adl_id, adl_label in ADL_OPTIONS:
-            self.adl_dropdown.addItem(adl_label, adl_id)
         adl_row.addWidget(self.adl_dropdown)
+        self._populate_label_dropdown(self.experiment_dropdown.currentText())
         layout.addLayout(adl_row)
 
         # --- Camera controller + timer ---
@@ -176,6 +186,15 @@ class MainWindow(QWidget):
 
         # count manual sync pulses during a run
         self.manual_sync_count = 0
+
+    def _populate_label_dropdown(self, experiment_name: str):
+        self.adl_dropdown.clear()
+        self.adl_dropdown.addItem("Select label...", None)
+        for adl_id, adl_label in EXPERIMENT_LABELS.get(experiment_name, []):
+            self.adl_dropdown.addItem(adl_label, adl_id)
+
+    def on_experiment_changed(self, _index=None):
+        self._populate_label_dropdown(self.experiment_dropdown.currentText())
 
     def _apply_state(self):
         if self.state == AppState.IDLE:
