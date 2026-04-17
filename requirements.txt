@@ -4,6 +4,8 @@ numpy>=2
 pyside6~=6.10.0
 opencv-python>=4.9
 pandas>=2.2
+sounddevice>=0.5
+soundfile>=0.12
 nidaqmx>=1.0; platform_system == "Windows"
 
 # Manually install PySpin

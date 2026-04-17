@@ -24,6 +24,7 @@ from PySide6.QtGui import QImage, QPixmap
 from enum import Enum, auto
 from datetime import datetime
 
+from backend.audio_control import SessionAudioRecorder, list_audio_input_devices
 from backend.camera_control import detect_first_camera, CameraController
 from backend.ni_control import NIDaqDO, DOLine, list_do_lines
 from backend.pulse_manager import PulseManager
@@ -127,6 +128,19 @@ class MainWindow(QWidget):
 
         layout.addLayout(daq_row)
 
+        # --- Microphone (optional WAV alongside video) ---
+        self.audio_label = QLabel("Microphone: scan and choose a device, or leave as no audio.")
+        layout.addWidget(self.audio_label)
+        audio_row = QHBoxLayout()
+        self.audio_input_combo = QComboBox()
+        self.audio_input_combo.setMinimumWidth(280)
+        self.audio_input_combo.addItem("No audio", None)
+        audio_row.addWidget(self.audio_input_combo)
+        self.scan_audio_button = QPushButton("Scan")
+        self.scan_audio_button.clicked.connect(self.on_scan_audio_clicked)
+        audio_row.addWidget(self.scan_audio_button)
+        layout.addLayout(audio_row)
+
         # Disable DAQ controls on non-Windows
         if not sys.platform.startswith("win"):
             self.scan_daq_button.setEnabled(False)
@@ -136,6 +150,7 @@ class MainWindow(QWidget):
         # Handle to the DAQ controller (set on connect)
         self.daq = None
         self.pulse_manager = None
+        self._session_audio: SessionAudioRecorder | None = None
 
         # --- Image preview label ---
         self.image_label = QLabel("No video")
@@ -187,6 +202,20 @@ class MainWindow(QWidget):
         # count manual sync pulses during a run
         self.manual_sync_count = 0
 
+    def on_scan_audio_clicked(self):
+        """List host audio input devices (external mic, etc.)."""
+        self.audio_input_combo.clear()
+        devices = list_audio_input_devices()
+        self.audio_input_combo.addItem("No audio", None)
+        for idx, label in devices:
+            self.audio_input_combo.addItem(label, idx)
+        if devices:
+            self.audio_label.setText(f"Microphone: {len(devices)} input device(s) found.")
+        else:
+            self.audio_label.setText(
+                "Microphone: none found (install sounddevice/soundfile, or check mic permissions)."
+            )
+
     def _populate_label_dropdown(self, experiment_name: str):
         self.adl_dropdown.clear()
         self.adl_dropdown.addItem("Select label...", None)
@@ -225,6 +254,13 @@ class MainWindow(QWidget):
             self.preview_button.setText("Stop Preview")
             self.record_button.setEnabled(True)
             self.record_button.setText("Stop Recording")
+            self.audio_input_combo.setEnabled(False)
+            self.scan_audio_button.setEnabled(False)
+
+        # Re-enable mic selection whenever not recording
+        if self.state != AppState.RECORDING:
+            self.audio_input_combo.setEnabled(True)
+            self.scan_audio_button.setEnabled(True)
 
     def on_detect_clicked(self):
         if self.state not in (AppState.IDLE, AppState.CAMERA_DETECTED):
@@ -363,6 +399,20 @@ class MainWindow(QWidget):
             self.status_label.setText(msg)
 
             if ok:
+                # Parallel WAV with same session base name as video (recording_<ts>.avi / .wav)
+                audio_device = self.audio_input_combo.currentData()
+                self._session_audio = None
+                if audio_device is not None:
+                    wav_path = f"{filename}.wav"
+                    try:
+                        self._session_audio = SessionAudioRecorder()
+                        self._session_audio.start(wav_path, int(audio_device))
+                        self.audio_label.setText(f"Microphone: recording to {wav_path}")
+                    except Exception as exc:
+                        self._session_audio = None
+                        print(f"Audio recording failed: {exc}")
+                        self.audio_label.setText(f"Microphone: failed ({exc}) — video only")
+
                 # 1) fire a 100 ms hardware pulse
                 if self.pulse_manager is not None and sys.platform.startswith("win"):
                     try:
@@ -388,8 +438,17 @@ class MainWindow(QWidget):
 
         # Stop recording
         elif self.state == AppState.RECORDING:
+            if self._session_audio is not None:
+                try:
+                    self._session_audio.stop()
+                except Exception as exc:
+                    print("Error stopping audio recording:", exc)
+                self._session_audio = None
             self.camera.stop_recording()
             self.status_label.setText("Recording stopped.")
+            self.audio_label.setText(
+                "Microphone: scan and choose a device, or leave as no audio."
+            )
             self.state = AppState.PREVIEWING
             self._apply_state()
 
@@ -451,6 +510,12 @@ class MainWindow(QWidget):
         # Stop recording/preview/camera first
         try:
             if self.state == AppState.RECORDING:
+                if self._session_audio is not None:
+                    try:
+                        self._session_audio.stop()
+                    except Exception as exc:
+                        print("Error stopping audio on close:", exc)
+                    self._session_audio = None
                 self.camera.stop_recording()
         except Exception as e:
             print("Error stopping recording on close:", e)
