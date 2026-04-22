@@ -18,13 +18,19 @@ from PySide6.QtWidgets import (
     QPushButton,
     QLabel,
     QComboBox,
+    QCheckBox,
+    QProgressBar,
 )
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QImage, QPixmap
 from enum import Enum, auto
 from datetime import datetime
 
-from backend.audio_control import SessionAudioRecorder, list_audio_input_devices
+from backend.audio_control import (
+    MicLevelPreview,
+    SessionAudioRecorder,
+    list_audio_input_devices,
+)
 from backend.camera_control import detect_first_camera, CameraController
 from backend.ni_control import NIDaqDO, DOLine, list_do_lines
 from backend.pulse_manager import PulseManager
@@ -135,11 +141,37 @@ class MainWindow(QWidget):
         self.audio_input_combo = QComboBox()
         self.audio_input_combo.setMinimumWidth(280)
         self.audio_input_combo.addItem("No audio", None)
+        self.audio_input_combo.currentIndexChanged.connect(
+            self._on_audio_input_device_changed
+        )
         audio_row.addWidget(self.audio_input_combo)
         self.scan_audio_button = QPushButton("Scan")
         self.scan_audio_button.clicked.connect(self.on_scan_audio_clicked)
         audio_row.addWidget(self.scan_audio_button)
         layout.addLayout(audio_row)
+
+        self.audio_monitor_checkbox = QCheckBox(
+            "Hear live mic in headphones (Preview mic + recording; avoids speaker feedback)"
+        )
+        self.audio_monitor_checkbox.setChecked(True)
+        layout.addWidget(self.audio_monitor_checkbox)
+
+        mic_preview_row = QHBoxLayout()
+        self.mic_preview_button = QPushButton("Preview mic")
+        self.mic_preview_button.clicked.connect(self.on_mic_preview_clicked)
+        mic_preview_row.addWidget(self.mic_preview_button)
+        mic_preview_row.addWidget(QLabel("Input level"))
+        self.audio_level_bar = QProgressBar()
+        self.audio_level_bar.setRange(0, 100)
+        self.audio_level_bar.setValue(0)
+        self.audio_level_bar.setTextVisible(False)
+        self.audio_level_bar.setFixedHeight(14)
+        self.audio_level_bar.setStyleSheet(
+            "QProgressBar { border: 1px solid #888; border-radius: 3px; background: #e8e8e8; }"
+            "QProgressBar::chunk { background-color: #2e7d32; border-radius: 2px; }"
+        )
+        mic_preview_row.addWidget(self.audio_level_bar, stretch=1)
+        layout.addLayout(mic_preview_row)
 
         # Disable DAQ controls on non-Windows
         if not sys.platform.startswith("win"):
@@ -151,6 +183,12 @@ class MainWindow(QWidget):
         self.daq = None
         self.pulse_manager = None
         self._session_audio: SessionAudioRecorder | None = None
+        self._mic_preview: MicLevelPreview | None = None
+        self._mic_preview_active = False
+
+        self.mic_level_timer = QTimer(self)
+        self.mic_level_timer.timeout.connect(self._update_mic_level_bar)
+        self.mic_level_timer.start(50)
 
         # --- Image preview label ---
         self.image_label = QLabel("No video")
@@ -204,6 +242,8 @@ class MainWindow(QWidget):
 
     def on_scan_audio_clicked(self):
         """List host audio input devices (external mic, etc.)."""
+        if self._mic_preview_active:
+            self._stop_mic_preview()
         self.audio_input_combo.clear()
         devices = list_audio_input_devices()
         self.audio_input_combo.addItem("No audio", None)
@@ -215,6 +255,7 @@ class MainWindow(QWidget):
             self.audio_label.setText(
                 "Microphone: none found (install sounddevice/soundfile, or check mic permissions)."
             )
+        self._apply_state()
 
     def _populate_label_dropdown(self, experiment_name: str):
         self.adl_dropdown.clear()
@@ -254,13 +295,93 @@ class MainWindow(QWidget):
             self.preview_button.setText("Stop Preview")
             self.record_button.setEnabled(True)
             self.record_button.setText("Stop Recording")
+            self._stop_mic_preview()
             self.audio_input_combo.setEnabled(False)
             self.scan_audio_button.setEnabled(False)
+            self.audio_monitor_checkbox.setEnabled(False)
+            self.mic_preview_button.setEnabled(False)
 
-        # Re-enable mic selection whenever not recording
         if self.state != AppState.RECORDING:
-            self.audio_input_combo.setEnabled(True)
-            self.scan_audio_button.setEnabled(True)
+            self.audio_monitor_checkbox.setEnabled(True)
+            if self._mic_preview_active:
+                self.audio_input_combo.setEnabled(False)
+                self.scan_audio_button.setEnabled(False)
+                self.mic_preview_button.setEnabled(True)
+                self.mic_preview_button.setText("Stop mic preview")
+            else:
+                self.audio_input_combo.setEnabled(True)
+                self.scan_audio_button.setEnabled(True)
+                has_dev = self.audio_input_combo.currentData() is not None
+                self.mic_preview_button.setEnabled(has_dev)
+                self.mic_preview_button.setText("Preview mic")
+
+    def _stop_mic_preview(self) -> None:
+        if self._mic_preview is not None:
+            try:
+                self._mic_preview.stop()
+            except Exception as exc:
+                print("Error stopping mic preview:", exc)
+            self._mic_preview = None
+        self._mic_preview_active = False
+        self.audio_level_bar.setValue(0)
+
+    def _on_audio_input_device_changed(self, _index: int | None = None) -> None:
+        if self._mic_preview_active:
+            self._stop_mic_preview()
+        self._apply_state()
+
+    def on_mic_preview_clicked(self) -> None:
+        if self.state == AppState.RECORDING:
+            return
+        if self._mic_preview_active:
+            self._stop_mic_preview()
+            self.audio_label.setText(
+                "Microphone: scan and choose a device, or leave as no audio."
+            )
+            self._apply_state()
+            return
+        dev = self.audio_input_combo.currentData()
+        if dev is None:
+            return
+        self._mic_preview = MicLevelPreview()
+        try:
+            self._mic_preview.start(
+                int(dev),
+                monitor=self.audio_monitor_checkbox.isChecked(),
+            )
+            self._mic_preview_active = True
+            self.audio_label.setText("Microphone: preview active (no file saved).")
+            QTimer.singleShot(450, self._notify_preview_listen_status)
+        except Exception as exc:
+            self._mic_preview = None
+            self._mic_preview_active = False
+            print(f"Mic preview failed: {exc}")
+            self.audio_label.setText(f"Mic preview failed: {exc}")
+        self._apply_state()
+
+    def _notify_preview_listen_status(self) -> None:
+        """If user wanted hear-through but duplex failed, explain in the UI."""
+        if not self._mic_preview_active or self._mic_preview is None:
+            return
+        if not self.audio_monitor_checkbox.isChecked():
+            return
+        if self._mic_preview.had_duplex_output:
+            return
+        self.audio_label.setText(
+            "Mic preview: level only — hear-through did not open. "
+            "Turn the checkbox on, set macOS Sound output to your headphones, "
+            "raise system/app volume, then stop preview and start again."
+        )
+
+    def _update_mic_level_bar(self) -> None:
+        if self._mic_preview_active and self._mic_preview is not None:
+            self.audio_level_bar.setValue(self._mic_preview.level_0_100())
+        elif self.state == AppState.RECORDING and self._session_audio is not None:
+            self.audio_level_bar.setValue(self._session_audio.level_0_100())
+        else:
+            v = self.audio_level_bar.value()
+            if v > 0:
+                self.audio_level_bar.setValue(max(0, v - 14))
 
     def on_detect_clicked(self):
         if self.state not in (AppState.IDLE, AppState.CAMERA_DETECTED):
@@ -399,6 +520,7 @@ class MainWindow(QWidget):
             self.status_label.setText(msg)
 
             if ok:
+                self._stop_mic_preview()
                 # Parallel WAV with same session base name as video (recording_<ts>.avi / .wav)
                 audio_device = self.audio_input_combo.currentData()
                 self._session_audio = None
@@ -406,7 +528,11 @@ class MainWindow(QWidget):
                     wav_path = f"{filename}.wav"
                     try:
                         self._session_audio = SessionAudioRecorder()
-                        self._session_audio.start(wav_path, int(audio_device))
+                        self._session_audio.start(
+                            wav_path,
+                            int(audio_device),
+                            monitor=self.audio_monitor_checkbox.isChecked(),
+                        )
                         self.audio_label.setText(f"Microphone: recording to {wav_path}")
                     except Exception as exc:
                         self._session_audio = None
@@ -544,6 +670,12 @@ class MainWindow(QWidget):
                 self.daq = None
         except Exception as e:
             print("Error stopping DAQ on close:", e)
+
+        try:
+            self._stop_mic_preview()
+            self.mic_level_timer.stop()
+        except Exception as e:
+            print("Error stopping mic preview on close:", e)
 
         super().closeEvent(event)
 
