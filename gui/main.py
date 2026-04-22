@@ -59,6 +59,8 @@ EXPERIMENT_LABELS = {
     "OCD Sleeve": [
         (101, "Symptom provocation"),
         (102, "Relax"),
+        (103, "Compulsion"),
+        (104, "Control"),
     ],
 }
 
