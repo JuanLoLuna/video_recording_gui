@@ -11,12 +11,155 @@ use headphones to avoid acoustic feedback.
 
 from __future__ import annotations
 
+import queue
+import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+
+def _samplerate_candidates(
+    sd: Any, input_device: int, output_device: int, primary: int
+) -> list[int]:
+    """Sample rates to try for duplex / split monitoring (shared input+output SR)."""
+    rates: list[int] = []
+    try:
+        di = sd.query_devices(input_device, "input")
+        do = sd.query_devices(output_device, "output")
+        ri = int(float(di.get("default_samplerate") or 0))
+        ro = int(float(do.get("default_samplerate") or 0))
+        for r in (primary, ro, ri, 48_000, 44_100, 96_000, 32_000, 16_000):
+            if r > 0 and r not in rates:
+                rates.append(r)
+    except Exception:
+        for r in (primary, 48_000, 44_100):
+            if r > 0 and r not in rates:
+                rates.append(r)
+    return rates
+
+
+def _duplex_stream_kwargs_variants(sd: Any) -> list[dict[str, Any]]:
+    """Keyword-argument sets to try when opening sd.Stream (duplex)."""
+    variants: list[dict[str, Any]] = [
+        {"latency": "high"},
+        {"blocksize": 1024},
+        {"blocksize": 512, "latency": "high"},
+        {"blocksize": 2048, "latency": "high"},
+        {"blocksize": 256, "latency": "high"},
+        {"blocksize": 128, "latency": "high"},
+        {"blocksize": 0},
+        {"blocksize": 0, "latency": "high"},
+    ]
+    if sys.platform == "win32":
+        try:
+            ws_in = sd.WasapiSettings(exclusive=False)
+            ws_out = sd.WasapiSettings(exclusive=False)
+            variants.append({"extra_settings": (ws_in, ws_out), "latency": "high"})
+            variants.append({"extra_settings": (ws_in, ws_out), "blocksize": 0})
+        except Exception:
+            pass
+    return variants
+
+
+def _run_split_monitor_streams(
+    sd: Any,
+    *,
+    input_device: int,
+    output_device: int,
+    samplerates: list[int],
+    out_ch: int,
+    stop_event: threading.Event,
+    on_input_mono: Callable[[Any], None],
+    blocksize: int = 1024,
+) -> bool:
+    """
+    Input-only + output-only streams with a small queue (Windows-friendly when
+    full-duplex open fails across MME/WASAPI/etc.).
+    """
+    audio_q: queue.Queue = queue.Queue(maxsize=8)
+
+    def in_cb(
+        indata: Any,
+        frames: int,
+        time_info: Any,
+        status: Any,
+    ) -> None:
+        if stop_event.is_set():
+            raise sd.CallbackStop
+        on_input_mono(indata)
+        try:
+            audio_q.put_nowait(indata.copy())
+        except queue.Full:
+            try:
+                _ = audio_q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                audio_q.put_nowait(indata.copy())
+            except queue.Full:
+                pass
+
+    def make_out_cb(channels: int):
+        def out_cb(
+            outdata: Any,
+            frames: int,
+            time_info: Any,
+            status: Any,
+        ) -> None:
+            if stop_event.is_set():
+                raise sd.CallbackStop
+            try:
+                ind = audio_q.get_nowait()
+            except queue.Empty:
+                outdata[:] = 0
+                return
+            n_in = int(ind.shape[0])
+            n_out_ch = int(outdata.shape[1])
+            if n_in >= frames:
+                mono = ind[:frames, 0]
+            else:
+                mono = np.zeros(frames, dtype=np.float32)
+                mono[:n_in] = ind[:, 0]
+            if n_out_ch == 1:
+                outdata[:, 0] = mono
+            else:
+                for c in range(n_out_ch):
+                    outdata[:, c] = mono
+
+        return out_cb
+
+    for sr in samplerates:
+        for ch_try in (out_ch, 1) if out_ch != 1 else (1,):
+            for bs in (blocksize, 512, 2048, 256, 0):
+                try:
+                    out_cb = make_out_cb(ch_try)
+                    with sd.OutputStream(
+                        device=output_device,
+                        channels=ch_try,
+                        samplerate=sr,
+                        blocksize=bs,
+                        dtype="float32",
+                        latency="high",
+                        callback=out_cb,
+                    ), sd.InputStream(
+                        device=input_device,
+                        channels=1,
+                        samplerate=sr,
+                        blocksize=bs,
+                        dtype="float32",
+                        latency="high",
+                        callback=in_cb,
+                    ):
+                        while not stop_event.is_set():
+                            time.sleep(0.05)
+                    return True
+                except Exception:
+                    continue
+    return False
 
 
 def list_audio_input_devices() -> list[tuple[int, str]]:
@@ -92,6 +235,10 @@ def list_audio_output_devices() -> list[tuple[int, str]]:
     """
     Return (device_index, label) for each host output device.
 
+    Unlike inputs, we do **not** deduplicate by device name: on Windows several
+    PortAudio indices can share the same driver string (e.g. Realtek jack vs
+    internal speakers), and keeping only one entry hid the headphone endpoint.
+
     If sounddevice is unavailable or errors, returns an empty list.
     """
     try:
@@ -114,6 +261,14 @@ def list_audio_output_devices() -> list[tuple[int, str]]:
             except Exception:
                 return "Unknown"
 
+        default_out_idx: int | None = None
+        try:
+            _din, dout = sd.default.device
+            if dout is not None and int(dout) >= 0:
+                default_out_idx = int(dout)
+        except Exception:
+            default_out_idx = None
+
         prefer_order = [
             "Windows WASAPI",
             "WASAPI",
@@ -126,7 +281,8 @@ def list_audio_output_devices() -> list[tuple[int, str]]:
         ]
         prefer_rank = {n: r for r, n in enumerate(prefer_order)}
 
-        candidates: list[tuple[str, int, int, str]] = []
+        # Sort key: host API preference, then name, then index (stable, every index listed).
+        rows: list[tuple[int, str, int, str]] = []
         for i, d in enumerate(devices):
             if not isinstance(d, dict):
                 continue
@@ -137,18 +293,12 @@ def list_audio_output_devices() -> list[tuple[int, str]]:
             rank = prefer_rank.get(ha_name, len(prefer_order))
             norm = " ".join(name.lower().split())
             label = f"{i}: {name} ({ha_name})"
-            candidates.append((norm, rank, i, label))
+            if default_out_idx is not None and i == default_out_idx:
+                label += " — Windows default playback"
+            rows.append((rank, norm, i, label))
 
-        candidates.sort(key=lambda t: (t[0], t[1], t[2]))
-
-        out: list[tuple[int, str]] = []
-        seen: set[str] = set()
-        for norm, _rank, idx, label in candidates:
-            if norm in seen:
-                continue
-            seen.add(norm)
-            out.append((idx, label))
-        return out
+        rows.sort(key=lambda t: (t[0], t[1], t[2]))
+        return [(idx, label) for _rank, _norm, idx, label in rows]
     except Exception:
         return []
 
@@ -163,8 +313,9 @@ def _open_duplex_stream(
     output_device: int | None = None,
 ) -> Any | None:
     """
-    Open full-duplex mic -> output. Tries explicit output device and
-    several sample rates / block sizes (macOS often fails with (in, None) or SR mismatch).
+    Open full-duplex mic -> output. Tries sample rates, block sizes, output
+    channel counts, and (on Windows) WASAPI shared settings. Returns None if
+    no combination opens (caller may use split streams).
     """
     try:
         if output_device is None:
@@ -174,32 +325,22 @@ def _open_duplex_stream(
             out_dev = int(out_def)
         else:
             out_dev = int(output_device)
-        out_info = sd.query_devices(out_dev, "output")
-        out_sr = int(float(out_info.get("default_samplerate") or in_samplerate))
-        rates: list[int] = []
-        for r in (in_samplerate, out_sr, 48_000, 44_100):
-            if r not in rates:
-                rates.append(r)
-        for sr in rates:
-            for extra in (
-                # Let PortAudio choose (often best on Windows/WASAPI)
-                {"latency": "high"},
-                # Common stable block sizes
-                {"blocksize": 1024},
-                {"blocksize": 512, "latency": "high"},
-                {"blocksize": 2048, "latency": "high"},
-            ):
-                try:
-                    return sd.Stream(
-                        device=(input_device, out_dev),
-                        samplerate=sr,
-                        channels=(1, out_ch),
-                        dtype="float32",
-                        callback=callback,
-                        **extra,
-                    )
-                except Exception:
-                    continue
+        rates = _samplerate_candidates(sd, input_device, out_dev, in_samplerate)
+        ch_opts = (out_ch, 1) if out_ch != 1 else (1,)
+        for ch in ch_opts:
+            for sr in rates:
+                for extra in _duplex_stream_kwargs_variants(sd):
+                    try:
+                        return sd.Stream(
+                            device=(input_device, out_dev),
+                            samplerate=sr,
+                            channels=(1, ch),
+                            dtype="float32",
+                            callback=callback,
+                            **extra,
+                        )
+                    except Exception:
+                        continue
         return None
     except Exception:
         return None
@@ -261,6 +402,7 @@ class MicLevelPreview:
             try:
                 use_duplex = bool(monitor)
                 out_ch = 1
+                out_dev: int | None = None
                 if use_duplex:
                     try:
                         out_dev = output_device
@@ -281,6 +423,7 @@ class MicLevelPreview:
                             )
                     except Exception:
                         use_duplex = False
+                        out_dev = None
 
                 def input_cb(
                     indata: Any,
@@ -293,7 +436,8 @@ class MicLevelPreview:
                     self._feed_level(indata)
 
                 stream: Any | None = None
-                if use_duplex:
+                used_split_monitor = False
+                if use_duplex and out_dev is not None:
 
                     def duplex_cb(
                         indata: Any,
@@ -323,10 +467,29 @@ class MicLevelPreview:
                     if stream is not None:
                         self.had_duplex_output = True
                     else:
-                        print(
-                            "[audio] preview monitor unavailable "
-                            "(duplex open failed); level meter only."
+                        rates = _samplerate_candidates(
+                            sd, device, out_dev, samplerate
                         )
+                        used_split_monitor = _run_split_monitor_streams(
+                            sd,
+                            input_device=device,
+                            output_device=out_dev,
+                            samplerates=rates,
+                            out_ch=out_ch,
+                            stop_event=self._stop,
+                            on_input_mono=self._feed_level,
+                        )
+                        if used_split_monitor:
+                            self.had_duplex_output = True
+                        else:
+                            print(
+                                "[audio] preview monitor unavailable "
+                                "(duplex and split-monitor open failed); "
+                                "level meter only."
+                            )
+
+                if used_split_monitor:
+                    return
 
                 if stream is None:
                     stream = sd.InputStream(
@@ -439,6 +602,7 @@ class SessionAudioRecorder:
                 ) as f:
                     use_duplex = bool(monitor)
                     out_ch = 1
+                    out_dev: int | None = None
                     if use_duplex:
                         try:
                             out_dev = output_device
@@ -459,6 +623,7 @@ class SessionAudioRecorder:
                                 )
                         except Exception:
                             use_duplex = False
+                            out_dev = None
 
                     def input_cb(
                         indata: Any,
@@ -472,7 +637,8 @@ class SessionAudioRecorder:
                         f.write(indata.copy())
 
                     stream: Any | None = None
-                    if use_duplex:
+                    used_split_monitor = False
+                    if use_duplex and out_dev is not None:
 
                         def duplex_cb(
                             indata: Any,
@@ -502,11 +668,33 @@ class SessionAudioRecorder:
                         )
                         if stream is not None:
                             self.had_duplex_output = True
-                        if stream is None:
-                            print(
-                                "[audio] live monitor unavailable "
-                                "(duplex open failed); recording without monitor."
+                        else:
+
+                            def on_mono(indata: Any) -> None:
+                                self._feed_level(indata)
+                                f.write(indata.copy())
+
+                            # Keep stream SR == WAV SR (split path does not resample).
+                            used_split_monitor = _run_split_monitor_streams(
+                                sd,
+                                input_device=device,
+                                output_device=out_dev,
+                                samplerates=[samplerate],
+                                out_ch=out_ch,
+                                stop_event=self._stop,
+                                on_input_mono=on_mono,
                             )
+                            if used_split_monitor:
+                                self.had_duplex_output = True
+                            else:
+                                print(
+                                    "[audio] live monitor unavailable "
+                                    "(duplex and split-monitor open failed); "
+                                    "recording without monitor."
+                                )
+
+                    if used_split_monitor:
+                        return
 
                     if stream is None:
                         stream = sd.InputStream(
