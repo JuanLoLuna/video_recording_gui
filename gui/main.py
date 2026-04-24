@@ -240,7 +240,12 @@ class MainWindow(QWidget):
         )
         self.audio_monitor_checkbox.setChecked(True)
         self.audio_monitor_checkbox.stateChanged.connect(self._on_audio_monitor_changed)
-        setup_inner.addWidget(self.audio_monitor_checkbox)
+        self.mic_preview_button = QPushButton("Preview mic")
+        self.mic_preview_button.clicked.connect(self.on_mic_preview_clicked)
+        monitor_preview_row = QHBoxLayout()
+        monitor_preview_row.addWidget(self.audio_monitor_checkbox, stretch=1)
+        monitor_preview_row.addWidget(self.mic_preview_button)
+        setup_inner.addLayout(monitor_preview_row)
 
         output_row = QHBoxLayout()
         output_row.addWidget(QLabel("Audio Output"))
@@ -255,13 +260,6 @@ class MainWindow(QWidget):
         self.scan_output_button.clicked.connect(self.on_scan_output_clicked)
         output_row.addWidget(self.scan_output_button)
         setup_inner.addLayout(output_row)
-
-        mic_preview_row = QHBoxLayout()
-        self.mic_preview_button = QPushButton("Preview mic")
-        self.mic_preview_button.clicked.connect(self.on_mic_preview_clicked)
-        mic_preview_row.addWidget(self.mic_preview_button)
-        mic_preview_row.addStretch(1)
-        setup_inner.addLayout(mic_preview_row)
 
         layout.addWidget(self.setup_panel)
 
