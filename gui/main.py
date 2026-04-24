@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QScrollArea,
     QSizePolicy,
+    QSlider,
 )
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QImage, QPixmap
@@ -126,6 +127,61 @@ class MainWindow(QWidget):
         self.detect_button = QPushButton("Detect camera")
         self.detect_button.clicked.connect(self.on_detect_clicked)
         layout.addWidget(self.detect_button)
+
+        # --- Collapsible camera image tuning (Spinnaker GenICam) ---
+        self._camera_tuning_expanded = False
+        self.camera_tuning_toggle = QPushButton(
+            "▶ Camera image — gain, gamma, black level"
+        )
+        self.camera_tuning_toggle.setStyleSheet(
+            "QPushButton { text-align: left; padding: 6px 8px; }"
+        )
+        self.camera_tuning_toggle.clicked.connect(self._on_camera_tuning_toggle)
+        layout.addWidget(self.camera_tuning_toggle)
+
+        self.camera_tuning_panel = QWidget()
+        tuning_layout = QVBoxLayout(self.camera_tuning_panel)
+        tuning_layout.setContentsMargins(12, 4, 8, 4)
+        self._image_slider_resolution = 1000
+        self._slider_meta: dict[str, dict] = {}
+        for title, nodename in (
+            ("Gain", "Gain"),
+            ("Gamma", "Gamma"),
+            ("Black level", "BlackLevel"),
+        ):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(title))
+            sl = QSlider(Qt.Orientation.Horizontal)
+            sl.setRange(0, self._image_slider_resolution)
+            sl.setEnabled(False)
+            val_lbl = QLabel("—")
+            val_lbl.setMinimumWidth(76)
+            val_lbl.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            row.addWidget(sl, stretch=1)
+            row.addWidget(val_lbl)
+            tuning_layout.addLayout(row)
+            self._slider_meta[nodename] = {
+                "slider": sl,
+                "label": val_lbl,
+                "min": 0.0,
+                "max": 1.0,
+                "steps": self._image_slider_resolution,
+                "supported": False,
+            }
+            sl.valueChanged.connect(
+                lambda v, n=nodename: self._on_image_slider_changed(n, v)
+            )
+
+        self.camera_tuning_hint = QLabel(
+            "Start preview to enable these controls (requires Spinnaker / GenICam nodes)."
+        )
+        self.camera_tuning_hint.setWordWrap(True)
+        self.camera_tuning_hint.setStyleSheet("color: #555; font-size: 11px;")
+        tuning_layout.addWidget(self.camera_tuning_hint)
+        self.camera_tuning_panel.setVisible(False)
+        layout.addWidget(self.camera_tuning_panel)
 
         # --- Sync / NI-DAQ status ---
         self.sync_label = QLabel("Sync not available — no DAQ connected")
@@ -363,6 +419,78 @@ class MainWindow(QWidget):
                 self.audio_output_combo.setEnabled(want_monitor)
                 self.scan_output_button.setEnabled(want_monitor)
 
+        self._update_camera_tuning_widgets_enabled()
+
+    def _on_camera_tuning_toggle(self) -> None:
+        self._camera_tuning_expanded = not self._camera_tuning_expanded
+        self.camera_tuning_panel.setVisible(self._camera_tuning_expanded)
+        arrow = "▼" if self._camera_tuning_expanded else "▶"
+        self.camera_tuning_toggle.setText(
+            f"{arrow} Camera image — gain, gamma, black level"
+        )
+
+    def _on_image_slider_changed(self, node: str, slider_value: int) -> None:
+        meta = self._slider_meta.get(node)
+        if meta is None:
+            return
+        sl = meta["slider"]
+        if not sl.isEnabled():
+            return
+        mn, mx = float(meta["min"]), float(meta["max"])
+        steps = float(meta["steps"])
+        if mx <= mn or steps <= 0:
+            return
+        value = mn + (slider_value / steps) * (mx - mn)
+        meta["label"].setText(f"{value:.4g}")
+        self.camera.set_image_param(node, value)
+
+    def _sync_image_sliders_from_camera(self) -> None:
+        """Read limits from the open camera and align sliders (call after preview starts)."""
+        steps = self._image_slider_resolution
+        for node, meta in self._slider_meta.items():
+            sl = meta["slider"]
+            lbl = meta["label"]
+            limits = self.camera.get_image_param_limits(node)
+            if limits is None:
+                meta["supported"] = False
+                sl.blockSignals(True)
+                sl.setEnabled(False)
+                lbl.setText("N/A")
+                sl.blockSignals(False)
+                continue
+            mn, mx, cur = limits
+            meta["min"], meta["max"] = mn, mx
+            meta["steps"] = steps
+            meta["supported"] = True
+            sl.blockSignals(True)
+            sl.setRange(0, steps)
+            if mx <= mn:
+                sl.setEnabled(False)
+                lbl.setText(f"{cur:.4g}")
+            else:
+                can_tune = self.state in (
+                    AppState.PREVIEWING,
+                    AppState.RECORDING,
+                )
+                sl.setEnabled(can_tune)
+                t = (cur - mn) / (mx - mn)
+                sl.setValue(int(round(t * steps)))
+                lbl.setText(f"{cur:.4g}")
+            sl.blockSignals(False)
+
+    def _update_camera_tuning_widgets_enabled(self) -> None:
+        if not self._slider_meta:
+            return
+        acquiring = self.state in (AppState.PREVIEWING, AppState.RECORDING)
+        if hasattr(self, "camera_tuning_hint"):
+            self.camera_tuning_hint.setVisible(not acquiring)
+        for meta in self._slider_meta.values():
+            sl = meta["slider"]
+            if not meta.get("supported"):
+                sl.setEnabled(False)
+                continue
+            sl.setEnabled(acquiring)
+
     def _stop_mic_preview(self) -> None:
         if self._mic_preview is not None:
             try:
@@ -570,6 +698,7 @@ class MainWindow(QWidget):
             self.preview_button.setText("Stop Preview")
             self.state = AppState.PREVIEWING
             self._apply_state()
+            self._sync_image_sliders_from_camera()
 
 
         else:

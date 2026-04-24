@@ -492,6 +492,75 @@ class CameraController:
             return self._latest_frame.copy()
 
     # ------------------------------------------------------------------
+    # Image controls (GenICam; GUI thread while acquiring)
+    # ------------------------------------------------------------------
+
+    def get_image_param_limits(self, param_name: str) -> tuple[float, float, float] | None:
+        """
+        Return (min, max, current) as floats for a GenICam node name
+        (e.g. 'Gain', 'Gamma', 'BlackLevel'), or None if unavailable.
+
+        Gamma is often gated by GammaEnable; this enables it when writable
+        so limits/current can be read.
+        """
+        if self.cam is None or not self.acquiring:
+            return None
+        try:
+            nodemap = self.cam.GetNodeMap()
+            if param_name == "Gamma":
+                ge = PySpin.CBooleanPtr(nodemap.GetNode("GammaEnable"))
+                if PySpin.IsWritable(ge):
+                    ge.SetValue(True)
+            node = nodemap.GetNode(param_name)
+            if node is None or not PySpin.IsReadable(node):
+                return None
+            fn = PySpin.CFloatPtr(node)
+            if PySpin.IsReadable(fn):
+                return (
+                    float(fn.GetMin()),
+                    float(fn.GetMax()),
+                    float(fn.GetValue()),
+                )
+            ir = PySpin.CIntegerPtr(node)
+            if PySpin.IsReadable(ir):
+                return (
+                    float(ir.GetMin()),
+                    float(ir.GetMax()),
+                    float(ir.GetValue()),
+                )
+        except Exception:
+            return None
+        return None
+
+    def set_image_param(self, param_name: str, value: float) -> bool:
+        """Write Gain / Gamma / BlackLevel (float or integer node)."""
+        if self.cam is None or not self.acquiring:
+            return False
+        try:
+            nodemap = self.cam.GetNodeMap()
+            if param_name == "Gamma":
+                ge = PySpin.CBooleanPtr(nodemap.GetNode("GammaEnable"))
+                if PySpin.IsWritable(ge):
+                    ge.SetValue(True)
+            node = nodemap.GetNode(param_name)
+            if node is None:
+                return False
+            fn = PySpin.CFloatPtr(node)
+            if PySpin.IsWritable(fn):
+                lo, hi = float(fn.GetMin()), float(fn.GetMax())
+                fn.SetValue(min(hi, max(lo, float(value))))
+                return True
+            ir = PySpin.CIntegerPtr(node)
+            if PySpin.IsWritable(ir):
+                lo, hi = int(ir.GetMin()), int(ir.GetMax())
+                iv = int(round(float(value)))
+                ir.SetValue(min(hi, max(lo, iv)))
+                return True
+        except Exception as exc:
+            print(f"[camera] set_image_param {param_name}: {exc}")
+        return False
+
+    # ------------------------------------------------------------------
     # Sync pulse logic for logging
     # ------------------------------------------------------------------
     def notify_sync_pulse_window(self, width_s: float, label: str):
