@@ -420,7 +420,7 @@ class MainWindow(QWidget):
         self._apply_state()
 
     def _notify_preview_listen_status(self) -> None:
-        """If user wanted hear-through but duplex failed, explain in the UI."""
+        """If user wanted hear-through but monitor failed, explain in the UI."""
         if not self._mic_preview_active or self._mic_preview is None:
             return
         if not self.audio_monitor_checkbox.isChecked():
@@ -429,8 +429,24 @@ class MainWindow(QWidget):
             return
         self.audio_label.setText(
             "Mic preview: level only — hear-through did not open. "
-            "Turn the checkbox on, set macOS Sound output to your headphones, "
+            "Turn the checkbox on, set the OS default output to your headphones, "
             "raise system/app volume, then stop preview and start again."
+        )
+
+    def _notify_recording_monitor_status(self, wav_path: str) -> None:
+        """had_duplex_output is set on a background thread; re-check after open."""
+        if self.state != AppState.RECORDING:
+            return
+        if self._session_audio is None:
+            return
+        if not self.audio_monitor_checkbox.isChecked():
+            return
+        if self._session_audio.had_duplex_output:
+            self.audio_label.setText(f"Microphone: recording to {wav_path}")
+            return
+        self.audio_label.setText(
+            f"Microphone: recording to {wav_path} (monitor unavailable — "
+            "check Windows sound output device / exclusive mode)."
         )
 
     def _update_mic_level_bar(self) -> None:
@@ -576,64 +592,69 @@ class MainWindow(QWidget):
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"recording_{timestamp}"
 
+            self.record_button.setEnabled(False)
+            self.record_button.setText("Starting recording… please wait")
+            self.status_label.setText("Starting recording…")
+            QApplication.processEvents()
+
             ok, msg = self.camera.start_recording(filename, fps=30.0)
             self.status_label.setText(msg)
+            QApplication.processEvents()
 
-            if ok:
-                self._stop_mic_preview()
-                # Parallel WAV with same session base name as video (recording_<ts>.avi / .wav)
-                audio_device = self.audio_input_combo.currentData()
-                self._session_audio = None
-                if audio_device is not None:
-                    wav_path = f"{filename}.wav"
-                    try:
-                        self._session_audio = SessionAudioRecorder()
-                        out_dev = self.audio_output_combo.currentData()
-                        self._session_audio.start(
-                            wav_path,
-                            int(audio_device),
-                            monitor=self.audio_monitor_checkbox.isChecked(),
-                            output_device=int(out_dev) if out_dev is not None else None,
+            if not ok:
+                self._apply_state()
+                return
+
+            self._stop_mic_preview()
+            # Parallel WAV with same session base name as video (recording_<ts>.avi / .wav)
+            audio_device = self.audio_input_combo.currentData()
+            self._session_audio = None
+            if audio_device is not None:
+                wav_path = f"{filename}.wav"
+                try:
+                    self._session_audio = SessionAudioRecorder()
+                    out_dev = self.audio_output_combo.currentData()
+                    self._session_audio.start(
+                        wav_path,
+                        int(audio_device),
+                        monitor=self.audio_monitor_checkbox.isChecked(),
+                        output_device=int(out_dev) if out_dev is not None else None,
+                    )
+                    self.audio_label.setText(
+                        f"Microphone: recording to {wav_path}"
+                    )
+                    if self.audio_monitor_checkbox.isChecked():
+                        QTimer.singleShot(
+                            500,
+                            lambda w=wav_path: self._notify_recording_monitor_status(w),
                         )
-                        if (
-                            self.audio_monitor_checkbox.isChecked()
-                            and not self._session_audio.had_duplex_output
-                        ):
-                            self.audio_label.setText(
-                                f"Microphone: recording to {wav_path} (monitor unavailable — "
-                                "check Windows sound output device / exclusive mode)."
-                            )
-                        else:
-                            self.audio_label.setText(
-                                f"Microphone: recording to {wav_path}"
-                            )
-                    except Exception as exc:
-                        self._session_audio = None
-                        print(f"Audio recording failed: {exc}")
-                        self.audio_label.setText(f"Microphone: failed ({exc}) — video only")
+                except Exception as exc:
+                    self._session_audio = None
+                    print(f"Audio recording failed: {exc}")
+                    self.audio_label.setText(f"Microphone: failed ({exc}) — video only")
 
-                # 1) fire a 100 ms hardware pulse
-                if self.pulse_manager is not None and sys.platform.startswith("win"):
-                    try:
-                        self.pulse_manager.request_pulse(
-                            width_s=SYNC_WIDTH_RECORD,
-                            label="record_start",
-                        )
-                    except Exception as e:
-                        print("Record-start pulse failed:", e)
-
-                # 2) tell the camera to mark frames in this window only
-                # if we actually sent a hardware pulse
-                if self.pulse_manager is not None and sys.platform.startswith("win"):
-                    self.camera.notify_sync_pulse_window(
+            # 1) fire a 100 ms hardware pulse
+            if self.pulse_manager is not None and sys.platform.startswith("win"):
+                try:
+                    self.pulse_manager.request_pulse(
                         width_s=SYNC_WIDTH_RECORD,
                         label="record_start",
                     )
+                except Exception as e:
+                    print("Record-start pulse failed:", e)
 
-                self.manual_sync_count = 0  # reset manual counter
+            # 2) tell the camera to mark frames in this window only
+            # if we actually sent a hardware pulse
+            if self.pulse_manager is not None and sys.platform.startswith("win"):
+                self.camera.notify_sync_pulse_window(
+                    width_s=SYNC_WIDTH_RECORD,
+                    label="record_start",
+                )
 
-                self.state = AppState.RECORDING
-                self._apply_state()
+            self.manual_sync_count = 0  # reset manual counter
+
+            self.state = AppState.RECORDING
+            self._apply_state()
 
         # Stop recording
         elif self.state == AppState.RECORDING:
