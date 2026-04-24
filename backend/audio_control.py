@@ -88,22 +88,92 @@ def list_audio_input_devices() -> list[tuple[int, str]]:
         return []
 
 
+def list_audio_output_devices() -> list[tuple[int, str]]:
+    """
+    Return (device_index, label) for each host output device.
+
+    If sounddevice is unavailable or errors, returns an empty list.
+    """
+    try:
+        import sounddevice as sd
+    except Exception:
+        return []
+
+    try:
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+
+        def hostapi_name(hostapi_index: int | None) -> str:
+            try:
+                if hostapi_index is None:
+                    return "Unknown"
+                ha = hostapis[int(hostapi_index)]
+                if isinstance(ha, dict):
+                    return str(ha.get("name") or "Unknown")
+                return "Unknown"
+            except Exception:
+                return "Unknown"
+
+        prefer_order = [
+            "Windows WASAPI",
+            "WASAPI",
+            "WDM-KS",
+            "Windows WDM-KS",
+            "DirectSound",
+            "Windows DirectSound",
+            "MME",
+            "Windows MME",
+        ]
+        prefer_rank = {n: r for r, n in enumerate(prefer_order)}
+
+        candidates: list[tuple[str, int, int, str]] = []
+        for i, d in enumerate(devices):
+            if not isinstance(d, dict):
+                continue
+            if int(d.get("max_output_channels", 0) or 0) < 1:
+                continue
+            name = str(d.get("name", f"device {i}")).strip()
+            ha_name = hostapi_name(d.get("hostapi"))  # type: ignore[arg-type]
+            rank = prefer_rank.get(ha_name, len(prefer_order))
+            norm = " ".join(name.lower().split())
+            label = f"{i}: {name} ({ha_name})"
+            candidates.append((norm, rank, i, label))
+
+        candidates.sort(key=lambda t: (t[0], t[1], t[2]))
+
+        out: list[tuple[int, str]] = []
+        seen: set[str] = set()
+        for norm, _rank, idx, label in candidates:
+            if norm in seen:
+                continue
+            seen.add(norm)
+            out.append((idx, label))
+        return out
+    except Exception:
+        return []
+
+
 def _open_duplex_stream(
     sd: Any,
     input_device: int,
     out_ch: int,
     in_samplerate: int,
     callback: Any,
+    *,
+    output_device: int | None = None,
 ) -> Any | None:
     """
-    Open full-duplex mic -> default output. Tries explicit output device and
+    Open full-duplex mic -> output. Tries explicit output device and
     several sample rates / block sizes (macOS often fails with (in, None) or SR mismatch).
     """
     try:
-        _in_def, out_def = sd.default.device
-        if out_def is None or int(out_def) < 0:
-            return None
-        out_dev = int(out_def)
+        if output_device is None:
+            _in_def, out_def = sd.default.device
+            if out_def is None or int(out_def) < 0:
+                return None
+            out_dev = int(out_def)
+        else:
+            out_dev = int(output_device)
         out_info = sd.query_devices(out_dev, "output")
         out_sr = int(float(out_info.get("default_samplerate") or in_samplerate))
         rates: list[int] = []
@@ -112,8 +182,12 @@ def _open_duplex_stream(
                 rates.append(r)
         for sr in rates:
             for extra in (
+                # Let PortAudio choose (often best on Windows/WASAPI)
+                {"latency": "high"},
+                # Common stable block sizes
                 {"blocksize": 1024},
                 {"blocksize": 512, "latency": "high"},
+                {"blocksize": 2048, "latency": "high"},
             ):
                 try:
                     return sd.Stream(
@@ -156,7 +230,13 @@ class MicLevelPreview:
         with self._level_lock:
             self._level_smoothed = 0.78 * self._level_smoothed + 0.22 * scaled
 
-    def start(self, device: int, *, monitor: bool = True) -> None:
+    def start(
+        self,
+        device: int,
+        *,
+        monitor: bool = True,
+        output_device: int | None = None,
+    ) -> None:
         if self._thread is not None and self._thread.is_alive():
             raise RuntimeError("Mic preview already running.")
         if self._thread is not None:
@@ -183,11 +263,15 @@ class MicLevelPreview:
                 out_ch = 1
                 if use_duplex:
                     try:
-                        _in_def, out_def = sd.default.device
-                        if out_def is None or int(out_def) < 0:
-                            use_duplex = False
-                        else:
-                            oinfo = sd.query_devices(out_def, "output")
+                        out_dev = output_device
+                        if out_dev is None:
+                            _in_def, out_def = sd.default.device
+                            if out_def is None or int(out_def) < 0:
+                                use_duplex = False
+                            else:
+                                out_dev = int(out_def)
+                        if use_duplex and out_dev is not None:
+                            oinfo = sd.query_devices(out_dev, "output")
                             out_ch = max(
                                 1,
                                 min(
@@ -229,7 +313,12 @@ class MicLevelPreview:
                                 outdata[:, c] = indata[:, 0]
 
                     stream = _open_duplex_stream(
-                        sd, device, out_ch, samplerate, duplex_cb
+                        sd,
+                        device,
+                        out_ch,
+                        samplerate,
+                        duplex_cb,
+                        output_device=output_device,
                     )
                     if stream is not None:
                         self.had_duplex_output = True
@@ -291,6 +380,7 @@ class SessionAudioRecorder:
         self._stream_lock = threading.Lock()
         self._level_lock = threading.Lock()
         self._level_smoothed = 0.0
+        self.had_duplex_output = False
 
     def level_0_100(self) -> int:
         with self._level_lock:
@@ -308,6 +398,7 @@ class SessionAudioRecorder:
         device: int,
         *,
         monitor: bool = True,
+        output_device: int | None = None,
     ) -> None:
         """
         Begin recording to wav_path using the given sounddevice input index.
@@ -335,6 +426,7 @@ class SessionAudioRecorder:
         self._stop.clear()
         with self._level_lock:
             self._level_smoothed = 0.0
+        self.had_duplex_output = False
 
         def run() -> None:
             try:
@@ -349,11 +441,15 @@ class SessionAudioRecorder:
                     out_ch = 1
                     if use_duplex:
                         try:
-                            _in_def, out_def = sd.default.device
-                            if out_def is None or int(out_def) < 0:
-                                use_duplex = False
-                            else:
-                                oinfo = sd.query_devices(out_def, "output")
+                            out_dev = output_device
+                            if out_dev is None:
+                                _in_def, out_def = sd.default.device
+                                if out_def is None or int(out_def) < 0:
+                                    use_duplex = False
+                                else:
+                                    out_dev = int(out_def)
+                            if use_duplex and out_dev is not None:
+                                oinfo = sd.query_devices(out_dev, "output")
                                 out_ch = max(
                                     1,
                                     min(
@@ -397,8 +493,15 @@ class SessionAudioRecorder:
                                     outdata[:, c] = indata[:, 0]
 
                         stream = _open_duplex_stream(
-                            sd, device, out_ch, samplerate, duplex_cb
+                            sd,
+                            device,
+                            out_ch,
+                            samplerate,
+                            duplex_cb,
+                            output_device=output_device,
                         )
+                        if stream is not None:
+                            self.had_duplex_output = True
                         if stream is None:
                             print(
                                 "[audio] live monitor unavailable "
