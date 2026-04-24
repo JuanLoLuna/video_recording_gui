@@ -20,6 +20,8 @@ from PySide6.QtWidgets import (
     QComboBox,
     QCheckBox,
     QProgressBar,
+    QScrollArea,
+    QSizePolicy,
 )
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QImage, QPixmap
@@ -107,7 +109,16 @@ class MainWindow(QWidget):
         self.setWindowTitle("Camera Preview")
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
-        layout = QVBoxLayout(self)
+        # Make the window usable on smaller displays (Windows laptops):
+        # put all controls in a scrollable container so nothing is inaccessible.
+        root_layout = QVBoxLayout(self)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        root_layout.addWidget(scroll)
+
+        content = QWidget()
+        scroll.setWidget(content)
+        layout = QVBoxLayout(content)
 
         self.status_label = QLabel("Press the button to detect a camera.")
         layout.addWidget(self.status_label)
@@ -161,7 +172,7 @@ class MainWindow(QWidget):
         layout.addWidget(self.audio_monitor_checkbox)
 
         output_row = QHBoxLayout()
-        output_row.addWidget(QLabel("Output"))
+        output_row.addWidget(QLabel("Audio Output"))
         self.audio_output_combo = QComboBox()
         self.audio_output_combo.setMinimumWidth(280)
         self.audio_output_combo.addItem("Default output", None)
@@ -211,7 +222,9 @@ class MainWindow(QWidget):
         # --- Image preview label ---
         self.image_label = QLabel("No video")
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setFixedSize(640, 480)
+        # Avoid fixed size so the window can shrink; keep a reasonable minimum.
+        self.image_label.setMinimumSize(480, 320)
+        self.image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout.addWidget(self.image_label)
 
         # --- Controls row: Preview / Record / Sync ---
