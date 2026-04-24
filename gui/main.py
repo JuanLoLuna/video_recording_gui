@@ -24,7 +24,6 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QFrame,
-    QPlainTextEdit,
 )
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QImage, QPixmap
@@ -304,37 +303,22 @@ class MainWindow(QWidget):
 
         layout.addLayout(controls_row)
 
-        # --- ADL label feedback (keys S / E while recording → CSV metadata) ---
+        # --- ADL label strip (S/E while recording): last action + color flash only ---
         self._label_frame_base_style = (
-            "QFrame#labelMarkerFrame { border: 1px solid #bbb; border-radius: 6px; "
-            "padding: 6px; background: #f5f5f5; }"
+            "QFrame#labelMarkerFrame { border: 1px solid #bbb; border-radius: 4px; "
+            "padding: 4px 8px; background: #f0f0f0; }"
         )
         self.label_marker_frame = QFrame()
         self.label_marker_frame.setObjectName("labelMarkerFrame")
         self.label_marker_frame.setStyleSheet(self._label_frame_base_style)
-        marker_layout = QVBoxLayout(self.label_marker_frame)
-        marker_layout.setSpacing(6)
-        self.label_hint = QLabel(
-            "While recording: press S for label START and E for END (logged with the next "
-            "frames). Select an ADL in the row below first."
-        )
-        self.label_hint.setWordWrap(True)
-        marker_layout.addWidget(self.label_hint)
-        last_row = QHBoxLayout()
-        self.label_last_event = QLabel("No marks yet.")
+        self.label_marker_frame.setMaximumHeight(40)
+        marker_layout = QHBoxLayout(self.label_marker_frame)
+        marker_layout.setContentsMargins(6, 2, 6, 2)
+        self.label_last_event = QLabel("—")
         self.label_last_event.setStyleSheet("font-weight: 600;")
-        last_row.addWidget(self.label_last_event, stretch=1)
-        self.label_count = QLabel("Marks this take: 0")
-        last_row.addWidget(self.label_count)
-        marker_layout.addLayout(last_row)
-        self.label_history = QPlainTextEdit()
-        self.label_history.setReadOnly(True)
-        self.label_history.setFixedHeight(88)
-        self.label_history.setPlaceholderText("Label events appear here during recording.")
-        self.label_history.document().setMaximumBlockCount(80)
-        marker_layout.addWidget(self.label_history)
+        self.label_last_event.setWordWrap(False)
+        marker_layout.addWidget(self.label_last_event, stretch=1)
         layout.addWidget(self.label_marker_frame)
-        self._label_mark_count = 0
 
         # --- Experiment + label dropdowns (bottom of GUI) ---
         adl_row = QHBoxLayout()
@@ -454,18 +438,6 @@ class MainWindow(QWidget):
                 self.scan_output_button.setEnabled(want_monitor)
 
         self._update_camera_tuning_widgets_enabled()
-
-        if hasattr(self, "label_hint"):
-            if self.state == AppState.RECORDING:
-                self.label_hint.setText(
-                    "Recording — press S for label START and E for END (written to the "
-                    "metadata CSV on the next frames). Choose the ADL in the row below first."
-                )
-            else:
-                self.label_hint.setText(
-                    "While recording: press S for label START and E for END (logged with the "
-                    "next frames). Select an ADL in the row below first."
-                )
 
     def _on_camera_tuning_toggle(self) -> None:
         self._camera_tuning_expanded = not self._camera_tuning_expanded
@@ -608,11 +580,8 @@ class MainWindow(QWidget):
         )
 
     def _reset_label_marker_session(self) -> None:
-        """Clear the on-screen label log when a new recording starts."""
-        self._label_mark_count = 0
-        self.label_count.setText("Marks this take: 0")
-        self.label_last_event.setText("No marks logged yet in this recording.")
-        self.label_history.clear()
+        """Reset the last-label strip when a new recording starts."""
+        self.label_last_event.setText("—")
 
     def _reset_label_marker_panel_style(self) -> None:
         self.label_marker_frame.setStyleSheet(self._label_frame_base_style)
@@ -620,13 +589,13 @@ class MainWindow(QWidget):
     def _flash_label_marker_panel(self, label_event: str) -> None:
         if label_event == "label_start":
             self.label_marker_frame.setStyleSheet(
-                "QFrame#labelMarkerFrame { border: 2px solid #2e7d32; border-radius: 6px; "
-                "padding: 6px; background: #c8e6c9; }"
+                "QFrame#labelMarkerFrame { border: 2px solid #2e7d32; border-radius: 4px; "
+                "padding: 4px 8px; background: #c8e6c9; }"
             )
         else:
             self.label_marker_frame.setStyleSheet(
-                "QFrame#labelMarkerFrame { border: 2px solid #e65100; border-radius: 6px; "
-                "padding: 6px; background: #ffe0b2; }"
+                "QFrame#labelMarkerFrame { border: 2px solid #e65100; border-radius: 4px; "
+                "padding: 4px 8px; background: #ffe0b2; }"
             )
         QTimer.singleShot(220, self._reset_label_marker_panel_style)
 
@@ -636,16 +605,15 @@ class MainWindow(QWidget):
         adl_id,
         adl_label: str | None,
     ) -> None:
-        self._label_mark_count += 1
-        self.label_count.setText(f"Marks this take: {self._label_mark_count}")
-        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]  # trim to ms
+        if label_event == "label_start":
+            verb = "START"
+        else:
+            verb = "END"
         if adl_id is None:
-            name = "(no ADL selected)"
+            name = "(no ADL)"
         else:
             name = (adl_label or "").strip() or f"ID {adl_id}"
-        short = f"{label_event} — {name}"
-        self.label_last_event.setText(f"Last: {short}")
-        self.label_history.appendPlainText(f"{ts}  {label_event}  —  {name}")
+        self.label_last_event.setText(f"{verb} — {name}")
         self._flash_label_marker_panel(label_event)
 
     def _notify_recording_monitor_status(self, wav_path: str) -> None:
