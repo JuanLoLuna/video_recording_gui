@@ -123,11 +123,25 @@ class MainWindow(QWidget):
         layout = QVBoxLayout(content)
 
         self.status_label = QLabel("Press the button to detect a camera.")
+        self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
+
+        # --- Setup & options (hidden while recording) ---
+        self._setup_options_expanded = True
+        self.setup_options_toggle = QPushButton("▼ Setup & options")
+        self.setup_options_toggle.setStyleSheet(
+            "QPushButton { text-align: left; padding: 6px 8px; }"
+        )
+        self.setup_options_toggle.clicked.connect(self._on_setup_options_toggle)
+        layout.addWidget(self.setup_options_toggle)
+
+        self.setup_panel = QWidget()
+        setup_inner = QVBoxLayout(self.setup_panel)
+        setup_inner.setContentsMargins(0, 0, 0, 0)
 
         self.detect_button = QPushButton("Detect camera")
         self.detect_button.clicked.connect(self.on_detect_clicked)
-        layout.addWidget(self.detect_button)
+        setup_inner.addWidget(self.detect_button)
 
         # --- Collapsible camera image tuning (Spinnaker GenICam) ---
         self._camera_tuning_expanded = False
@@ -138,7 +152,7 @@ class MainWindow(QWidget):
             "QPushButton { text-align: left; padding: 6px 8px; }"
         )
         self.camera_tuning_toggle.clicked.connect(self._on_camera_tuning_toggle)
-        layout.addWidget(self.camera_tuning_toggle)
+        setup_inner.addWidget(self.camera_tuning_toggle)
 
         self.camera_tuning_panel = QWidget()
         tuning_layout = QVBoxLayout(self.camera_tuning_panel)
@@ -182,11 +196,11 @@ class MainWindow(QWidget):
         self.camera_tuning_hint.setStyleSheet("color: #555; font-size: 11px;")
         tuning_layout.addWidget(self.camera_tuning_hint)
         self.camera_tuning_panel.setVisible(False)
-        layout.addWidget(self.camera_tuning_panel)
+        setup_inner.addWidget(self.camera_tuning_panel)
 
         # --- Sync / NI-DAQ status ---
         self.sync_label = QLabel("Sync not available — no DAQ connected")
-        layout.addWidget(self.sync_label)
+        setup_inner.addWidget(self.sync_label)
 
         daq_row = QHBoxLayout()
         self.daq_line_combo = QComboBox()
@@ -203,11 +217,11 @@ class MainWindow(QWidget):
         self.connect_daq_button.clicked.connect(self.on_connect_daq_clicked)
         daq_row.addWidget(self.connect_daq_button)
 
-        layout.addLayout(daq_row)
+        setup_inner.addLayout(daq_row)
 
         # --- Microphone (optional WAV alongside video) ---
         self.audio_label = QLabel("Microphone: scan and choose a device, or leave as no audio.")
-        layout.addWidget(self.audio_label)
+        setup_inner.addWidget(self.audio_label)
         audio_row = QHBoxLayout()
         self.audio_input_combo = QComboBox()
         self.audio_input_combo.setMinimumWidth(280)
@@ -219,14 +233,14 @@ class MainWindow(QWidget):
         self.scan_audio_button = QPushButton("Scan")
         self.scan_audio_button.clicked.connect(self.on_scan_audio_clicked)
         audio_row.addWidget(self.scan_audio_button)
-        layout.addLayout(audio_row)
+        setup_inner.addLayout(audio_row)
 
         self.audio_monitor_checkbox = QCheckBox(
             "Hear live mic in headphones (Preview mic + recording; avoids speaker feedback)"
         )
         self.audio_monitor_checkbox.setChecked(True)
         self.audio_monitor_checkbox.stateChanged.connect(self._on_audio_monitor_changed)
-        layout.addWidget(self.audio_monitor_checkbox)
+        setup_inner.addWidget(self.audio_monitor_checkbox)
 
         output_row = QHBoxLayout()
         output_row.addWidget(QLabel("Audio Output"))
@@ -240,13 +254,41 @@ class MainWindow(QWidget):
         self.scan_output_button = QPushButton("Scan")
         self.scan_output_button.clicked.connect(self.on_scan_output_clicked)
         output_row.addWidget(self.scan_output_button)
-        layout.addLayout(output_row)
+        setup_inner.addLayout(output_row)
 
         mic_preview_row = QHBoxLayout()
         self.mic_preview_button = QPushButton("Preview mic")
         self.mic_preview_button.clicked.connect(self.on_mic_preview_clicked)
         mic_preview_row.addWidget(self.mic_preview_button)
-        mic_preview_row.addWidget(QLabel("Input level"))
+        mic_preview_row.addStretch(1)
+        setup_inner.addLayout(mic_preview_row)
+
+        layout.addWidget(self.setup_panel)
+
+        # --- Session bar (always visible): transport, level, ADL — stays compact while recording ---
+        self.session_bar = QWidget()
+        session_layout = QVBoxLayout(self.session_bar)
+        session_layout.setContentsMargins(0, 4, 0, 0)
+        session_layout.setSpacing(6)
+
+        self.preview_button = QPushButton("Start Preview")
+        self.preview_button.clicked.connect(self.on_preview_clicked)
+
+        self.record_button = QPushButton("Start Recording")
+        self.record_button.clicked.connect(self.on_record_clicked)
+
+        self.sync_button = QPushButton("Sync Pulse")
+        self.sync_button.setEnabled(False)
+        self.sync_button.clicked.connect(self.on_sync_pulse_clicked)
+
+        controls_row = QHBoxLayout()
+        controls_row.addWidget(self.preview_button)
+        controls_row.addWidget(self.record_button)
+        controls_row.addWidget(self.sync_button)
+        session_layout.addLayout(controls_row)
+
+        level_row = QHBoxLayout()
+        level_row.addWidget(QLabel("Mic level"))
         self.audio_level_bar = QProgressBar()
         self.audio_level_bar.setRange(0, 100)
         self.audio_level_bar.setValue(0)
@@ -256,8 +298,8 @@ class MainWindow(QWidget):
             "QProgressBar { border: 1px solid #888; border-radius: 3px; background: #e8e8e8; }"
             "QProgressBar::chunk { background-color: #2e7d32; border-radius: 2px; }"
         )
-        mic_preview_row.addWidget(self.audio_level_bar, stretch=1)
-        layout.addLayout(mic_preview_row)
+        level_row.addWidget(self.audio_level_bar, stretch=1)
+        session_layout.addLayout(level_row)
 
         # Disable DAQ controls on non-Windows
         if not sys.platform.startswith("win"):
@@ -276,34 +318,14 @@ class MainWindow(QWidget):
         self.mic_level_timer.timeout.connect(self._update_mic_level_bar)
         self.mic_level_timer.start(50)
 
-        # --- Image preview label ---
+        # --- Image preview (stretches between setup and session bar) ---
         self.image_label = QLabel("No video")
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        # Avoid fixed size so the window can shrink; keep a reasonable minimum.
         self.image_label.setMinimumSize(480, 320)
         self.image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        layout.addWidget(self.image_label)
+        layout.addWidget(self.image_label, stretch=1)
 
-        # --- Controls row: Preview / Record / Sync ---
-        self.preview_button = QPushButton("Start Preview")
-        self.preview_button.clicked.connect(self.on_preview_clicked)
-
-        self.record_button = QPushButton("Start Recording")
-        self.record_button.clicked.connect(self.on_record_clicked)
-
-        # Sync pulse button (formerly "test pulse")
-        self.sync_button = QPushButton("Sync Pulse")
-        self.sync_button.setEnabled(False)  # enabled after DAQ connects
-        self.sync_button.clicked.connect(self.on_sync_pulse_clicked)
-
-        controls_row = QHBoxLayout()
-        controls_row.addWidget(self.preview_button)
-        controls_row.addWidget(self.record_button)
-        controls_row.addWidget(self.sync_button)
-
-        layout.addLayout(controls_row)
-
-        # --- ADL label strip (S/E while recording): last action + color flash only ---
+        # --- ADL label strip (session bar) ---
         self._label_frame_base_style = (
             "QFrame#labelMarkerFrame { border: 1px solid #bbb; border-radius: 4px; "
             "padding: 4px 8px; background: #f0f0f0; }"
@@ -318,9 +340,8 @@ class MainWindow(QWidget):
         self.label_last_event.setStyleSheet("font-weight: 600;")
         self.label_last_event.setWordWrap(False)
         marker_layout.addWidget(self.label_last_event, stretch=1)
-        layout.addWidget(self.label_marker_frame)
+        session_layout.addWidget(self.label_marker_frame)
 
-        # --- Experiment + label dropdowns (bottom of GUI) ---
         adl_row = QHBoxLayout()
         self.experiment_dropdown = QComboBox()
         for experiment_name in EXPERIMENT_LABELS:
@@ -331,7 +352,9 @@ class MainWindow(QWidget):
         self.adl_dropdown = QComboBox()
         adl_row.addWidget(self.adl_dropdown)
         self._populate_label_dropdown(self.experiment_dropdown.currentText())
-        layout.addLayout(adl_row)
+        session_layout.addLayout(adl_row)
+
+        layout.addWidget(self.session_bar)
 
         # --- Camera controller + timer ---
         self.camera = CameraController()
@@ -438,6 +461,37 @@ class MainWindow(QWidget):
                 self.scan_output_button.setEnabled(want_monitor)
 
         self._update_camera_tuning_widgets_enabled()
+        self._update_recording_chrome()
+
+    def _refresh_setup_options_toggle_text(self) -> None:
+        if not hasattr(self, "setup_options_toggle"):
+            return
+        arrow = "▼" if self._setup_options_expanded else "▶"
+        self.setup_options_toggle.setText(f"{arrow} Setup & options")
+
+    def _on_setup_options_toggle(self) -> None:
+        if self.state == AppState.RECORDING:
+            return
+        self._setup_options_expanded = not self._setup_options_expanded
+        self.setup_panel.setVisible(self._setup_options_expanded)
+        self._refresh_setup_options_toggle_text()
+
+    def _update_recording_chrome(self) -> None:
+        """Hide setup chrome while recording; keep session bar (video, transport, ADL)."""
+        if not hasattr(self, "session_bar"):
+            return
+        rec = self.state == AppState.RECORDING
+        if rec:
+            self.setup_options_toggle.setVisible(False)
+            self.setup_panel.setVisible(False)
+            self.preview_button.setVisible(False)
+            self.status_label.setMaximumHeight(72)
+        else:
+            self.setup_options_toggle.setVisible(True)
+            self.setup_panel.setVisible(self._setup_options_expanded)
+            self.preview_button.setVisible(True)
+            self.status_label.setMaximumHeight(16_777_215)
+        self._refresh_setup_options_toggle_text()
 
     def _on_camera_tuning_toggle(self) -> None:
         self._camera_tuning_expanded = not self._camera_tuning_expanded
