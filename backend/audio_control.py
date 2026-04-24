@@ -32,14 +32,57 @@ def list_audio_input_devices() -> list[tuple[int, str]]:
 
     try:
         devices = sd.query_devices()
-        out: list[tuple[int, str]] = []
+        hostapis = sd.query_hostapis()
+
+        def hostapi_name(hostapi_index: int | None) -> str:
+            try:
+                if hostapi_index is None:
+                    return "Unknown"
+                ha = hostapis[int(hostapi_index)]
+                if isinstance(ha, dict):
+                    return str(ha.get("name") or "Unknown")
+                return "Unknown"
+            except Exception:
+                return "Unknown"
+
+        # Windows commonly lists the same physical mic multiple times across host APIs.
+        # Prefer WASAPI entries and deduplicate by normalized device name.
+        prefer_order = [
+            "Windows WASAPI",
+            "WASAPI",
+            "WDM-KS",
+            "Windows WDM-KS",
+            "DirectSound",
+            "Windows DirectSound",
+            "MME",
+            "Windows MME",
+        ]
+        prefer_rank = {n: r for r, n in enumerate(prefer_order)}
+
+        candidates: list[tuple[str, int, int, str]] = []
+        # tuple: (norm_name, rank, device_index, label)
         for i, d in enumerate(devices):
             if not isinstance(d, dict):
                 continue
             if int(d.get("max_input_channels", 0) or 0) < 1:
                 continue
-            name = str(d.get("name", f"device {i}"))
-            out.append((i, f"{i}: {name}"))
+            name = str(d.get("name", f"device {i}")).strip()
+            ha_name = hostapi_name(d.get("hostapi"))  # type: ignore[arg-type]
+            rank = prefer_rank.get(ha_name, len(prefer_order))
+            norm = " ".join(name.lower().split())
+            label = f"{i}: {name} ({ha_name})"
+            candidates.append((norm, rank, i, label))
+
+        # Stable: sort by name, host-api preference, then index.
+        candidates.sort(key=lambda t: (t[0], t[1], t[2]))
+
+        out: list[tuple[int, str]] = []
+        seen: set[str] = set()
+        for norm, _rank, idx, label in candidates:
+            if norm in seen:
+                continue
+            seen.add(norm)
+            out.append((idx, label))
         return out
     except Exception:
         return []
