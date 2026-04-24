@@ -75,6 +75,7 @@ def _run_split_monitor_streams(
     stop_event: threading.Event,
     on_input_mono: Callable[[Any], None],
     blocksize: int = 1024,
+    on_monitor_started: Callable[[], None] | None = None,
 ) -> bool:
     """
     Input-only + output-only streams with a small queue (Windows-friendly when
@@ -154,6 +155,11 @@ def _run_split_monitor_streams(
                         latency="high",
                         callback=in_cb,
                     ):
+                        if on_monitor_started is not None:
+                            try:
+                                on_monitor_started()
+                            except Exception:
+                                pass
                         while not stop_event.is_set():
                             time.sleep(0.05)
                     return True
@@ -478,10 +484,11 @@ class MicLevelPreview:
                             out_ch=out_ch,
                             stop_event=self._stop,
                             on_input_mono=self._feed_level,
+                            on_monitor_started=lambda: setattr(
+                                self, "had_duplex_output", True
+                            ),
                         )
-                        if used_split_monitor:
-                            self.had_duplex_output = True
-                        else:
+                        if not used_split_monitor:
                             print(
                                 "[audio] preview monitor unavailable "
                                 "(duplex and split-monitor open failed); "
@@ -683,10 +690,11 @@ class SessionAudioRecorder:
                                 out_ch=out_ch,
                                 stop_event=self._stop,
                                 on_input_mono=on_mono,
+                                on_monitor_started=lambda: setattr(
+                                    self, "had_duplex_output", True
+                                ),
                             )
-                            if used_split_monitor:
-                                self.had_duplex_output = True
-                            else:
+                            if not used_split_monitor:
                                 print(
                                     "[audio] live monitor unavailable "
                                     "(duplex and split-monitor open failed); "
