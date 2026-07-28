@@ -90,6 +90,10 @@ class CameraController:
 
         self.avi_recorder = None
         self.recording_fps = 30.0
+        # Target acquisition frame rate (fps). Applied in start(); can be changed
+        # live via set_frame_rate(). recording_fps follows it so AVI playback
+        # speed matches the real capture rate.
+        self.target_frame_rate = 30.0
         self.record_filename = None
         self.metadata_records = []
         self.frame_counter = 0
@@ -142,7 +146,15 @@ class CameraController:
                 frame_rate_enable.SetValue(True)
             frame_rate = PySpin.CFloatPtr(nodemap.GetNode("AcquisitionFrameRate"))
             if PySpin.IsWritable(frame_rate):
-                frame_rate.SetValue(30.0)  # target 30 fps
+                lo, hi = float(frame_rate.GetMin()), float(frame_rate.GetMax())
+                target = min(hi, max(lo, float(self.target_frame_rate)))
+                frame_rate.SetValue(target)
+            # Read back whatever the camera actually applied so recording fps
+            # (AVI playback speed) matches the true capture rate.
+            if PySpin.IsReadable(frame_rate):
+                actual = float(frame_rate.GetValue())
+                self.target_frame_rate = actual
+                self.recording_fps = actual
 
             self.cam.BeginAcquisition()
             self.acquiring = True
@@ -558,6 +570,69 @@ class CameraController:
                 return True
         except Exception as exc:
             print(f"[camera] set_image_param {param_name}: {exc}")
+        return False
+
+    # ------------------------------------------------------------------
+    # Acquisition frame rate (GenICam; GUI thread while acquiring)
+    # ------------------------------------------------------------------
+
+    def get_frame_rate_limits(self) -> tuple[float, float, float] | None:
+        """
+        Return (min, max, current) fps for AcquisitionFrameRate, or None if
+        the camera does not expose an adjustable frame rate.
+
+        Enables AcquisitionFrameRateEnable first so the node is readable; the
+        'current' value right after enabling reflects the camera's default
+        (typically its max sustainable rate at the current exposure).
+        """
+        if self.cam is None or not self.acquiring:
+            return None
+        try:
+            nodemap = self.cam.GetNodeMap()
+            enable = PySpin.CBooleanPtr(nodemap.GetNode("AcquisitionFrameRateEnable"))
+            if PySpin.IsWritable(enable):
+                enable.SetValue(True)
+            node = PySpin.CFloatPtr(nodemap.GetNode("AcquisitionFrameRate"))
+            if PySpin.IsReadable(node):
+                return (
+                    float(node.GetMin()),
+                    float(node.GetMax()),
+                    float(node.GetValue()),
+                )
+        except Exception:
+            return None
+        return None
+
+    def get_acquisition_frame_rate(self) -> float:
+        """Current acquisition fps, or the last-known target if unreadable."""
+        limits = self.get_frame_rate_limits()
+        if limits is None:
+            return float(self.target_frame_rate)
+        return limits[2]
+
+    def set_frame_rate(self, value: float) -> bool:
+        """
+        Set AcquisitionFrameRate (clamped to the camera's supported range) and
+        keep recording_fps in sync so AVI playback speed matches capture.
+        Returns True on success.
+        """
+        if self.cam is None or not self.acquiring:
+            return False
+        try:
+            nodemap = self.cam.GetNodeMap()
+            enable = PySpin.CBooleanPtr(nodemap.GetNode("AcquisitionFrameRateEnable"))
+            if PySpin.IsWritable(enable):
+                enable.SetValue(True)
+            node = PySpin.CFloatPtr(nodemap.GetNode("AcquisitionFrameRate"))
+            if PySpin.IsWritable(node):
+                lo, hi = float(node.GetMin()), float(node.GetMax())
+                node.SetValue(min(hi, max(lo, float(value))))
+                actual = float(node.GetValue())
+                self.target_frame_rate = actual
+                self.recording_fps = actual
+                return True
+        except Exception as exc:
+            print(f"[camera] set_frame_rate: {exc}")
         return False
 
     # ------------------------------------------------------------------

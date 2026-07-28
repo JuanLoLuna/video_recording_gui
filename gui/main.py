@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSlider,
+    QDoubleSpinBox,
     QFrame,
 )
 from PySide6.QtCore import QTimer, Qt
@@ -197,6 +198,31 @@ class MainWindow(QWidget):
         tuning_layout.addWidget(self.camera_tuning_hint)
         self.camera_tuning_panel.setVisible(False)
         setup_inner.addWidget(self.camera_tuning_panel)
+
+        # --- Acquisition frame rate (fps) ---
+        # Drives both the camera sensor rate and the AVI playback rate, so they
+        # stay matched. Range/current are read from the camera once preview
+        # starts; locked while recording to avoid changing capture speed mid-file.
+        fps_row = QHBoxLayout()
+        fps_row.addWidget(QLabel("Frame rate"))
+        self.frame_rate_spin = QDoubleSpinBox()
+        self.frame_rate_spin.setDecimals(1)
+        self.frame_rate_spin.setSingleStep(1.0)
+        self.frame_rate_spin.setRange(1.0, 1000.0)
+        self.frame_rate_spin.setValue(30.0)
+        self.frame_rate_spin.setSuffix(" fps")
+        self.frame_rate_spin.setEnabled(False)
+        self.frame_rate_spin.valueChanged.connect(self._on_frame_rate_changed)
+        fps_row.addWidget(self.frame_rate_spin)
+        fps_row.addStretch(1)
+        setup_inner.addLayout(fps_row)
+
+        self.frame_rate_hint = QLabel(
+            "Start preview to read the camera's supported range and current rate."
+        )
+        self.frame_rate_hint.setWordWrap(True)
+        self.frame_rate_hint.setStyleSheet("color: #555; font-size: 11px;")
+        setup_inner.addWidget(self.frame_rate_hint)
 
         # --- Sync / NI-DAQ status ---
         self.sync_label = QLabel("Sync not available — no DAQ connected")
@@ -459,6 +485,7 @@ class MainWindow(QWidget):
                 self.scan_output_button.setEnabled(want_monitor)
 
         self._update_camera_tuning_widgets_enabled()
+        self._update_frame_rate_widget_enabled()
         self._update_recording_chrome()
 
     def _refresh_setup_options_toggle_text(self) -> None:
@@ -547,6 +574,48 @@ class MainWindow(QWidget):
                 sl.setValue(int(round(t * steps)))
                 lbl.setText(f"{cur:.4g}")
             sl.blockSignals(False)
+
+    def _sync_frame_rate_from_camera(self) -> None:
+        """Read the camera's frame-rate range/current and fill the spin box."""
+        spin = self.frame_rate_spin
+        limits = self.camera.get_frame_rate_limits()
+        if limits is None:
+            spin.blockSignals(True)
+            spin.setEnabled(False)
+            spin.blockSignals(False)
+            self.frame_rate_hint.setText("Frame rate not adjustable on this camera.")
+            return
+        mn, mx, cur = limits
+        spin.blockSignals(True)
+        spin.setRange(mn, mx)
+        spin.setValue(cur)
+        spin.blockSignals(False)
+        self._update_frame_rate_widget_enabled()
+        self.frame_rate_hint.setText(
+            f"Camera supports {mn:.1f}–{mx:.1f} fps. Current rate: {cur:.1f} fps "
+            f"(also sets AVI playback speed)."
+        )
+
+    def _on_frame_rate_changed(self, value: float) -> None:
+        if not self.frame_rate_spin.isEnabled():
+            return
+        if not self.camera.set_frame_rate(float(value)):
+            return
+        actual = self.camera.get_acquisition_frame_rate()
+        # Camera may snap to a nearby achievable rate; reflect what it accepted.
+        if abs(actual - float(value)) > 0.05:
+            self.frame_rate_spin.blockSignals(True)
+            self.frame_rate_spin.setValue(actual)
+            self.frame_rate_spin.blockSignals(False)
+        self.frame_rate_hint.setText(
+            f"Frame rate set to {actual:.1f} fps (also sets AVI playback speed)."
+        )
+
+    def _update_frame_rate_widget_enabled(self) -> None:
+        """Adjustable only while previewing — locked when idle or recording."""
+        if not hasattr(self, "frame_rate_spin"):
+            return
+        self.frame_rate_spin.setEnabled(self.state == AppState.PREVIEWING)
 
     def _update_camera_tuning_widgets_enabled(self) -> None:
         if not self._slider_meta:
@@ -798,14 +867,17 @@ class MainWindow(QWidget):
             if not ok:
                 return
 
-            # This controls PREVIEW fps, not camera fps.
-            # 33 ms ~ 30 fps, 16 ms ~ 60 fps, 8 ms ~ 90 fps.
-            self.timer.start(8)
+            # This controls PREVIEW redraw rate, NOT camera fps. Redrawing faster
+            # than the camera produces frames just burns GUI-thread time on
+            # repeated smooth-scaled repaints and makes the UI feel laggy.
+            # 33 ms ~ 30 fps matches the default capture rate.
+            self.timer.start(33)
             self.preview_running = True
             self.preview_button.setText("Stop Preview")
             self.state = AppState.PREVIEWING
             self._apply_state()
             self._sync_image_sliders_from_camera()
+            self._sync_frame_rate_from_camera()
 
 
         else:
@@ -818,6 +890,9 @@ class MainWindow(QWidget):
             self.image_label.setPixmap(QPixmap())
             self.image_label.setText("No video")
             self.status_label.setText("Preview stopped.")
+            self.frame_rate_hint.setText(
+                "Start preview to read the camera's supported range and current rate."
+            )
             self.state = AppState.CAMERA_DETECTED
             self._apply_state()
 
@@ -833,7 +908,9 @@ class MainWindow(QWidget):
             self.status_label.setText("Starting recording…")
             QApplication.processEvents()
 
-            ok, msg = self.camera.start_recording(filename, fps=30.0)
+            # Use the camera's real acquisition rate so AVI playback speed matches.
+            fps = self.camera.get_acquisition_frame_rate() or 30.0
+            ok, msg = self.camera.start_recording(filename, fps=fps)
             self.status_label.setText(msg)
             QApplication.processEvents()
 
