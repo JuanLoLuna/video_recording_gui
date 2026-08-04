@@ -366,6 +366,11 @@ class MainWindow(QWidget):
         marker_layout.addWidget(self.label_last_event, stretch=1)
         session_layout.addWidget(self.label_marker_frame)
 
+        # Label-pair feedback is kept per label, so changing the dropdown shows
+        # the completed-pair count for that specific label.
+        self._label_pair_counts: dict[int, int] = {}
+        self._open_label_ids: set[int] = set()
+
         adl_row = QHBoxLayout()
         self.experiment_dropdown = QComboBox()
         for experiment_name in EXPERIMENT_LABELS:
@@ -374,7 +379,14 @@ class MainWindow(QWidget):
         adl_row.addWidget(self.experiment_dropdown)
 
         self.adl_dropdown = QComboBox()
+        self.adl_dropdown.currentIndexChanged.connect(self._update_label_pair_counter)
         adl_row.addWidget(self.adl_dropdown)
+        self.label_pair_counter = QLabel("Completed pairs: 0")
+        self.label_pair_counter.setStyleSheet("font-weight: 600;")
+        self.label_pair_counter.setToolTip(
+            "Number of completed start/end pairs for the selected label in this recording."
+        )
+        adl_row.addWidget(self.label_pair_counter)
         self._populate_label_dropdown(self.experiment_dropdown.currentText())
         session_layout.addLayout(adl_row)
 
@@ -429,6 +441,12 @@ class MainWindow(QWidget):
 
     def on_experiment_changed(self, _index=None):
         self._populate_label_dropdown(self.experiment_dropdown.currentText())
+
+    def _update_label_pair_counter(self, _index=None) -> None:
+        """Show the completed start/end-pair count for the selected label."""
+        adl_id = self.adl_dropdown.currentData()
+        count = self._label_pair_counts.get(adl_id, 0) if adl_id is not None else 0
+        self.label_pair_counter.setText(f"Completed pairs: {count}")
 
     def _apply_state(self):
         if self.state == AppState.IDLE:
@@ -701,8 +719,26 @@ class MainWindow(QWidget):
         )
 
     def _reset_label_marker_session(self) -> None:
-        """Reset the last-label strip when a new recording starts."""
+        """Reset label feedback when a new recording starts."""
         self.label_last_event.setText("—")
+        self._label_pair_counts.clear()
+        self._open_label_ids.clear()
+        self._update_label_pair_counter()
+
+    def _record_label_pair_event(self, label_event: str, adl_id) -> bool:
+        """Track valid start/end pairs and return whether one just completed."""
+        if adl_id is None:
+            return False
+        if label_event == "label_start":
+            self._open_label_ids.add(adl_id)
+            return False
+        if adl_id not in self._open_label_ids:
+            return False
+
+        self._open_label_ids.remove(adl_id)
+        self._label_pair_counts[adl_id] = self._label_pair_counts.get(adl_id, 0) + 1
+        self._update_label_pair_counter()
+        return True
 
     def _reset_label_marker_panel_style(self) -> None:
         self.label_marker_frame.setStyleSheet(self._label_frame_base_style)
@@ -1036,8 +1072,11 @@ class MainWindow(QWidget):
         adl_label = self.adl_dropdown.currentText() if adl_id is not None else None
         self.camera.notify_label_event(label_event, adl_id, adl_label)
         self._append_label_marker_activity(label_event, adl_id, adl_label)
+        pair_completed = self._record_label_pair_event(label_event, adl_id)
+        pair_message = " Completed pair." if pair_completed else ""
         self.status_label.setText(
             f"Logged {label_event} ({adl_label if adl_label else 'no ADL selected'})."
+            f"{pair_message}"
         )
 
     def closeEvent(self, event):
