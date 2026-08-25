@@ -2,8 +2,23 @@
 import threading
 import time
 import csv
+from dataclasses import dataclass
+
 import numpy as np
 import PySpin
+
+
+@dataclass(frozen=True)
+class PreviewFrame:
+    """An owned preview image plus timing captured along its pipeline."""
+
+    image: np.ndarray
+    sequence: int
+    frame_id: int | None
+    camera_timestamp: int | None
+    retrieved_at: float
+    published_at: float
+
 
 def detect_first_camera():
     """
@@ -81,7 +96,18 @@ class CameraController:
 
         # Latest frame for preview
         self._latest_frame = None
+        self._latest_preview_frame: PreviewFrame | None = None
         self._frame_lock = threading.Lock()
+
+        # Acquisition health used by the GUI diagnostics. These counters are
+        # intentionally separate from recording metadata so preview can be
+        # diagnosed before and after a recording.
+        self._acquisition_stats_lock = threading.Lock()
+        self._preview_sequence = 0
+        self._last_camera_frame_id = None
+        self._camera_frame_gaps = 0
+        self._incomplete_images = 0
+        self._acquisition_errors = 0
 
         # Recording state/flags (thread-safe)
         self.recording_active = False          # true while SpinVideo is open
@@ -159,6 +185,7 @@ class CameraController:
             self.cam.BeginAcquisition()
             self.acquiring = True
             self._stop_event.clear()
+            self._reset_acquisition_stats()
 
             self._acq_thread = threading.Thread(
                 target=self._acquisition_loop,
@@ -227,6 +254,7 @@ class CameraController:
 
         self.acquiring = False
         self._latest_frame = None
+        self._latest_preview_frame = None
 
     def _cleanup_system(self):
         if self.system is not None:
@@ -408,11 +436,46 @@ class CameraController:
             try:
                 image = self.cam.GetNextImage()
             except Exception:
+                with self._acquisition_stats_lock:
+                    self._acquisition_errors += 1
                 continue
 
+            retrieved_at = time.monotonic()
+
             if image.IsIncomplete():
+                with self._acquisition_stats_lock:
+                    self._incomplete_images += 1
                 image.Release()
                 continue
+
+            # Read camera identity/timing for every complete frame, including
+            # preview-only frames. Previously these were read only while recording.
+            timestamp_us = None
+            frame_id = None
+            try:
+                chunk_data = image.GetChunkData()
+                if hasattr(chunk_data, "GetTimestamp"):
+                    try:
+                        timestamp_us = chunk_data.GetTimestamp()
+                    except Exception:
+                        timestamp_us = None
+                if hasattr(chunk_data, "GetFrameID"):
+                    try:
+                        frame_id = chunk_data.GetFrameID()
+                    except Exception:
+                        frame_id = None
+            except Exception:
+                pass
+
+            with self._acquisition_stats_lock:
+                self._preview_sequence += 1
+                preview_sequence = self._preview_sequence
+                if frame_id is not None and self._last_camera_frame_id is not None:
+                    frame_delta = int(frame_id) - int(self._last_camera_frame_id)
+                    if frame_delta > 1:
+                        self._camera_frame_gaps += frame_delta - 1
+                if frame_id is not None:
+                    self._last_camera_frame_id = int(frame_id)
 
             # --------------------------------------------------
             # If recording, append frame + log metadata
@@ -443,26 +506,6 @@ class CameraController:
                 except Exception as exc:
                     print("Error appending frame:", exc)
 
-                # --- Check chunk data ---
-                timestamp_us = None
-                frame_id = None
-
-                try:
-                    chunk_data = image.GetChunkData()
-                    if hasattr(chunk_data, "GetTimestamp"):
-                        try:
-                            timestamp_us = chunk_data.GetTimestamp()
-                        except Exception:
-                            timestamp_us = None
-                    if hasattr(chunk_data, "GetFrameID"):
-                        try:
-                            frame_id = chunk_data.GetFrameID()
-                        except Exception:
-                            frame_id = None
-
-                except Exception:
-                    pass
-
                 self.metadata_records.append(
                     {
                         "record_frame_index": int(self.frame_counter),
@@ -482,8 +525,20 @@ class CameraController:
             try:
                 arr = image.GetNDArray()
                 arr = np.array(arr, copy=True)
+                published_at = time.monotonic()
+                preview_frame = PreviewFrame(
+                    image=arr,
+                    sequence=preview_sequence,
+                    frame_id=int(frame_id) if frame_id is not None else None,
+                    camera_timestamp=(
+                        int(timestamp_us) if timestamp_us is not None else None
+                    ),
+                    retrieved_at=retrieved_at,
+                    published_at=published_at,
+                )
                 with self._frame_lock:
                     self._latest_frame = arr
+                    self._latest_preview_frame = preview_frame
             except Exception:
                 pass
 
@@ -502,6 +557,44 @@ class CameraController:
             if self._latest_frame is None:
                 return None
             return self._latest_frame.copy()
+
+    def get_latest_preview_frame(
+        self,
+        after_sequence: int | None = None,
+    ) -> PreviewFrame | None:
+        """Return a new owned preview frame, or ``None`` if it is unchanged."""
+        with self._frame_lock:
+            latest = self._latest_preview_frame
+            if latest is None or (
+                after_sequence is not None and latest.sequence == after_sequence
+            ):
+                return None
+            return PreviewFrame(
+                image=latest.image.copy(),
+                sequence=latest.sequence,
+                frame_id=latest.frame_id,
+                camera_timestamp=latest.camera_timestamp,
+                retrieved_at=latest.retrieved_at,
+                published_at=latest.published_at,
+            )
+
+    def _reset_acquisition_stats(self) -> None:
+        with self._acquisition_stats_lock:
+            self._preview_sequence = 0
+            self._last_camera_frame_id = None
+            self._camera_frame_gaps = 0
+            self._incomplete_images = 0
+            self._acquisition_errors = 0
+
+    def get_acquisition_stats(self) -> dict[str, int]:
+        """Return a thread-safe acquisition-health snapshot."""
+        with self._acquisition_stats_lock:
+            return {
+                "complete_frames": self._preview_sequence,
+                "camera_frame_gaps": self._camera_frame_gaps,
+                "incomplete_images": self._incomplete_images,
+                "acquisition_errors": self._acquisition_errors,
+            }
 
     # ------------------------------------------------------------------
     # Image controls (GenICam; GUI thread while acquiring)

@@ -1,5 +1,6 @@
 import atexit
 import sys
+import time
 from pathlib import Path
 
 # Allow direct script execution via `python gui/main.py` by exposing the repo root.
@@ -40,6 +41,10 @@ from backend.audio_control import (
 from backend.camera_control import detect_first_camera, CameraController
 from backend.ni_control import NIDaqDO, DOLine, list_do_lines
 from backend.pulse_manager import PulseManager
+from backend.preview_diagnostics import (
+    AsyncDiagnosticsCsvLogger,
+    PreviewDiagnosticsAccumulator,
+)
 
 SYNC_WIDTH_RECORD = 0.100  # 100 ms
 
@@ -349,6 +354,11 @@ class MainWindow(QWidget):
         self.image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout.addWidget(self.image_label, stretch=1)
 
+        self.preview_health_label = QLabel("Preview pipeline: waiting for preview")
+        self.preview_health_label.setStyleSheet("color: #555; font-size: 11px;")
+        self.preview_health_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        layout.addWidget(self.preview_health_label)
+
         # --- ADL label strip (session bar) ---
         self._label_frame_base_style = (
             "QFrame#labelMarkerFrame { border: 1px solid #bbb; border-radius: 4px; "
@@ -397,6 +407,14 @@ class MainWindow(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_frame)
         self.preview_running = False
+        self._last_displayed_preview_sequence = None
+
+        self._preview_diagnostics = PreviewDiagnosticsAccumulator()
+        self._preview_diagnostics_logger = AsyncDiagnosticsCsvLogger()
+        self.preview_diagnostics_timer = QTimer(self)
+        self.preview_diagnostics_timer.timeout.connect(
+            self._sample_preview_diagnostics
+        )
 
         self.state = AppState.IDLE
         self._apply_state()
@@ -908,7 +926,11 @@ class MainWindow(QWidget):
             # repeated smooth-scaled repaints and makes the UI feel laggy.
             # 33 ms ~ 30 fps matches the default capture rate.
             self.timer.start(33)
+            self.preview_diagnostics_timer.start(1000)
             self.preview_running = True
+            self._last_displayed_preview_sequence = None
+            self._preview_diagnostics.reset(self.camera.get_acquisition_stats())
+            self.preview_health_label.setText("Preview pipeline: measuring…")
             self.preview_button.setText("Stop Preview")
             self.state = AppState.PREVIEWING
             self._apply_state()
@@ -921,10 +943,13 @@ class MainWindow(QWidget):
             if self.state == AppState.RECORDING:
                 return  # safety, shouldn't happen if buttons are disabled correctly
             self.timer.stop()
+            self.preview_diagnostics_timer.stop()
+            self._stop_preview_diagnostics_logging()
             self.camera.stop()
             self.preview_running = False
             self.image_label.setPixmap(QPixmap())
             self.image_label.setText("No video")
+            self.preview_health_label.setText("Preview pipeline: waiting for preview")
             self.status_label.setText("Preview stopped.")
             self.frame_rate_hint.setText(
                 "Start preview to read the camera's supported range and current rate."
@@ -953,6 +978,8 @@ class MainWindow(QWidget):
             if not ok:
                 self._apply_state()
                 return
+
+            self._start_preview_diagnostics_logging(filename)
 
             self._stop_mic_preview()
             # Parallel WAV with same session base name as video (recording_<ts>.avi / .wav)
@@ -1015,6 +1042,7 @@ class MainWindow(QWidget):
                     print("Error stopping audio recording:", exc)
                 self._session_audio = None
             self.camera.stop_recording()
+            self._stop_preview_diagnostics_logging()
             self.status_label.setText("Recording stopped.")
             self.audio_label.setText(
                 "Microphone: scan and choose a device, or leave as no audio."
@@ -1022,10 +1050,73 @@ class MainWindow(QWidget):
             self.state = AppState.PREVIEWING
             self._apply_state()
 
+    def _start_preview_diagnostics_logging(self, recording_basename: str) -> None:
+        """Start a sidecar diagnostics CSV for this recording session."""
+        self._preview_diagnostics.reset(self.camera.get_acquisition_stats())
+        diagnostics_path = f"{recording_basename}_diagnostics.csv"
+        self._preview_diagnostics_logger.start(diagnostics_path)
+
+    def _stop_preview_diagnostics_logging(self) -> None:
+        """Flush the current interval and finish the diagnostics sidecar."""
+        if self._preview_diagnostics_logger.is_running:
+            self._sample_preview_diagnostics()
+        self._preview_diagnostics_logger.stop()
+        if self.preview_running:
+            self._preview_diagnostics.reset(self.camera.get_acquisition_stats())
+
+    def _sample_preview_diagnostics(self) -> None:
+        """Update GUI health once per second and queue a CSV row if recording."""
+        row = self._preview_diagnostics.sample(self.camera.get_acquisition_stats())
+        if self._preview_diagnostics_logger.is_running:
+            self._preview_diagnostics_logger.submit(row)
+
+        age_value = row["preview_age_ms"]
+        interval_s = float(row["interval_s"])
+        rendered_fps = float(row["rendered_fps"])
+        frame_gaps = int(row["camera_frame_gaps"])
+        incomplete = int(row["incomplete_images"])
+        errors = int(row["acquisition_errors"])
+
+        if age_value == "":
+            text = f"Preview pipeline: no new frame ({rendered_fps:.1f} displayed fps)"
+            color = "#b71c1c"
+        else:
+            age_ms = float(age_value)
+            text = f"Preview pipeline: {age_ms:.0f} ms, {rendered_fps:.1f} displayed fps"
+            color = "#2e7d32" if age_ms <= 250.0 else "#e65100"
+
+        # A delayed one-second diagnostics timer indicates that the Qt event
+        # loop itself was unable to run, even if it catches up with a fresh
+        # frame immediately afterward.
+        if interval_s > 1.5:
+            text += f" — GUI stalled about {(interval_s - 1.0):.1f} s"
+            color = "#b71c1c"
+        if frame_gaps or incomplete or errors:
+            text += (
+                f" — camera warnings: {frame_gaps} gap(s), "
+                f"{incomplete} incomplete, {errors} error(s)"
+            )
+            color = "#b71c1c"
+
+        logger_error = self._preview_diagnostics_logger.last_error
+        if logger_error:
+            text += f" — diagnostics log error: {logger_error}"
+            color = "#b71c1c"
+        self.preview_health_label.setText(text)
+        self.preview_health_label.setStyleSheet(
+            f"color: {color}; font-size: 11px;"
+        )
+
     def update_frame(self):
-        frame = self.camera.get_latest_frame()
-        if frame is None:
+        preview_frame = self.camera.get_latest_preview_frame(
+            after_sequence=self._last_displayed_preview_sequence
+        )
+        if preview_frame is None:
+            if self._last_displayed_preview_sequence is not None:
+                self._preview_diagnostics.note_repeated_frame()
             return
+
+        frame = preview_frame.image
 
         # Handle grayscale vs color
         if frame.ndim == 2:
@@ -1054,6 +1145,15 @@ class MainWindow(QWidget):
             self.image_label.size(), Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation
         ))
+        displayed_at = time.monotonic()
+        self._last_displayed_preview_sequence = preview_frame.sequence
+        self._preview_diagnostics.note_displayed_frame(
+            frame_id=preview_frame.frame_id,
+            sequence=preview_frame.sequence,
+            retrieved_at=preview_frame.retrieved_at,
+            published_at=preview_frame.published_at,
+            displayed_at=displayed_at,
+        )
 
     def keyPressEvent(self, event):
         if event.isAutoRepeat():
@@ -1096,6 +1196,8 @@ class MainWindow(QWidget):
         try:
             if self.preview_running:
                 self.timer.stop()
+                self.preview_diagnostics_timer.stop()
+                self._stop_preview_diagnostics_logging()
         except Exception as e:
             print("Error stopping timer on close:", e)
         try:
