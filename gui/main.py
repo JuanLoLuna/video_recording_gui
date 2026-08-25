@@ -26,9 +26,10 @@ from PySide6.QtWidgets import (
     QSlider,
     QDoubleSpinBox,
     QFrame,
+    QMessageBox,
 )
-from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtCore import QTimer, Qt, QUrl
+from PySide6.QtGui import QDesktopServices, QImage, QPixmap
 from enum import Enum, auto
 from datetime import datetime
 
@@ -45,6 +46,7 @@ from backend.preview_diagnostics import (
     AsyncDiagnosticsCsvLogger,
     PreviewDiagnosticsAccumulator,
 )
+from backend.power_status import assess_power_safety, read_power_status
 
 SYNC_WIDTH_RECORD = 0.100  # 100 ms
 
@@ -131,6 +133,20 @@ class MainWindow(QWidget):
         self.status_label = QLabel("Press the button to detect a camera.")
         self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
+
+        # --- Recording power safety (always visible, including while recording) ---
+        self.power_status_frame = QFrame()
+        self.power_status_frame.setObjectName("powerStatusFrame")
+        power_status_layout = QHBoxLayout(self.power_status_frame)
+        power_status_layout.setContentsMargins(8, 5, 8, 5)
+        self.power_status_label = QLabel("Power safety: checking…")
+        self.power_status_label.setWordWrap(True)
+        power_status_layout.addWidget(self.power_status_label, stretch=1)
+        self.open_power_settings_button = QPushButton("Open Power Settings")
+        self.open_power_settings_button.clicked.connect(self._open_power_settings)
+        self.open_power_settings_button.setVisible(sys.platform.startswith("win"))
+        power_status_layout.addWidget(self.open_power_settings_button)
+        layout.addWidget(self.power_status_frame)
 
         # --- Setup & options (hidden while recording) ---
         self._setup_options_expanded = True
@@ -411,13 +427,26 @@ class MainWindow(QWidget):
 
         self._preview_diagnostics = PreviewDiagnosticsAccumulator()
         self._preview_diagnostics_logger = AsyncDiagnosticsCsvLogger()
+        self._recording_integrity_warning = False
+        self._recording_gap_count = 0
+        self._recording_incomplete_count = 0
+        self._recording_acquisition_error_count = 0
         self.preview_diagnostics_timer = QTimer(self)
         self.preview_diagnostics_timer.timeout.connect(
             self._sample_preview_diagnostics
         )
 
+        self._current_power_status = read_power_status()
+        self._power_assessment = assess_power_safety(self._current_power_status)
+        self._power_auto_stop_in_progress = False
+
         self.state = AppState.IDLE
         self._apply_state()
+
+        self.power_status_timer = QTimer(self)
+        self.power_status_timer.timeout.connect(self._refresh_power_status)
+        self.power_status_timer.start(500)
+        self._refresh_power_status()
 
         # count manual sync pulses during a run
         self.manual_sync_count = 0
@@ -523,6 +552,99 @@ class MainWindow(QWidget):
         self._update_camera_tuning_widgets_enabled()
         self._update_frame_rate_widget_enabled()
         self._update_recording_chrome()
+        self._apply_power_safety_to_controls()
+
+    def _open_power_settings(self) -> None:
+        """Open Windows Power & battery settings without changing them."""
+        if not sys.platform.startswith("win"):
+            return
+        if not QDesktopServices.openUrl(QUrl("ms-settings:powersleep")):
+            self.status_label.setText("Could not open Windows Power Settings.")
+
+    def _update_power_status_display(self) -> None:
+        colors = {
+            "safe": ("#e8f5e9", "#2e7d32"),
+            "warning": ("#fff8e1", "#e65100"),
+            "danger": ("#ffebee", "#b71c1c"),
+            "neutral": ("#f0f0f0", "#555"),
+        }
+        background, foreground = colors.get(
+            self._power_assessment.level,
+            colors["neutral"],
+        )
+        self.power_status_label.setText(self._power_assessment.summary)
+        self.power_status_label.setToolTip(self._power_assessment.reason or "")
+        self.power_status_frame.setStyleSheet(
+            "QFrame#powerStatusFrame {"
+            f" background: {background}; border: 1px solid {foreground};"
+            " border-radius: 4px; }"
+            f"QLabel {{ color: {foreground}; font-weight: 600; }}"
+        )
+
+    def _apply_power_safety_to_controls(self) -> None:
+        """Gate recording starts without disabling the active Stop button."""
+        if not hasattr(self, "record_button"):
+            return
+        reason = self._power_assessment.reason or ""
+        if self.state == AppState.PREVIEWING:
+            self.record_button.setEnabled(not self._power_assessment.recording_blocked)
+            self.record_button.setToolTip(reason)
+        elif self.state == AppState.RECORDING:
+            self.record_button.setEnabled(True)
+            self.record_button.setToolTip("Stop the current recording.")
+        else:
+            self.record_button.setToolTip(reason)
+
+    def _refresh_power_status(self) -> None:
+        """Refresh the banner and safely stop if power becomes recording-unsafe."""
+        self._current_power_status = read_power_status()
+        self._power_assessment = assess_power_safety(self._current_power_status)
+        self._update_power_status_display()
+        self._apply_power_safety_to_controls()
+
+        if (
+            self.state == AppState.RECORDING
+            and self._power_assessment.recording_blocked
+            and not self._power_auto_stop_in_progress
+        ):
+            self._power_auto_stop_in_progress = True
+            reason = self._power_assessment.reason or self._power_assessment.summary
+            self._stop_recording_session(
+                f"Recording stopped automatically: {reason}"
+            )
+            QMessageBox.critical(
+                self,
+                "Recording stopped for power safety",
+                f"The recording was stopped to protect file integrity.\n\n{reason}",
+            )
+            self._power_auto_stop_in_progress = False
+
+    def _confirm_power_safe_to_record(self) -> bool:
+        """Re-read power immediately before recording and request consent if low."""
+        self._current_power_status = read_power_status()
+        self._power_assessment = assess_power_safety(self._current_power_status)
+        self._update_power_status_display()
+        self._apply_power_safety_to_controls()
+
+        if self._power_assessment.recording_blocked:
+            QMessageBox.warning(
+                self,
+                "Recording blocked by power safety",
+                self._power_assessment.reason or self._power_assessment.summary,
+            )
+            return False
+        if not self._power_assessment.requires_confirmation:
+            return True
+
+        choice = QMessageBox.question(
+            self,
+            "Low battery warning",
+            f"{self._power_assessment.summary}\n\n"
+            f"{self._power_assessment.reason}\n\nStart recording anyway?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return choice == QMessageBox.StandardButton.Yes
 
     def _refresh_setup_options_toggle_text(self) -> None:
         if not hasattr(self, "setup_options_toggle"):
@@ -960,6 +1082,9 @@ class MainWindow(QWidget):
     def on_record_clicked(self):
         # Start recording
         if self.state == AppState.PREVIEWING:
+            if not self._confirm_power_safe_to_record():
+                return
+
             # SpinVideo adds its own suffix; avoid a double ".avi"
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"recording_{timestamp}"
@@ -979,6 +1104,10 @@ class MainWindow(QWidget):
                 self._apply_state()
                 return
 
+            self._recording_integrity_warning = False
+            self._recording_gap_count = 0
+            self._recording_incomplete_count = 0
+            self._recording_acquisition_error_count = 0
             self._start_preview_diagnostics_logging(filename)
 
             self._stop_mic_preview()
@@ -1035,20 +1164,26 @@ class MainWindow(QWidget):
 
         # Stop recording
         elif self.state == AppState.RECORDING:
-            if self._session_audio is not None:
-                try:
-                    self._session_audio.stop()
-                except Exception as exc:
-                    print("Error stopping audio recording:", exc)
-                self._session_audio = None
-            self.camera.stop_recording()
-            self._stop_preview_diagnostics_logging()
-            self.status_label.setText("Recording stopped.")
-            self.audio_label.setText(
-                "Microphone: scan and choose a device, or leave as no audio."
-            )
-            self.state = AppState.PREVIEWING
-            self._apply_state()
+            self._stop_recording_session("Recording stopped.")
+
+    def _stop_recording_session(self, status_message: str) -> None:
+        """Use the existing stop path for manual and power-safety stops."""
+        if self.state != AppState.RECORDING:
+            return
+        if self._session_audio is not None:
+            try:
+                self._session_audio.stop()
+            except Exception as exc:
+                print("Error stopping audio recording:", exc)
+            self._session_audio = None
+        self.camera.stop_recording()
+        self._stop_preview_diagnostics_logging()
+        self.status_label.setText(status_message)
+        self.audio_label.setText(
+            "Microphone: scan and choose a device, or leave as no audio."
+        )
+        self.state = AppState.PREVIEWING
+        self._apply_state()
 
     def _start_preview_diagnostics_logging(self, recording_basename: str) -> None:
         """Start a sidecar diagnostics CSV for this recording session."""
@@ -1076,6 +1211,13 @@ class MainWindow(QWidget):
         frame_gaps = int(row["camera_frame_gaps"])
         incomplete = int(row["incomplete_images"])
         errors = int(row["acquisition_errors"])
+        if self.state == AppState.RECORDING and (
+            frame_gaps or incomplete or errors
+        ):
+            self._recording_integrity_warning = True
+            self._recording_gap_count += frame_gaps
+            self._recording_incomplete_count += incomplete
+            self._recording_acquisition_error_count += errors
 
         if age_value == "":
             text = f"Preview pipeline: no new frame ({rendered_fps:.1f} displayed fps)"
@@ -1095,6 +1237,14 @@ class MainWindow(QWidget):
             text += (
                 f" — camera warnings: {frame_gaps} gap(s), "
                 f"{incomplete} incomplete, {errors} error(s)"
+            )
+            color = "#b71c1c"
+        if self._recording_integrity_warning:
+            text += (
+                " — RECORDING INTEGRITY WARNING: "
+                f"{self._recording_gap_count} missing frame(s), "
+                f"{self._recording_incomplete_count} incomplete, "
+                f"{self._recording_acquisition_error_count} acquisition error(s)"
             )
             color = "#b71c1c"
 
@@ -1222,6 +1372,7 @@ class MainWindow(QWidget):
             print("Error stopping DAQ on close:", e)
 
         try:
+            self.power_status_timer.stop()
             self._stop_mic_preview()
             self.mic_level_timer.stop()
         except Exception as e:
