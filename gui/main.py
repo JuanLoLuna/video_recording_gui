@@ -40,7 +40,13 @@ from backend.audio_control import (
     list_audio_output_devices,
 )
 from backend.camera_control import detect_first_camera, CameraController
-from backend.ni_control import NIDaqDO, DOLine, list_do_lines
+from backend.ni_control import (
+    NIDaqDO,
+    DOLine,
+    list_do_lines,
+    ni_output_enabled,
+    NI_DISABLED_MESSAGE,
+)
 from backend.pulse_manager import PulseManager
 from backend.preview_diagnostics import (
     AsyncDiagnosticsCsvLogger,
@@ -957,6 +963,16 @@ class MainWindow(QWidget):
     def on_scan_daq_clicked(self):
         """Scan for connected NI-DAQ devices and populate the dropdown."""
         self.daq_line_combo.clear()
+
+        # NI output is released to the SyncService heartbeat by default. Say so
+        # explicitly rather than letting it look like a hardware fault.
+        if not ni_output_enabled():
+            self.daq_line_combo.addItem("Disabled by configuration", None)
+            self.connect_daq_button.setEnabled(False)
+            self.sync_button.setEnabled(False)
+            self.sync_label.setText(NI_DISABLED_MESSAGE)
+            return
+
         lines = list_do_lines()
         if lines:
             for line in lines:
