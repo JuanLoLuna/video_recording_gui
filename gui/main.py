@@ -53,6 +53,13 @@ from backend.preview_diagnostics import (
     PreviewDiagnosticsAccumulator,
 )
 from backend.power_status import assess_power_safety, read_power_status
+from backend.power_keepalive import (
+    KeepAwakeRequest,
+    KeepAwakeState,
+    apply_keep_awake,
+    assess_keepalive,
+    release_keep_awake,
+)
 
 SYNC_WIDTH_RECORD = 0.100  # 100 ms
 
@@ -446,6 +453,10 @@ class MainWindow(QWidget):
         self._power_assessment = assess_power_safety(self._current_power_status)
         self._power_auto_stop_in_progress = False
 
+        # Sleep prevention while recording (Windows-only; no-op elsewhere).
+        self._keepalive_request = KeepAwakeRequest(system=True, display=False, away_mode=True)
+        self._keepalive_state = KeepAwakeState(supported=sys.platform.startswith("win"))
+
         self.state = AppState.IDLE
         self._apply_state()
 
@@ -578,8 +589,26 @@ class MainWindow(QWidget):
             self._power_assessment.level,
             colors["neutral"],
         )
-        self.power_status_label.setText(self._power_assessment.summary)
-        self.power_status_label.setToolTip(self._power_assessment.reason or "")
+        keepalive_assessment = assess_keepalive(
+            self._keepalive_state, recording=self.state == AppState.RECORDING
+        )
+        text = self._power_assessment.summary
+        tooltip = self._power_assessment.reason or ""
+        if self.state == AppState.RECORDING:
+            text = f"{text} — {keepalive_assessment.summary}"
+            if keepalive_assessment.reason:
+                tooltip = (tooltip + "\n" if tooltip else "") + keepalive_assessment.reason
+            # A "danger"/"warning" keepalive state during recording should be
+            # visible even when the power assessment itself reads "safe".
+            level_rank = {"safe": 0, "neutral": 0, "warning": 1, "danger": 2}
+            if level_rank.get(keepalive_assessment.level, 0) > level_rank.get(
+                self._power_assessment.level, 0
+            ):
+                background, foreground = colors.get(
+                    keepalive_assessment.level, colors["neutral"]
+                )
+        self.power_status_label.setText(text)
+        self.power_status_label.setToolTip(tooltip)
         self.power_status_frame.setStyleSheet(
             "QFrame#powerStatusFrame {"
             f" background: {background}; border: 1px solid {foreground};"
@@ -605,6 +634,13 @@ class MainWindow(QWidget):
         """Refresh the banner and safely stop if power becomes recording-unsafe."""
         self._current_power_status = read_power_status()
         self._power_assessment = assess_power_safety(self._current_power_status)
+
+        # Self-heal sleep prevention: some intervening OS/driver event can
+        # clear a prior SetThreadExecutionState request. Re-assert while
+        # recording, at negligible cost, rather than leaving it lapsed.
+        if self.state == AppState.RECORDING and not self._keepalive_state.active:
+            self._keepalive_state = apply_keep_awake(self._keepalive_request)
+
         self._update_power_status_display()
         self._apply_power_safety_to_controls()
 
@@ -1101,6 +1137,8 @@ class MainWindow(QWidget):
             if not self._confirm_power_safe_to_record():
                 return
 
+            self._keepalive_state = apply_keep_awake(self._keepalive_request)
+
             # SpinVideo adds its own suffix; avoid a double ".avi"
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"recording_{timestamp}"
@@ -1186,6 +1224,7 @@ class MainWindow(QWidget):
         """Use the existing stop path for manual and power-safety stops."""
         if self.state != AppState.RECORDING:
             return
+        self._keepalive_state = release_keep_awake()
         if self._session_audio is not None:
             try:
                 self._session_audio.stop()
@@ -1347,6 +1386,10 @@ class MainWindow(QWidget):
 
     def closeEvent(self, event):
         """Ensure all hardware and timers are properly stopped."""
+        try:
+            release_keep_awake()
+        except Exception as e:
+            print("Error releasing sleep prevention on close:", e)
         # Stop recording/preview/camera first
         try:
             if self.state == AppState.RECORDING:
