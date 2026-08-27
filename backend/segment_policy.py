@@ -21,10 +21,11 @@ Three ceilings, defence in depth:
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 
 DEFAULT_SEGMENT_SECONDS = 900.0  # 15 minutes
@@ -32,6 +33,28 @@ DEFAULT_MAX_BYTES = 3_000_000_000  # ~2.6x headroom under the 4 GiB RIFF ceiling
 DEFAULT_SDK_MAX_FILE_SIZE_MB = 3584  # SetMaximumFileSize() argument -- the SDK-level net
 BYTES_SAMPLE_INTERVAL_FRAMES = 300
 PREPARE_LEAD_FRAMES = 60  # pre-open the next writer this many frames before the roll
+
+# Overrides DEFAULT_SEGMENT_SECONDS -- lets rotation be exercised many
+# times in a short test run (e.g. "20" for ~3 rotations/minute) instead of
+# waiting ~15 minutes per segment. Unset in production.
+SEGMENT_SECONDS_ENV = "SLEEVE_VIDEO_GUI_SEGMENT_SECONDS"
+
+
+def resolve_segment_seconds(*, env: Mapping[str, str] | None = None) -> float:
+    """DEFAULT_SEGMENT_SECONDS, overridable via SEGMENT_SECONDS_ENV.
+
+    `env` defaults to os.environ; pass a plain dict in tests. Falls back
+    to the default on a missing, non-numeric, or non-positive value.
+    """
+    env_map = os.environ if env is None else env
+    raw = env_map.get(SEGMENT_SECONDS_ENV)
+    if not raw:
+        return DEFAULT_SEGMENT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_SEGMENT_SECONDS
+    return value if value > 0 else DEFAULT_SEGMENT_SECONDS
 
 
 def segment_frames_for(fps: float, segment_seconds: float = DEFAULT_SEGMENT_SECONDS) -> int:

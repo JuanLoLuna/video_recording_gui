@@ -3,10 +3,13 @@ import unittest
 from pathlib import Path
 
 from backend.segment_policy import (
+    DEFAULT_SEGMENT_SECONDS,
     PREPARE_LEAD_FRAMES,
+    SEGMENT_SECONDS_ENV,
     RenamePlan,
     plan_renames,
     reconcile_part_files,
+    resolve_segment_seconds,
     segment_frames_for,
     should_prepare,
     should_roll,
@@ -31,6 +34,30 @@ class SegmentFramesForTests(unittest.TestCase):
 
     def test_never_returns_zero_or_less(self):
         self.assertGreaterEqual(segment_frames_for(0.001, 1.0), 1)
+
+
+class ResolveSegmentSecondsTests(unittest.TestCase):
+    def test_default_when_unset(self):
+        self.assertEqual(resolve_segment_seconds(env={}), DEFAULT_SEGMENT_SECONDS)
+
+    def test_override_from_env(self):
+        self.assertEqual(
+            resolve_segment_seconds(env={SEGMENT_SECONDS_ENV: "20"}), 20.0
+        )
+
+    def test_non_numeric_value_falls_back_to_default(self):
+        self.assertEqual(
+            resolve_segment_seconds(env={SEGMENT_SECONDS_ENV: "not-a-number"}),
+            DEFAULT_SEGMENT_SECONDS,
+        )
+
+    def test_non_positive_value_falls_back_to_default(self):
+        self.assertEqual(
+            resolve_segment_seconds(env={SEGMENT_SECONDS_ENV: "0"}), DEFAULT_SEGMENT_SECONDS
+        )
+        self.assertEqual(
+            resolve_segment_seconds(env={SEGMENT_SECONDS_ENV: "-5"}), DEFAULT_SEGMENT_SECONDS
+        )
 
 
 class ShouldRollTests(unittest.TestCase):

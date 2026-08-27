@@ -25,6 +25,7 @@ from backend.segment_policy import (
     BYTES_SAMPLE_INTERVAL_FRAMES,
     DEFAULT_SDK_MAX_FILE_SIZE_MB,
     reconcile_part_files,
+    resolve_segment_seconds,
     segment_frames_for,
     should_prepare,
     should_roll,
@@ -217,7 +218,9 @@ class CameraController:
         # live via set_frame_rate(). recording_fps follows it so AVI playback
         # speed matches the real capture rate.
         self.target_frame_rate = 30.0
-        self._max_frames_per_segment = segment_frames_for(self.target_frame_rate)
+        self._max_frames_per_segment = segment_frames_for(
+            self.target_frame_rate, resolve_segment_seconds()
+        )
         # Streams one row per recorded frame to disk incrementally, rather
         # than buffering the whole session in RAM and writing once on
         # stop (which lost 100% of metadata on any crash and grew
@@ -847,7 +850,7 @@ class CameraController:
         self._pending_fault_roll = False
         self._pending_fault_roll_gap_s = None
         self._mark_next_frame_segment_resume = False
-        self._max_frames_per_segment = segment_frames_for(fps)
+        self._max_frames_per_segment = segment_frames_for(fps, resolve_segment_seconds())
 
         self.recording_fps = fps
         self.record_start_requested = True
