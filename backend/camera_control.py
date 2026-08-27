@@ -164,7 +164,10 @@ class CameraController:
         self._segment_index = 0
         self._frames_in_segment = 0
         self._bytes_in_segment = 0
-        self._segment_opened_at = 0.0  # monotonic
+        # Wall-clock (time.time()), matching closed_at/first_system_time/
+        # last_system_time in the manifest row -- NOT time.monotonic(),
+        # whose reference point is arbitrary and isn't comparable to those.
+        self._segment_opened_at = 0.0
         self._segment_first_record_frame_index: int | None = None
         self._segment_first_system_time: float | None = None
         # Pre-armed next writer, opened ~60 frames before the roll so the
@@ -180,6 +183,16 @@ class CameraController:
         self._pending_fault_roll = False
         self._pending_fault_roll_gap_s: float | None = None
         self._mark_next_frame_segment_resume = False
+        # Value written into each frame's "segment" metadata column.
+        # Deliberately NOT read directly from self._segment_tracker: the
+        # tracker bumps the instant a reinit succeeds (for prompt
+        # events.jsonl logging), which can be one or more frames before
+        # segment_file actually rolls over. Copying the tracker's value
+        # into this field only at the moment of the actual file swap (see
+        # _maybe_rotate_segment) keeps "segment" and "segment_file"
+        # changing on the exact same row, matching frame_metadata.py's
+        # documented invariant.
+        self._metadata_segment = 0
         # One row per segment (~960/session); reused across record start/
         # stop cycles like _metadata_writer, started fresh in start_recording.
         self._segment_manifest_writer = SegmentManifestWriter()
@@ -671,7 +684,7 @@ class CameraController:
         self._segment_index = new_index
         self._frames_in_segment = 0
         self._bytes_in_segment = 0
-        self._segment_opened_at = time.monotonic()
+        self._segment_opened_at = time.time()
         self._segment_first_record_frame_index = None
         self._segment_first_system_time = None
         if decision.reason == "fault":
@@ -679,6 +692,12 @@ class CameraController:
             # unknown sync_label values, so this new value is inert to
             # anything that doesn't know about it yet.
             self._mark_next_frame_segment_resume = True
+            # _segment_tracker.current_segment was already bumped when the
+            # reinit succeeded (for prompt events.jsonl logging), possibly
+            # several frames before this swap. Copy it into the per-row
+            # "segment" column only now, so it changes on the exact same
+            # row as segment_file -- not one or more frames earlier.
+            self._metadata_segment = self._segment_tracker.current_segment
 
     def _retire_segment(
         self,
@@ -841,7 +860,7 @@ class CameraController:
         self._segment_index = 0
         self._frames_in_segment = 0
         self._bytes_in_segment = 0
-        self._segment_opened_at = time.monotonic()
+        self._segment_opened_at = time.time()
         self._segment_first_record_frame_index = None
         self._segment_first_system_time = None
         self._pending_writer = None
@@ -850,6 +869,7 @@ class CameraController:
         self._pending_fault_roll = False
         self._pending_fault_roll_gap_s = None
         self._mark_next_frame_segment_resume = False
+        self._metadata_segment = 0
         self._max_frames_per_segment = segment_frames_for(fps, resolve_segment_seconds())
 
         self.recording_fps = fps
@@ -1103,7 +1123,7 @@ class CameraController:
                                 "sync_label": row_sync_label,
                                 "adl_id": adl_id,
                                 "adl_label": adl_label,
-                                "segment": self._segment_tracker.current_segment,
+                                "segment": self._metadata_segment,
                                 "segment_file": self._session_paths.video_final(self._segment_index).name,
                                 "segment_frame_index": self._frames_in_segment,
                             }
