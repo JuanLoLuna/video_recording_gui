@@ -171,7 +171,8 @@ class CameraController:
         self._pending_writer = None
         self._pending_writer_segment_index: int | None = None
         self._prepared_next_segment = False
-        self._max_frames_per_segment = segment_frames_for(self.target_frame_rate)
+        # _max_frames_per_segment is set below, alongside target_frame_rate
+        # (which it derives from) -- see that assignment for the real value.
         # Set by _recover_camera on a successful reinit: forces the NEXT
         # append to roll into a fresh segment, so a fault's gap always
         # lands between segments rather than inside one.
@@ -216,6 +217,7 @@ class CameraController:
         # live via set_frame_rate(). recording_fps follows it so AVI playback
         # speed matches the real capture rate.
         self.target_frame_rate = 30.0
+        self._max_frames_per_segment = segment_frames_for(self.target_frame_rate)
         # Streams one row per recorded frame to disk incrementally, rather
         # than buffering the whole session in RAM and writing once on
         # stop (which lost 100% of metadata on any crash and grew
