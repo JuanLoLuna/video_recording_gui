@@ -1179,8 +1179,10 @@ class MainWindow(QWidget):
                         monitor=self.audio_monitor_checkbox.isChecked(),
                         output_device=int(out_dev) if out_dev is not None else None,
                     )
+                    format_choice = self._session_audio.audio_format_choice
+                    format_note = f" ({format_choice.reason})" if format_choice is not None else ""
                     self.audio_label.setText(
-                        f"Microphone: recording to {wav_path}"
+                        f"Microphone: recording to {wav_path}{format_note}"
                     )
                     if self.audio_monitor_checkbox.isChecked():
                         QTimer.singleShot(

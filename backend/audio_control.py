@@ -21,6 +21,21 @@ from typing import Any
 
 import numpy as np
 
+from backend.audio_format import AudioFormatChoice, AudioWriteBudget, choose_audio_format
+
+
+def _resolve_audio_format(
+    sf: Any, samplerate: int, channels: int, subtype: str = "PCM_16"
+) -> AudioFormatChoice:
+    """Probe this libsndfile build at runtime and pick a streaming-safe container."""
+    return choose_audio_format(
+        available_formats=sf.available_formats(),
+        samplerate=samplerate,
+        channels=channels,
+        subtype=subtype,
+        format_checker=sf.check_format,
+    )
+
 
 def _samplerate_candidates(
     sd: Any, input_device: int, output_device: int, primary: int
@@ -551,6 +566,7 @@ class SessionAudioRecorder:
         self._level_lock = threading.Lock()
         self._level_smoothed = 0.0
         self.had_duplex_output = False
+        self.audio_format_choice: AudioFormatChoice | None = None
 
     def level_0_100(self) -> int:
         with self._level_lock:
@@ -593,6 +609,10 @@ class SessionAudioRecorder:
         samplerate = int(float(info.get("default_samplerate") or 48000))
         channels = 1
 
+        choice = _resolve_audio_format(sf, samplerate, channels)
+        self.audio_format_choice = choice
+        budget = AudioWriteBudget.for_choice(choice, samplerate)
+
         self._stop.clear()
         with self._level_lock:
             self._level_smoothed = 0.0
@@ -600,12 +620,16 @@ class SessionAudioRecorder:
 
         def run() -> None:
             try:
+                sf_kwargs: dict[str, Any] = {}
+                if choice.format is not None:
+                    sf_kwargs["format"] = choice.format
                 with sf.SoundFile(
                     str(path),
                     "w",
                     samplerate,
                     channels,
-                    subtype="PCM_16",
+                    subtype=choice.subtype,
+                    **sf_kwargs,
                 ) as f:
                     use_duplex = bool(monitor)
                     out_ch = 1
@@ -642,6 +666,9 @@ class SessionAudioRecorder:
                             raise sd.CallbackStop
                         self._feed_level(indata)
                         f.write(indata.copy())
+                        budget.note_frames(frames)
+                        if budget.should_stop():
+                            self._stop.set()
 
                     stream: Any | None = None
                     used_split_monitor = False
@@ -658,6 +685,9 @@ class SessionAudioRecorder:
                                 raise sd.CallbackStop
                             self._feed_level(indata)
                             f.write(indata.copy())
+                            budget.note_frames(frames)
+                            if budget.should_stop():
+                                self._stop.set()
                             n_out = int(outdata.shape[1])
                             if n_out == 1:
                                 outdata[:] = indata
@@ -680,6 +710,9 @@ class SessionAudioRecorder:
                             def on_mono(indata: Any) -> None:
                                 self._feed_level(indata)
                                 f.write(indata.copy())
+                                budget.note_frames(indata.shape[0])
+                                if budget.should_stop():
+                                    self._stop.set()
 
                             # Keep stream SR == WAV SR (split path does not resample).
                             used_split_monitor = _run_split_monitor_streams(
