@@ -54,6 +54,7 @@ from backend.preview_diagnostics import (
 )
 from backend.power_status import assess_power_safety, read_power_status
 from backend.recording_warnings import RecordingWarningTracker
+from backend.recording_paths import SessionPaths, resolve_output_dir
 from backend.power_keepalive import (
     KeepAwakeRequest,
     KeepAwakeState,
@@ -1153,9 +1154,12 @@ class MainWindow(QWidget):
 
             self._keepalive_state = apply_keep_awake(self._keepalive_request)
 
-            # SpinVideo adds its own suffix; avoid a double ".avi"
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"recording_{timestamp}"
+            # SessionPaths is the single place deriving every session
+            # artifact name (video segments, wav, metadata, diagnostics,
+            # segments manifest, events) from one stem, so they can't
+            # drift out of sync with each other.
+            output_dir = resolve_output_dir(explicit=getattr(self, "_configured_output_dir", None))
+            session_paths = SessionPaths.for_session(output_dir, datetime.now())
 
             self.record_button.setEnabled(False)
             self.record_button.setText("Starting recording… please wait")
@@ -1164,7 +1168,7 @@ class MainWindow(QWidget):
 
             # Use the camera's real acquisition rate so AVI playback speed matches.
             fps = self.camera.get_acquisition_frame_rate() or 30.0
-            ok, msg = self.camera.start_recording(filename, fps=fps)
+            ok, msg = self.camera.start_recording(session_paths, fps=fps)
             self.status_label.setText(msg)
             QApplication.processEvents()
 
@@ -1174,14 +1178,14 @@ class MainWindow(QWidget):
 
             self._recording_warnings.reset()
             self._update_recording_warning_banner()
-            self._start_preview_diagnostics_logging(filename)
+            self._start_preview_diagnostics_logging(session_paths.diagnostics_csv)
 
             self._stop_mic_preview()
-            # Parallel WAV with same session base name as video (recording_<ts>.avi / .wav)
+            # Parallel WAV sharing the same session stem as the video segments.
             audio_device = self.audio_input_combo.currentData()
             self._session_audio = None
             if audio_device is not None:
-                wav_path = f"{filename}.wav"
+                wav_path = str(session_paths.wav)
                 try:
                     self._session_audio = SessionAudioRecorder()
                     out_dev = self.audio_output_combo.currentData()
@@ -1254,10 +1258,9 @@ class MainWindow(QWidget):
         self.state = AppState.PREVIEWING
         self._apply_state()
 
-    def _start_preview_diagnostics_logging(self, recording_basename: str) -> None:
+    def _start_preview_diagnostics_logging(self, diagnostics_path) -> None:
         """Start a sidecar diagnostics CSV for this recording session."""
         self._preview_diagnostics.reset(self.camera.get_acquisition_stats())
-        diagnostics_path = f"{recording_basename}_diagnostics.csv"
         self._preview_diagnostics_logger.start(diagnostics_path)
 
     def _stop_preview_diagnostics_logging(self) -> None:

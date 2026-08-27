@@ -1,13 +1,16 @@
 # backend/camera_control.py
+import os
+import queue
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
+from pathlib import Path
 
 import numpy as np
 import PySpin
 
 from backend.async_csv_writer import AsyncCsvWriter
-from backend.frame_metadata import METADATA_FIELDS, metadata_csv_path, metadata_row, resolve_sync_label
+from backend.frame_metadata import METADATA_FIELDS, metadata_row, resolve_sync_label
 from backend.acquisition_watchdog import AcquisitionWatchdog, watchdog_config_for_frame_rate
 from backend.timeline_break import (
     JsonlEventLog,
@@ -17,6 +20,36 @@ from backend.timeline_break import (
     session_stop_record,
     timeline_break_record,
 )
+from backend.recording_paths import SessionPaths
+from backend.segment_policy import (
+    BYTES_SAMPLE_INTERVAL_FRAMES,
+    DEFAULT_SDK_MAX_FILE_SIZE_MB,
+    reconcile_part_files,
+    segment_frames_for,
+    should_prepare,
+    should_roll,
+)
+from backend.segment_manifest import SegmentManifestEntry, SegmentManifestWriter, manifest_row
+
+
+# Spinnaker's own buffer pool is the decoupling queue between frame arrival
+# and disk writes: deepening it is what makes a rotation-boundary disk
+# stall (up to ~1.6 GB of dirty page cache) survivable without dropping
+# frames. At 1.31 MB/frame (1280x1024 Mono8), 150 buffers is ~197 MB of
+# RAM for ~5s of stall tolerance. Confirmed reachable on the production
+# camera (Phase 0 bench item 2).
+STREAM_BUFFER_COUNT_TARGET = 150
+
+
+@dataclass
+class _CloserJob:
+    """One segment handed from the acquisition thread to the closer thread."""
+
+    writer: object  # PySpin.SpinVideo
+    part_base: Path
+    final_path: Path
+    segment_index: int
+    manifest_entry: SegmentManifestEntry
 
 
 @dataclass(frozen=True)
@@ -125,6 +158,37 @@ class CameraController:
         # there is no session timeline to protect yet.
         self._event_log: JsonlEventLog | None = None
 
+        # --- Video segment rotation (Phase 2) ---
+        self._session_paths: SessionPaths | None = None
+        self._segment_index = 0
+        self._frames_in_segment = 0
+        self._bytes_in_segment = 0
+        self._segment_opened_at = 0.0  # monotonic
+        self._segment_first_record_frame_index: int | None = None
+        self._segment_first_system_time: float | None = None
+        # Pre-armed next writer, opened ~60 frames before the roll so the
+        # (small) Open()/header cost lands off the boundary frame.
+        self._pending_writer = None
+        self._pending_writer_segment_index: int | None = None
+        self._prepared_next_segment = False
+        self._max_frames_per_segment = segment_frames_for(self.target_frame_rate)
+        # Set by _recover_camera on a successful reinit: forces the NEXT
+        # append to roll into a fresh segment, so a fault's gap always
+        # lands between segments rather than inside one.
+        self._pending_fault_roll = False
+        self._pending_fault_roll_gap_s: float | None = None
+        self._mark_next_frame_segment_resume = False
+        # One row per segment (~960/session); reused across record start/
+        # stop cycles like _metadata_writer, started fresh in start_recording.
+        self._segment_manifest_writer = SegmentManifestWriter()
+        # Retired writers are Close()'d, renamed, and manifest-logged off
+        # the acquisition thread -- Close() can take long enough (flushing
+        # up to ~1.6 GB of dirty page cache) that doing it inline would
+        # risk dropping frames at every rotation boundary. Lives for the
+        # whole app (daemon thread, started lazily), not per-session.
+        self._closer_queue: queue.Queue = queue.Queue()
+        self._closer_thread: threading.Thread | None = None
+
         # Latest frame for preview
         self._latest_frame = None
         self._latest_preview_frame: PreviewFrame | None = None
@@ -152,7 +216,6 @@ class CameraController:
         # live via set_frame_rate(). recording_fps follows it so AVI playback
         # speed matches the real capture rate.
         self.target_frame_rate = 30.0
-        self.record_filename = None
         # Streams one row per recorded frame to disk incrementally, rather
         # than buffering the whole session in RAM and writing once on
         # stop (which lost 100% of metadata on any crash and grew
@@ -231,14 +294,20 @@ class CameraController:
           - Stop acquisition thread
           - DeInit camera, clear camera list, release system
         """
-        # If recording is active or queued, request stop and give loop time
+        # If recording is active or queued, request stop and give loop time.
+        # Since Phase 2, finishing a stop means closing a segment (possibly
+        # flushing a large dirty-page-cache write) AND draining the closer
+        # thread's queue -- both can now take meaningfully longer than the
+        # old single-file case did, so this is deliberately generous rather
+        # than the previous fixed ~1s. Below, EndAcquisition/DeInit/
+        # ReleaseInstance must not run while any of that is still in
+        # flight, or the acquisition/closer threads can hit a use-after-free
+        # on the native Spinnaker objects.
         if self.recording_active or self.record_start_requested:
             self.record_stop_requested = True
-            # wait up to ~1s for recording_active to go False
-            for _ in range(100):
-                if not self.recording_active:
-                    break
-                time.sleep(0.01)
+            stop_deadline = time.monotonic() + 90.0
+            while self.recording_active and time.monotonic() < stop_deadline:
+                time.sleep(0.05)
 
         # Tell acquisition loop to stop
         self._stop_event.set()
@@ -337,6 +406,7 @@ class CameraController:
         cam.BeginAcquisition(), same constraint as _enable_chunk_data().
         """
         self._enable_chunk_data()
+        self._configure_stream_buffers()
 
         nodemap = self.cam.GetNodeMap()
         acq_mode = PySpin.CEnumerationPtr(nodemap.GetNode("AcquisitionMode"))
@@ -357,6 +427,27 @@ class CameraController:
             actual = float(frame_rate.GetValue())
             self.target_frame_rate = actual
             self.recording_fps = actual
+
+    def _configure_stream_buffers(self) -> None:
+        """Deepen the transport-layer buffer pool (see STREAM_BUFFER_COUNT_TARGET).
+
+        TLStream nodes (StreamBufferCountMode/StreamBufferCountManual) are
+        accessed via GetTLStreamNodeMap(), a separate nodemap from the
+        regular GenICam one used everywhere else in this file.
+        """
+        try:
+            tl_nodemap = self.cam.GetTLStreamNodeMap()
+            mode = PySpin.CEnumerationPtr(tl_nodemap.GetNode("StreamBufferCountMode"))
+            if PySpin.IsWritable(mode):
+                manual_entry = mode.GetEntryByName("Manual")
+                if PySpin.IsReadable(manual_entry):
+                    mode.SetIntValue(manual_entry.GetValue())
+            count = PySpin.CIntegerPtr(tl_nodemap.GetNode("StreamBufferCountManual"))
+            if PySpin.IsWritable(count):
+                target = min(int(count.GetMax()), STREAM_BUFFER_COUNT_TARGET)
+                count.SetValue(target)
+        except Exception as exc:
+            print(f"[camera] could not configure stream buffer count: {exc}")
 
     def _reinitialize_camera(self) -> tuple[bool, str]:
         """Best-effort full camera reinit after a fault. Acquisition thread only.
@@ -467,14 +558,229 @@ class CameraController:
                     self._event_log.write(timeline_break_record(brk))
                 except Exception as exc:
                     print("Error writing timeline break:", exc)
+                if self.recording_active:
+                    # Force the NEXT successful append to roll into a
+                    # fresh segment (see should_roll(fault=True) and
+                    # _maybe_rotate_segment), so the gap always lands
+                    # between segments rather than inside one.
+                    self._pending_fault_roll = True
+                    self._pending_fault_roll_gap_s = gap_s
         reinit_decision = self._watchdog.note_reinit_result(now=now, ok=ok)
         self._apply_watchdog_decision(reinit_decision)
+
+    # ------------------------------------------------------------------
+    # Video segment rotation (acquisition thread only, while recording)
+    # ------------------------------------------------------------------
+
+    def _open_segment_writer(self, segment_index: int):
+        """Open a new SpinVideo writer for segment_index at its part path.
+
+        SpinVideo always appends its own "-0000" suffix to whatever base
+        path it's given, so this writes to
+        ".../.incomplete/<basename>_part{NNNN}-0000.avi"; the closer
+        thread renames it to the final "<basename>-{NNNN}.avi" after
+        Close() succeeds.
+        """
+        part_base = self._session_paths.video_part_base(segment_index)
+        part_base.parent.mkdir(parents=True, exist_ok=True)
+        writer = PySpin.SpinVideo()
+        # SDK-level net, well above our own max_bytes ceiling -- should
+        # never fire first. reconcile_part_files/the closer thread handle
+        # it gracefully if it ever does.
+        writer.SetMaximumFileSize(DEFAULT_SDK_MAX_FILE_SIZE_MB)
+        opt = PySpin.MJPGOption()
+        opt.frameRate = self.recording_fps
+        opt.quality = 75
+        writer.Open(str(part_base), opt)
+        return writer
+
+    def _maybe_rotate_segment(self) -> None:
+        """Acquisition thread only. Called after each successful Append().
+
+        Periodically samples the in-progress segment's on-disk size,
+        pre-arms the next writer shortly before the boundary, and swaps
+        writers when a roll condition fires. See backend/segment_policy.py
+        for the roll/prepare decision logic.
+        """
+        if self._frames_in_segment % BYTES_SAMPLE_INTERVAL_FRAMES == 0:
+            try:
+                part_base = self._session_paths.video_part_base(self._segment_index)
+                current_avi = part_base.with_name(part_base.name + "-0000.avi")
+                self._bytes_in_segment = current_avi.stat().st_size
+            except OSError:
+                pass
+
+        if not self._prepared_next_segment and should_prepare(
+            frames_in_segment=self._frames_in_segment,
+            max_frames=self._max_frames_per_segment,
+        ):
+            try:
+                next_index = self._segment_index + 1
+                self._pending_writer = self._open_segment_writer(next_index)
+                self._pending_writer_segment_index = next_index
+                self._prepared_next_segment = True
+            except Exception as exc:
+                print(f"[camera] could not pre-arm next segment: {exc}")
+
+        decision = should_roll(
+            frames_in_segment=self._frames_in_segment,
+            bytes_in_segment=self._bytes_in_segment,
+            max_frames=self._max_frames_per_segment,
+            fault=self._pending_fault_roll,
+        )
+        if not decision.should_roll:
+            return
+
+        fault_gap_s = None
+        if decision.reason == "fault":
+            fault_gap_s = self._pending_fault_roll_gap_s
+            self._pending_fault_roll = False
+            self._pending_fault_roll_gap_s = None
+
+        if self._pending_writer is not None and self._prepared_next_segment:
+            new_writer = self._pending_writer
+            new_index = self._pending_writer_segment_index
+        else:
+            new_index = self._segment_index + 1
+            try:
+                new_writer = self._open_segment_writer(new_index)
+            except Exception as exc:
+                print(f"[camera] could not open segment {new_index}: {exc}")
+                # Keep recording into the current (oversized) segment
+                # rather than losing the writer entirely.
+                return
+
+        self._pending_writer = None
+        self._pending_writer_segment_index = None
+        self._prepared_next_segment = False
+
+        self._retire_segment(
+            writer=self.avi_recorder,
+            segment_index=self._segment_index,
+            roll_reason=decision.reason,
+            timeline_break=(decision.reason == "fault"),
+            gap_s=fault_gap_s,
+        )
+
+        self.avi_recorder = new_writer
+        self._segment_index = new_index
+        self._frames_in_segment = 0
+        self._bytes_in_segment = 0
+        self._segment_opened_at = time.monotonic()
+        self._segment_first_record_frame_index = None
+        self._segment_first_system_time = None
+        if decision.reason == "fault":
+            # Never reuse "record_start" -- downstream filters drop
+            # unknown sync_label values, so this new value is inert to
+            # anything that doesn't know about it yet.
+            self._mark_next_frame_segment_resume = True
+
+    def _retire_segment(
+        self,
+        *,
+        writer,
+        segment_index: int,
+        roll_reason: str,
+        timeline_break: bool,
+        gap_s: float | None,
+    ) -> None:
+        """Hand a segment's writer off to the closer thread with its manifest entry."""
+        final_path = self._session_paths.video_final(segment_index)
+        part_base = self._session_paths.video_part_base(segment_index)
+        entry = SegmentManifestEntry(
+            segment_index=segment_index,
+            segment_file=final_path.name,
+            frame_count=self._frames_in_segment,
+            first_record_frame_index=self._segment_first_record_frame_index,
+            last_record_frame_index=self.frame_counter,
+            first_system_time=self._segment_first_system_time,
+            last_system_time=time.time(),
+            opened_at=self._segment_opened_at,
+            roll_reason=roll_reason,
+            timeline_break=timeline_break,
+            gap_s=gap_s,
+        )
+        self._closer_queue.put(
+            _CloserJob(
+                writer=writer,
+                part_base=part_base,
+                final_path=final_path,
+                segment_index=segment_index,
+                manifest_entry=entry,
+            )
+        )
+
+    def _start_closer_thread(self) -> None:
+        self._closer_thread = threading.Thread(
+            target=self._closer_loop, name="segment-closer", daemon=True
+        )
+        self._closer_thread.start()
+
+    def _closer_loop(self) -> None:
+        while True:
+            job = self._closer_queue.get()
+            try:
+                self._run_closer_job(job)
+            finally:
+                self._closer_queue.task_done()
+
+    def _run_closer_job(self, job: "_CloserJob") -> None:
+        start = time.monotonic()
+        try:
+            job.writer.Close()
+        except Exception as exc:
+            print(f"[camera] error closing segment {job.segment_index}: {exc}")
+        close_duration_s = time.monotonic() - start
+
+        part_files = reconcile_part_files(job.part_base)
+        total_bytes = 0
+        if not part_files:
+            print(
+                f"[camera] segment {job.segment_index}: no part file found "
+                "after close (recording may be incomplete)"
+            )
+        else:
+            total_bytes += self._safe_rename(part_files[0], job.final_path)
+            for extra in part_files[1:]:
+                # Spinnaker's own SetMaximumFileSize net fired mid-segment
+                # (should never happen -- it's set well above our own
+                # ceiling). Never silently orphan it: rename with an
+                # unmistakable prefix rather than trying to claim another
+                # slot in the live segment_index sequence, which risks a
+                # race against the acquisition thread's own counter.
+                print(f"[camera] WARNING: unexpected extra part file for segment {job.segment_index}: {extra}")
+                total_bytes += self._safe_rename(extra, extra.with_name("UNEXPECTED_" + extra.name))
+
+        entry = dataclass_replace(
+            job.manifest_entry,
+            closed_at=time.time(),
+            close_duration_s=close_duration_s,
+            bytes=total_bytes,
+        )
+        self._segment_manifest_writer.submit(manifest_row(entry))
+
+    def _safe_rename(self, source: Path, destination: Path) -> int:
+        size = 0
+        try:
+            size = source.stat().st_size
+        except OSError:
+            pass
+        for attempt in range(5):
+            try:
+                os.replace(source, destination)
+                return size
+            except OSError as exc:
+                if attempt == 4:
+                    print(f"[camera] error finalizing {source} -> {destination}: {exc}")
+                    return size
+                time.sleep(0.2 * (attempt + 1))
+        return size
 
     # ------------------------------------------------------------------
     # Recording control (GUI thread): only set flags
     # ------------------------------------------------------------------
 
-    def start_recording(self, filename: str, fps: float = 30.0):
+    def start_recording(self, session_paths: SessionPaths, fps: float = 30.0):
         """
         Request recording to start. The acquisition thread will
         actually open SpinVideo and begin appending frames.
@@ -491,18 +797,17 @@ class CameraController:
         # Open the metadata CSV synchronously, on the calling (GUI) thread,
         # so a bad output path fails the start immediately instead of
         # silently losing every frame's metadata for the whole session.
-        self._metadata_writer.start(metadata_csv_path(filename))
+        self._metadata_writer.start(session_paths.metadata_csv)
         if not self._metadata_writer.wait_until_open():
             return False, f"Cannot open metadata CSV: {self._metadata_writer.last_error}"
 
-        events_path = filename.rsplit(".", 1)[0] + "_events.jsonl"
         try:
-            self._event_log = JsonlEventLog(events_path)
+            self._event_log = JsonlEventLog(session_paths.events_jsonl)
             self._event_log.write(
                 session_header_record(
                     mono_ns=int(time.monotonic() * 1e9),
                     wall_ns=int(time.time() * 1e9),
-                    recording_basename=filename,
+                    recording_basename=session_paths.basename,
                 )
             )
         except Exception as exc:
@@ -513,11 +818,35 @@ class CameraController:
                 except Exception:
                     pass
                 self._event_log = None
-            return False, f"Cannot open events log {events_path}: {exc}"
+            return False, f"Cannot open events log {session_paths.events_jsonl}: {exc}"
+
+        self._segment_manifest_writer.start(session_paths.segments_csv)
+        if not self._segment_manifest_writer.wait_until_open():
+            self._metadata_writer.stop()
+            self._event_log.close()
+            self._event_log = None
+            return False, f"Cannot open segments CSV: {self._segment_manifest_writer.last_error}"
+
+        # Lives for the app's lifetime, not per-session -- start it once.
+        if self._closer_thread is None or not self._closer_thread.is_alive():
+            self._start_closer_thread()
 
         self._segment_tracker.reset()
+        self._session_paths = session_paths
+        self._segment_index = 0
+        self._frames_in_segment = 0
+        self._bytes_in_segment = 0
+        self._segment_opened_at = time.monotonic()
+        self._segment_first_record_frame_index = None
+        self._segment_first_system_time = None
+        self._pending_writer = None
+        self._pending_writer_segment_index = None
+        self._prepared_next_segment = False
+        self._pending_fault_roll = False
+        self._pending_fault_roll_gap_s = None
+        self._mark_next_frame_segment_resume = False
+        self._max_frames_per_segment = segment_frames_for(fps)
 
-        self.record_filename = filename
         self.recording_fps = fps
         self.record_start_requested = True
         self.record_stop_requested = False
@@ -527,7 +856,7 @@ class CameraController:
             self._append_failures = 0
             self._camera_reinits = 0
 
-        return True, f"Recording requested: {filename}"
+        return True, f"Recording requested: {session_paths.basename}"
 
     def stop_recording(self):
         """
@@ -555,11 +884,7 @@ class CameraController:
             # --------------------------------------------------
             if self.record_start_requested and not self.recording_active:
                 try:
-                    self.avi_recorder = PySpin.SpinVideo()
-                    opt = PySpin.MJPGOption()
-                    opt.frameRate = self.recording_fps
-                    opt.quality = 75
-                    self.avi_recorder.Open(self.record_filename, opt)
+                    self.avi_recorder = self._open_segment_writer(0)
                     self.recording_active = True
                 except Exception as exc:
                     print("Error starting recording:", exc)
@@ -572,11 +897,41 @@ class CameraController:
             # STOP recording (close SpinVideo + write CSV) if requested
             # --------------------------------------------------
             if self.record_stop_requested and self.recording_active:
-                try:
-                    if self.avi_recorder is not None:
-                        self.avi_recorder.Close()
-                except Exception as exc:
-                    print("Error closing recorder:", exc)
+                if self.avi_recorder is not None:
+                    self._retire_segment(
+                        writer=self.avi_recorder,
+                        segment_index=self._segment_index,
+                        roll_reason="session_stop",
+                        timeline_break=False,
+                        gap_s=None,
+                    )
+                    self.avi_recorder = None
+
+                # Discard any pre-armed next writer -- it will never be used.
+                if self._pending_writer is not None:
+                    try:
+                        self._pending_writer.Close()
+                    except Exception:
+                        pass
+                    try:
+                        unused_base = self._session_paths.video_part_base(
+                            self._pending_writer_segment_index
+                        )
+                        for unused_file in reconcile_part_files(unused_base):
+                            unused_file.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    self._pending_writer = None
+                    self._pending_writer_segment_index = None
+                self._prepared_next_segment = False
+
+                # Block until every queued segment (including the one just
+                # retired above) is Close()'d, renamed, and manifest-logged.
+                # Otherwise stop()'s DeInit()/ReleaseInstance() could run
+                # concurrently with a Close() still in flight on the closer
+                # thread -- the acquisition thread has no more frames to
+                # grab at this point, so waiting here costs nothing.
+                self._closer_queue.join()
 
                 # Drains any queued/overflowed rows and closes the CSV.
                 # Rows themselves were already written incrementally during
@@ -585,6 +940,11 @@ class CameraController:
                 writer_error = self._metadata_writer.last_error
                 if writer_error:
                     print("Error writing metadata CSV:", writer_error)
+
+                self._segment_manifest_writer.stop()
+                manifest_error = self._segment_manifest_writer.last_error
+                if manifest_error:
+                    print("Error writing segments CSV:", manifest_error)
 
                 if self._event_log is not None:
                     try:
@@ -609,8 +969,7 @@ class CameraController:
                 # Reset recording state
                 self.recording_active = False
                 self.record_stop_requested = False
-                self.avi_recorder = None
-                self.record_filename = None
+                self._session_paths = None
 
             # --------------------------------------------------
             # Grab next frame from camera, with fault recovery
@@ -717,6 +1076,17 @@ class CameraController:
                         self._append_failures += 1
                 else:
                     self.frame_counter += 1
+                    self._frames_in_segment += 1
+                    if self._frames_in_segment == 1:
+                        self._segment_first_record_frame_index = self.frame_counter
+                        self._segment_first_system_time = time.time()
+
+                    if self._mark_next_frame_segment_resume:
+                        row_sync_label = "segment_resume"
+                        self._mark_next_frame_segment_resume = False
+                    else:
+                        row_sync_label = resolve_sync_label(label_event, sync_label)
+
                     self._metadata_writer.submit(
                         metadata_row(
                             {
@@ -725,13 +1095,16 @@ class CameraController:
                                 "timestamp_us": timestamp_us,
                                 "system_time": time.time(),
                                 "sync_pulse": sync_this_frame,
-                                "sync_label": resolve_sync_label(label_event, sync_label),
+                                "sync_label": row_sync_label,
                                 "adl_id": adl_id,
                                 "adl_label": adl_label,
                                 "segment": self._segment_tracker.current_segment,
+                                "segment_file": self._session_paths.video_final(self._segment_index).name,
+                                "segment_frame_index": self._frames_in_segment,
                             }
                         )
                     )
+                    self._maybe_rotate_segment()
 
             # --------------------------------------------------
             # Preview: store latest frame
