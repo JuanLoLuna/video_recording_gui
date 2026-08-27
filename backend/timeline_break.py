@@ -62,6 +62,38 @@ def timeline_break_record(brk: TimelineBreak) -> dict[str, object]:
     return record
 
 
+def session_header_record(
+    *, mono_ns: int, wall_ns: int, recording_basename: str
+) -> dict[str, object]:
+    """First record in a session's events sidecar.
+
+    Written even when the session has zero faults, so the file is never
+    silently empty -- an events.jsonl with only a header and a stop
+    record is the expected, correct shape for a clean session; one with
+    nothing at all previously looked identical to "logging is broken".
+    """
+    return {
+        "rec": "header",
+        "segment": 0,
+        "mono_ns": mono_ns,
+        "wall_ns": wall_ns,
+        "recording": recording_basename,
+    }
+
+
+def session_stop_record(
+    *, mono_ns: int, wall_ns: int, total_segments: int, camera_reinits: int
+) -> dict[str, object]:
+    """Last record in a session's events sidecar."""
+    return {
+        "rec": "stop",
+        "mono_ns": mono_ns,
+        "wall_ns": wall_ns,
+        "total_segments": total_segments,
+        "camera_reinits": camera_reinits,
+    }
+
+
 def detect_suspend(
     *,
     prev_skew_ns: int,

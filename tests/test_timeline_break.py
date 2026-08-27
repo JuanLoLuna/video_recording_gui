@@ -10,6 +10,8 @@ from backend.timeline_break import (
     TimelineBreak,
     detect_suspend,
     estimate_frames_lost,
+    session_header_record,
+    session_stop_record,
     timeline_break_record,
 )
 
@@ -62,6 +64,33 @@ class TimelineBreakRecordTests(unittest.TestCase):
         self.assertEqual(record["gap_s"], 12.0)
         self.assertEqual(record["frames_lost_estimate"], 360)
         self.assertEqual(record["record_frame_index"], 5000)
+
+
+class SessionBookendRecordTests(unittest.TestCase):
+    def test_header_record_shape(self):
+        record = session_header_record(
+            mono_ns=1, wall_ns=2, recording_basename="recording_20260101_000000"
+        )
+        self.assertEqual(record["rec"], "header")
+        self.assertEqual(record["segment"], 0)
+        self.assertEqual(record["recording"], "recording_20260101_000000")
+
+    def test_stop_record_shape(self):
+        record = session_stop_record(mono_ns=1, wall_ns=2, total_segments=3, camera_reinits=1)
+        self.assertEqual(record["rec"], "stop")
+        self.assertEqual(record["total_segments"], 3)
+        self.assertEqual(record["camera_reinits"], 1)
+
+    def test_a_clean_session_still_produces_a_non_empty_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            log = JsonlEventLog(path)
+            log.write(session_header_record(mono_ns=0, wall_ns=0, recording_basename="x"))
+            log.write(session_stop_record(mono_ns=1, wall_ns=1, total_segments=0, camera_reinits=0))
+            log.close()
+            lines = path.read_text().strip().split("\n")
+            self.assertEqual(len(lines), 2)
+            self.assertGreater(path.stat().st_size, 0)
 
 
 class DetectSuspendTests(unittest.TestCase):

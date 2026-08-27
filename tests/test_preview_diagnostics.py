@@ -67,6 +67,26 @@ class PreviewDiagnosticsAccumulatorTests(unittest.TestCase):
         self.assertEqual(empty_row["repeated_frames_skipped"], 0)
         self.assertEqual(empty_row["camera_frame_gaps"], 0)
 
+    def test_append_failures_and_camera_reinits_are_also_deltas(self):
+        accumulator = PreviewDiagnosticsAccumulator()
+        accumulator.reset(
+            {"append_failures": 2, "camera_reinits": 1},
+            now=0.0,
+        )
+        row = accumulator.sample(
+            {"append_failures": 5, "camera_reinits": 2},
+            now=1.0,
+        )
+        self.assertEqual(row["append_failures"], 3)
+        self.assertEqual(row["camera_reinits"], 1)
+
+    def test_missing_new_stat_keys_default_to_zero_delta(self):
+        accumulator = PreviewDiagnosticsAccumulator()
+        accumulator.reset({"camera_frame_gaps": 0}, now=0.0)
+        row = accumulator.sample({"camera_frame_gaps": 0}, now=1.0)
+        self.assertEqual(row["append_failures"], 0)
+        self.assertEqual(row["camera_reinits"], 0)
+
 
 class AsyncDiagnosticsCsvLoggerTests(unittest.TestCase):
     def test_writes_rows_with_the_expected_schema(self):

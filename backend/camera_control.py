@@ -9,7 +9,14 @@ import PySpin
 from backend.async_csv_writer import AsyncCsvWriter
 from backend.frame_metadata import METADATA_FIELDS, metadata_csv_path, metadata_row, resolve_sync_label
 from backend.acquisition_watchdog import AcquisitionWatchdog, watchdog_config_for_frame_rate
-from backend.timeline_break import JsonlEventLog, SegmentTracker, estimate_frames_lost, timeline_break_record
+from backend.timeline_break import (
+    JsonlEventLog,
+    SegmentTracker,
+    estimate_frames_lost,
+    session_header_record,
+    session_stop_record,
+    timeline_break_record,
+)
 
 
 @dataclass(frozen=True)
@@ -491,8 +498,21 @@ class CameraController:
         events_path = filename.rsplit(".", 1)[0] + "_events.jsonl"
         try:
             self._event_log = JsonlEventLog(events_path)
+            self._event_log.write(
+                session_header_record(
+                    mono_ns=int(time.monotonic() * 1e9),
+                    wall_ns=int(time.time() * 1e9),
+                    recording_basename=filename,
+                )
+            )
         except Exception as exc:
             self._metadata_writer.stop()
+            if self._event_log is not None:
+                try:
+                    self._event_log.close()
+                except Exception:
+                    pass
+                self._event_log = None
             return False, f"Cannot open events log {events_path}: {exc}"
 
         self._segment_tracker.reset()
@@ -567,6 +587,19 @@ class CameraController:
                     print("Error writing metadata CSV:", writer_error)
 
                 if self._event_log is not None:
+                    try:
+                        with self._acquisition_stats_lock:
+                            reinits = self._camera_reinits
+                        self._event_log.write(
+                            session_stop_record(
+                                mono_ns=int(time.monotonic() * 1e9),
+                                wall_ns=int(time.time() * 1e9),
+                                total_segments=self._segment_tracker.current_segment,
+                                camera_reinits=reinits,
+                            )
+                        )
+                    except Exception as exc:
+                        print("Error writing session stop record:", exc)
                     try:
                         self._event_log.close()
                     except Exception as exc:

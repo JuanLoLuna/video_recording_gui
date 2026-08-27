@@ -26,6 +26,8 @@ DIAGNOSTIC_FIELDS = [
     "camera_frame_gaps",
     "incomplete_images",
     "acquisition_errors",
+    "append_failures",
+    "camera_reinits",
 ]
 
 
@@ -142,6 +144,8 @@ class PreviewDiagnosticsAccumulator:
             "camera_frame_gaps": stat_delta("camera_frame_gaps"),
             "incomplete_images": stat_delta("incomplete_images"),
             "acquisition_errors": stat_delta("acquisition_errors"),
+            "append_failures": stat_delta("append_failures"),
+            "camera_reinits": stat_delta("camera_reinits"),
         }
 
         self._interval_started_at = sampled_at

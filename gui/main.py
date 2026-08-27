@@ -53,6 +53,7 @@ from backend.preview_diagnostics import (
     PreviewDiagnosticsAccumulator,
 )
 from backend.power_status import assess_power_safety, read_power_status
+from backend.recording_warnings import RecordingWarningTracker
 from backend.power_keepalive import (
     KeepAwakeRequest,
     KeepAwakeState,
@@ -160,6 +161,22 @@ class MainWindow(QWidget):
         self.open_power_settings_button.setVisible(sys.platform.startswith("win"))
         power_status_layout.addWidget(self.open_power_settings_button)
         layout.addWidget(self.power_status_frame)
+
+        # --- Recording integrity warning (dismissible; reappears on new issues) ---
+        self.recording_warning_frame = QFrame()
+        self.recording_warning_frame.setObjectName("recordingWarningFrame")
+        recording_warning_layout = QHBoxLayout(self.recording_warning_frame)
+        recording_warning_layout.setContentsMargins(8, 5, 8, 5)
+        self.recording_warning_label = QLabel("")
+        self.recording_warning_label.setWordWrap(True)
+        recording_warning_layout.addWidget(self.recording_warning_label, stretch=1)
+        self.dismiss_recording_warning_button = QPushButton("Dismiss")
+        self.dismiss_recording_warning_button.clicked.connect(
+            self._on_dismiss_recording_warning_clicked
+        )
+        recording_warning_layout.addWidget(self.dismiss_recording_warning_button)
+        self.recording_warning_frame.setVisible(False)
+        layout.addWidget(self.recording_warning_frame)
 
         # --- Setup & options (hidden while recording) ---
         self._setup_options_expanded = True
@@ -440,10 +457,7 @@ class MainWindow(QWidget):
 
         self._preview_diagnostics = PreviewDiagnosticsAccumulator()
         self._preview_diagnostics_logger = AsyncDiagnosticsCsvLogger()
-        self._recording_integrity_warning = False
-        self._recording_gap_count = 0
-        self._recording_incomplete_count = 0
-        self._recording_acquisition_error_count = 0
+        self._recording_warnings = RecordingWarningTracker()
         self.preview_diagnostics_timer = QTimer(self)
         self.preview_diagnostics_timer.timeout.connect(
             self._sample_preview_diagnostics
@@ -1158,10 +1172,8 @@ class MainWindow(QWidget):
                 self._apply_state()
                 return
 
-            self._recording_integrity_warning = False
-            self._recording_gap_count = 0
-            self._recording_incomplete_count = 0
-            self._recording_acquisition_error_count = 0
+            self._recording_warnings.reset()
+            self._update_recording_warning_banner()
             self._start_preview_diagnostics_logging(filename)
 
             self._stop_mic_preview()
@@ -1256,6 +1268,34 @@ class MainWindow(QWidget):
         if self.preview_running:
             self._preview_diagnostics.reset(self.camera.get_acquisition_stats())
 
+    def _update_recording_warning_banner(self) -> None:
+        """Reflect RecordingWarningTracker state in the dismissible banner.
+
+        Unlike the old permanent-latch text on preview_health_label, this
+        can return to a calm "recovered" state after the acquisition
+        watchdog fixes a fault, and can be dismissed once read.
+        """
+        state = self._recording_warnings.summarize(now_s=time.monotonic())
+        self.recording_warning_frame.setVisible(state.visible)
+        if not state.visible:
+            return
+        colors = {
+            "active": ("#ffebee", "#b71c1c"),
+            "recovered": ("#fff8e1", "#e65100"),
+        }
+        background, foreground = colors.get(state.level, ("#f0f0f0", "#555"))
+        self.recording_warning_label.setText(f"{state.headline}\n{state.detail}")
+        self.recording_warning_frame.setStyleSheet(
+            "QFrame#recordingWarningFrame {"
+            f" background: {background}; border: 1px solid {foreground};"
+            " border-radius: 4px; }"
+            f"QLabel {{ color: {foreground}; font-weight: 600; }}"
+        )
+
+    def _on_dismiss_recording_warning_clicked(self) -> None:
+        self._recording_warnings.dismiss(now_s=time.monotonic())
+        self._update_recording_warning_banner()
+
     def _sample_preview_diagnostics(self) -> None:
         """Update GUI health once per second and queue a CSV row if recording."""
         row = self._preview_diagnostics.sample(self.camera.get_acquisition_stats())
@@ -1268,13 +1308,23 @@ class MainWindow(QWidget):
         frame_gaps = int(row["camera_frame_gaps"])
         incomplete = int(row["incomplete_images"])
         errors = int(row["acquisition_errors"])
-        if self.state == AppState.RECORDING and (
-            frame_gaps or incomplete or errors
-        ):
-            self._recording_integrity_warning = True
-            self._recording_gap_count += frame_gaps
-            self._recording_incomplete_count += incomplete
-            self._recording_acquisition_error_count += errors
+        append_failures = int(row["append_failures"])
+        camera_reinits = int(row["camera_reinits"])
+
+        if self.state == AppState.RECORDING:
+            now_s = time.monotonic()
+            if frame_gaps or incomplete or errors or append_failures:
+                self._recording_warnings.note_issue(
+                    f"{frame_gaps} frame gap(s), {incomplete} incomplete image(s), "
+                    f"{errors} acquisition error(s), {append_failures} append failure(s)",
+                    now_s=now_s,
+                )
+            if camera_reinits:
+                self._recording_warnings.note_issue(
+                    f"camera reconnected after a fault ({camera_reinits} reinit(s))",
+                    now_s=now_s,
+                )
+        self._update_recording_warning_banner()
 
         if age_value == "":
             text = f"Preview pipeline: no new frame ({rendered_fps:.1f} displayed fps)"
@@ -1294,14 +1344,6 @@ class MainWindow(QWidget):
             text += (
                 f" — camera warnings: {frame_gaps} gap(s), "
                 f"{incomplete} incomplete, {errors} error(s)"
-            )
-            color = "#b71c1c"
-        if self._recording_integrity_warning:
-            text += (
-                " — RECORDING INTEGRITY WARNING: "
-                f"{self._recording_gap_count} missing frame(s), "
-                f"{self._recording_incomplete_count} incomplete, "
-                f"{self._recording_acquisition_error_count} acquisition error(s)"
             )
             color = "#b71c1c"
 
