@@ -8,6 +8,8 @@ import PySpin
 
 from backend.async_csv_writer import AsyncCsvWriter
 from backend.frame_metadata import METADATA_FIELDS, metadata_csv_path, metadata_row, resolve_sync_label
+from backend.acquisition_watchdog import AcquisitionWatchdog, watchdog_config_for_frame_rate
+from backend.timeline_break import JsonlEventLog, SegmentTracker, estimate_frames_lost, timeline_break_record
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,26 @@ class CameraController:
         self._acq_thread = None
         self._stop_event = threading.Event()
 
+        # Guards self.cam handle swaps and all GenICam node access, so a
+        # fault-recovery reinit (acquisition thread) can never race a GUI
+        # slider callback (get/set_image_param, get/set_frame_rate) into a
+        # use-after-free on the native Spinnaker object. Never held across
+        # GetNextImage()/Append() -- those must stay off this lock so a
+        # slow grab can't block the GUI thread.
+        self._camera_lock = threading.RLock()
+        # Set for the duration of a reinit; GUI-thread accessors check this
+        # and return immediately rather than blocking on _camera_lock, so a
+        # multi-second camera reinit never freezes the GUI.
+        self._recovering = threading.Event()
+        self._watchdog: AcquisitionWatchdog | None = None
+        self._segment_tracker = SegmentTracker()
+        self._camera_reinits = 0
+        # Timeline-break sidecar for the current recording session (opened in
+        # start_recording, closed on stop). None while not recording, so a
+        # reinit during preview-only acquisition just doesn't log a break --
+        # there is no session timeline to protect yet.
+        self._event_log: JsonlEventLog | None = None
+
         # Latest frame for preview
         self._latest_frame = None
         self._latest_preview_frame: PreviewFrame | None = None
@@ -171,36 +193,17 @@ class CameraController:
 
             self.cam = self.cam_list[0]
             self.cam.Init()
-
-            # Enable chunk metadata
-            self._enable_chunk_data()
-
-            # Acquisition mode: Continuous
-            nodemap = self.cam.GetNodeMap()
-            acq_mode = PySpin.CEnumerationPtr(nodemap.GetNode("AcquisitionMode"))
-            continuous_entry = acq_mode.GetEntryByName("Continuous")
-            acq_mode.SetIntValue(continuous_entry.GetValue())
-
-            # Set acquisition frame rate
-            frame_rate_enable = PySpin.CBooleanPtr(nodemap.GetNode("AcquisitionFrameRateEnable"))
-            if PySpin.IsWritable(frame_rate_enable):
-                frame_rate_enable.SetValue(True)
-            frame_rate = PySpin.CFloatPtr(nodemap.GetNode("AcquisitionFrameRate"))
-            if PySpin.IsWritable(frame_rate):
-                lo, hi = float(frame_rate.GetMin()), float(frame_rate.GetMax())
-                target = min(hi, max(lo, float(self.target_frame_rate)))
-                frame_rate.SetValue(target)
-            # Read back whatever the camera actually applied so recording fps
-            # (AVI playback speed) matches the true capture rate.
-            if PySpin.IsReadable(frame_rate):
-                actual = float(frame_rate.GetValue())
-                self.target_frame_rate = actual
-                self.recording_fps = actual
+            self._configure_camera_nodes()
 
             self.cam.BeginAcquisition()
             self.acquiring = True
             self._stop_event.clear()
             self._reset_acquisition_stats()
+            self._watchdog = AcquisitionWatchdog(
+                watchdog_config_for_frame_rate(self.target_frame_rate),
+                now=time.monotonic(),
+            )
+            self._camera_reinits = 0
 
             self._acq_thread = threading.Thread(
                 target=self._acquisition_loop,
@@ -317,6 +320,149 @@ class CameraController:
                 print(f"Could not enable chunk '{name}': {exc}")
                 continue
 
+    def _configure_camera_nodes(self) -> None:
+        """Chunk data + acquisition mode + frame rate.
+
+        Called from start() and from _reinitialize_camera() so a camera
+        recovered after a fault ends up configured identically to how it
+        started, instead of silently reverting to whatever the driver
+        defaults to. Must be called AFTER cam.Init() and BEFORE
+        cam.BeginAcquisition(), same constraint as _enable_chunk_data().
+        """
+        self._enable_chunk_data()
+
+        nodemap = self.cam.GetNodeMap()
+        acq_mode = PySpin.CEnumerationPtr(nodemap.GetNode("AcquisitionMode"))
+        continuous_entry = acq_mode.GetEntryByName("Continuous")
+        acq_mode.SetIntValue(continuous_entry.GetValue())
+
+        frame_rate_enable = PySpin.CBooleanPtr(nodemap.GetNode("AcquisitionFrameRateEnable"))
+        if PySpin.IsWritable(frame_rate_enable):
+            frame_rate_enable.SetValue(True)
+        frame_rate = PySpin.CFloatPtr(nodemap.GetNode("AcquisitionFrameRate"))
+        if PySpin.IsWritable(frame_rate):
+            lo, hi = float(frame_rate.GetMin()), float(frame_rate.GetMax())
+            target = min(hi, max(lo, float(self.target_frame_rate)))
+            frame_rate.SetValue(target)
+        # Read back whatever the camera actually applied so recording fps
+        # (AVI playback speed) matches the true capture rate.
+        if PySpin.IsReadable(frame_rate):
+            actual = float(frame_rate.GetValue())
+            self.target_frame_rate = actual
+            self.recording_fps = actual
+
+    def _reinitialize_camera(self) -> tuple[bool, str]:
+        """Best-effort full camera reinit after a fault. Acquisition thread only.
+
+        Tears down and rebuilds the whole Spinnaker object chain (System ->
+        CameraList -> Camera), the same sequence stop() already performs,
+        then re-applies _configure_camera_nodes() and restarts acquisition.
+        Called repeatedly by the watchdog's backoff loop until it succeeds
+        -- see AcquisitionWatchdog's "no give_up action" design note.
+        """
+        # Set _recovering BEFORE taking the lock: GUI-thread accessors check
+        # this flag first and return immediately without ever touching
+        # _camera_lock, so they should never see the flag clear while
+        # blocked waiting on the lock. (Setting it after acquiring the
+        # lock would leave a narrow window where an accessor's flag check
+        # passes and it then blocks on the lock instead.)
+        self._recovering.set()
+        try:
+            with self._camera_lock:
+                if self.cam is not None:
+                    try:
+                        self.cam.EndAcquisition()
+                    except Exception:
+                        pass
+                    try:
+                        self.cam.DeInit()
+                    except Exception:
+                        pass
+                    self.cam = None
+                if self.cam_list is not None:
+                    try:
+                        self.cam_list.Clear()
+                    except Exception:
+                        pass
+                    self.cam_list = None
+                if self.system is not None:
+                    try:
+                        self.system.ReleaseInstance()
+                    except Exception:
+                        pass
+                    self.system = None
+
+                try:
+                    self.system = PySpin.System.GetInstance()
+                    self.cam_list = self.system.GetCameras()
+                    if self.cam_list.GetSize() == 0:
+                        return False, "No camera detected during reinit."
+                    self.cam = self.cam_list[0]
+                    self.cam.Init()
+                    self._configure_camera_nodes()
+                    self.cam.BeginAcquisition()
+                    with self._acquisition_stats_lock:
+                        self._camera_reinits += 1
+                    return True, "Camera reinitialized."
+                except Exception as exc:
+                    self.cam = None
+                    return False, f"{exc.__class__.__name__}: {exc}"
+        finally:
+            self._recovering.clear()
+
+    def _watchdog_grab_timeout_ms(self) -> int:
+        return int(self._watchdog.config.grab_timeout_s * 1000)
+
+    def _apply_watchdog_decision(self, decision) -> None:
+        """Acquisition thread only. Acts on a "sleep" or "reinit" decision.
+
+        ("continue" needs no action -- the caller just proceeds.)
+        """
+        if decision.action == "sleep":
+            # Interruptible: returns immediately if stop() sets the event,
+            # so a growing backoff never delays shutdown.
+            self._stop_event.wait(decision.sleep_s)
+        elif decision.action == "reinit":
+            self._recover_camera(decision)
+
+    def _recover_camera(self, decision) -> None:
+        """Acquisition thread only. Attempt one reinit and log the outcome.
+
+        On success, marks a timeline break in the current recording's
+        events sidecar (if recording) so the gap is documented -- but
+        deliberately does NOT touch frame_counter or the metadata writer:
+        record_frame_index must stay unbroken across the break, per the
+        session's one-continuous-CSV design.
+        """
+        ok, msg = self._reinitialize_camera()
+        now = time.monotonic()
+        if not ok:
+            print(f"[camera] reinit failed: {msg}")
+        else:
+            print(f"[camera] reinit succeeded ({decision.reason})")
+            if self._event_log is not None:
+                gap_s = decision.stalled_for_s if decision.stalled_for_s else None
+                frames_lost = (
+                    estimate_frames_lost(gap_s, self.target_frame_rate)
+                    if gap_s is not None
+                    else None
+                )
+                brk = self._segment_tracker.begin_break(
+                    cause="camera_reinit",
+                    mono_ns=int(now * 1e9),
+                    wall_ns=int(time.time() * 1e9),
+                    note=f"{decision.reason}; do not fit across this",
+                    gap_s=gap_s,
+                    frames_lost_estimate=frames_lost,
+                    record_frame_index=self.frame_counter,
+                )
+                try:
+                    self._event_log.write(timeline_break_record(brk))
+                except Exception as exc:
+                    print("Error writing timeline break:", exc)
+        reinit_decision = self._watchdog.note_reinit_result(now=now, ok=ok)
+        self._apply_watchdog_decision(reinit_decision)
+
     # ------------------------------------------------------------------
     # Recording control (GUI thread): only set flags
     # ------------------------------------------------------------------
@@ -342,6 +488,15 @@ class CameraController:
         if not self._metadata_writer.wait_until_open():
             return False, f"Cannot open metadata CSV: {self._metadata_writer.last_error}"
 
+        events_path = filename.rsplit(".", 1)[0] + "_events.jsonl"
+        try:
+            self._event_log = JsonlEventLog(events_path)
+        except Exception as exc:
+            self._metadata_writer.stop()
+            return False, f"Cannot open events log {events_path}: {exc}"
+
+        self._segment_tracker.reset()
+
         self.record_filename = filename
         self.recording_fps = fps
         self.record_start_requested = True
@@ -350,6 +505,7 @@ class CameraController:
         self.frame_counter = 0
         with self._acquisition_stats_lock:
             self._append_failures = 0
+            self._camera_reinits = 0
 
         return True, f"Recording requested: {filename}"
 
@@ -367,11 +523,13 @@ class CameraController:
     # ------------------------------------------------------------------
 
     def _acquisition_loop(self):
-        while (
-            not self._stop_event.is_set()
-            and self.acquiring
-            and self.cam is not None
-        ):
+        # Deliberately does NOT require self.cam is not None: self.cam is
+        # None for the whole duration between a fault tearing the handle
+        # down and a reinit rebuilding it (see _reinitialize_camera / the
+        # "no camera handle" branch below), and the loop must keep running
+        # through that window to retry -- otherwise a single failed reinit
+        # would silently end the loop and never resume.
+        while not self._stop_event.is_set() and self.acquiring:
             # --------------------------------------------------
             # START recording (open SpinVideo) if requested
             # --------------------------------------------------
@@ -408,6 +566,13 @@ class CameraController:
                 if writer_error:
                     print("Error writing metadata CSV:", writer_error)
 
+                if self._event_log is not None:
+                    try:
+                        self._event_log.close()
+                    except Exception as exc:
+                        print("Error closing events log:", exc)
+                    self._event_log = None
+
                 # Reset recording state
                 self.recording_active = False
                 self.record_stop_requested = False
@@ -415,15 +580,39 @@ class CameraController:
                 self.record_filename = None
 
             # --------------------------------------------------
-            # Grab next frame from camera
+            # Grab next frame from camera, with fault recovery
             # --------------------------------------------------
-            try:
-                image = self.cam.GetNextImage()
-            except Exception:
-                with self._acquisition_stats_lock:
-                    self._acquisition_errors += 1
+            # A stall (camera stopped delivering, no exception at all) can
+            # only be caught by checking elapsed time independently of
+            # whether the grab itself raises -- poll before attempting it.
+            stall_decision = self._watchdog.poll(now=time.monotonic())
+            if stall_decision.action == "reinit":
+                self._recover_camera(stall_decision)
                 continue
 
+            with self._camera_lock:
+                cam = self.cam
+            if cam is None:
+                error_decision = self._watchdog.note_error(
+                    now=time.monotonic(), error="no camera handle"
+                )
+                self._apply_watchdog_decision(error_decision)
+                continue
+
+            try:
+                # grabTimeout is milliseconds (Spinnaker CameraBase::GetNextImage);
+                # bounding it is what turns a silent forever-block into a
+                # detectable, recoverable error instead.
+                grab_timeout_ms = self._watchdog_grab_timeout_ms()
+                image = cam.GetNextImage(grab_timeout_ms)
+            except Exception as exc:
+                with self._acquisition_stats_lock:
+                    self._acquisition_errors += 1
+                error_decision = self._watchdog.note_error(now=time.monotonic(), error=str(exc))
+                self._apply_watchdog_decision(error_decision)
+                continue
+
+            self._watchdog.note_frame_ok(now=time.monotonic())
             retrieved_at = time.monotonic()
 
             if image.IsIncomplete():
@@ -506,6 +695,7 @@ class CameraController:
                                 "sync_label": resolve_sync_label(label_event, sync_label),
                                 "adl_id": adl_id,
                                 "adl_label": adl_label,
+                                "segment": self._segment_tracker.current_segment,
                             }
                         )
                     )
@@ -587,6 +777,7 @@ class CameraController:
                 "acquisition_errors": self._acquisition_errors,
                 "append_failures": self._append_failures,
                 "metadata_overflow_rows": self._metadata_writer.overflow_rows,
+                "camera_reinits": self._camera_reinits,
             }
 
     # ------------------------------------------------------------------
@@ -601,61 +792,67 @@ class CameraController:
         Gamma is often gated by GammaEnable; this enables it when writable
         so limits/current can be read.
         """
-        if self.cam is None or not self.acquiring:
+        if self.cam is None or not self.acquiring or self._recovering.is_set():
             return None
-        try:
-            nodemap = self.cam.GetNodeMap()
-            if param_name == "Gamma":
-                ge = PySpin.CBooleanPtr(nodemap.GetNode("GammaEnable"))
-                if PySpin.IsWritable(ge):
-                    ge.SetValue(True)
-            node = nodemap.GetNode(param_name)
-            if node is None or not PySpin.IsReadable(node):
+        with self._camera_lock:
+            if self.cam is None:
                 return None
-            fn = PySpin.CFloatPtr(node)
-            if PySpin.IsReadable(fn):
-                return (
-                    float(fn.GetMin()),
-                    float(fn.GetMax()),
-                    float(fn.GetValue()),
-                )
-            ir = PySpin.CIntegerPtr(node)
-            if PySpin.IsReadable(ir):
-                return (
-                    float(ir.GetMin()),
-                    float(ir.GetMax()),
-                    float(ir.GetValue()),
-                )
-        except Exception:
-            return None
+            try:
+                nodemap = self.cam.GetNodeMap()
+                if param_name == "Gamma":
+                    ge = PySpin.CBooleanPtr(nodemap.GetNode("GammaEnable"))
+                    if PySpin.IsWritable(ge):
+                        ge.SetValue(True)
+                node = nodemap.GetNode(param_name)
+                if node is None or not PySpin.IsReadable(node):
+                    return None
+                fn = PySpin.CFloatPtr(node)
+                if PySpin.IsReadable(fn):
+                    return (
+                        float(fn.GetMin()),
+                        float(fn.GetMax()),
+                        float(fn.GetValue()),
+                    )
+                ir = PySpin.CIntegerPtr(node)
+                if PySpin.IsReadable(ir):
+                    return (
+                        float(ir.GetMin()),
+                        float(ir.GetMax()),
+                        float(ir.GetValue()),
+                    )
+            except Exception:
+                return None
         return None
 
     def set_image_param(self, param_name: str, value: float) -> bool:
         """Write Gain / Gamma / BlackLevel (float or integer node)."""
-        if self.cam is None or not self.acquiring:
+        if self.cam is None or not self.acquiring or self._recovering.is_set():
             return False
-        try:
-            nodemap = self.cam.GetNodeMap()
-            if param_name == "Gamma":
-                ge = PySpin.CBooleanPtr(nodemap.GetNode("GammaEnable"))
-                if PySpin.IsWritable(ge):
-                    ge.SetValue(True)
-            node = nodemap.GetNode(param_name)
-            if node is None:
+        with self._camera_lock:
+            if self.cam is None:
                 return False
-            fn = PySpin.CFloatPtr(node)
-            if PySpin.IsWritable(fn):
-                lo, hi = float(fn.GetMin()), float(fn.GetMax())
-                fn.SetValue(min(hi, max(lo, float(value))))
-                return True
-            ir = PySpin.CIntegerPtr(node)
-            if PySpin.IsWritable(ir):
-                lo, hi = int(ir.GetMin()), int(ir.GetMax())
-                iv = int(round(float(value)))
-                ir.SetValue(min(hi, max(lo, iv)))
-                return True
-        except Exception as exc:
-            print(f"[camera] set_image_param {param_name}: {exc}")
+            try:
+                nodemap = self.cam.GetNodeMap()
+                if param_name == "Gamma":
+                    ge = PySpin.CBooleanPtr(nodemap.GetNode("GammaEnable"))
+                    if PySpin.IsWritable(ge):
+                        ge.SetValue(True)
+                node = nodemap.GetNode(param_name)
+                if node is None:
+                    return False
+                fn = PySpin.CFloatPtr(node)
+                if PySpin.IsWritable(fn):
+                    lo, hi = float(fn.GetMin()), float(fn.GetMax())
+                    fn.SetValue(min(hi, max(lo, float(value))))
+                    return True
+                ir = PySpin.CIntegerPtr(node)
+                if PySpin.IsWritable(ir):
+                    lo, hi = int(ir.GetMin()), int(ir.GetMax())
+                    iv = int(round(float(value)))
+                    ir.SetValue(min(hi, max(lo, iv)))
+                    return True
+            except Exception as exc:
+                print(f"[camera] set_image_param {param_name}: {exc}")
         return False
 
     # ------------------------------------------------------------------
@@ -671,22 +868,25 @@ class CameraController:
         'current' value right after enabling reflects the camera's default
         (typically its max sustainable rate at the current exposure).
         """
-        if self.cam is None or not self.acquiring:
+        if self.cam is None or not self.acquiring or self._recovering.is_set():
             return None
-        try:
-            nodemap = self.cam.GetNodeMap()
-            enable = PySpin.CBooleanPtr(nodemap.GetNode("AcquisitionFrameRateEnable"))
-            if PySpin.IsWritable(enable):
-                enable.SetValue(True)
-            node = PySpin.CFloatPtr(nodemap.GetNode("AcquisitionFrameRate"))
-            if PySpin.IsReadable(node):
-                return (
-                    float(node.GetMin()),
-                    float(node.GetMax()),
-                    float(node.GetValue()),
-                )
-        except Exception:
-            return None
+        with self._camera_lock:
+            if self.cam is None:
+                return None
+            try:
+                nodemap = self.cam.GetNodeMap()
+                enable = PySpin.CBooleanPtr(nodemap.GetNode("AcquisitionFrameRateEnable"))
+                if PySpin.IsWritable(enable):
+                    enable.SetValue(True)
+                node = PySpin.CFloatPtr(nodemap.GetNode("AcquisitionFrameRate"))
+                if PySpin.IsReadable(node):
+                    return (
+                        float(node.GetMin()),
+                        float(node.GetMax()),
+                        float(node.GetValue()),
+                    )
+            except Exception:
+                return None
         return None
 
     def get_acquisition_frame_rate(self) -> float:
@@ -702,23 +902,26 @@ class CameraController:
         keep recording_fps in sync so AVI playback speed matches capture.
         Returns True on success.
         """
-        if self.cam is None or not self.acquiring:
+        if self.cam is None or not self.acquiring or self._recovering.is_set():
             return False
-        try:
-            nodemap = self.cam.GetNodeMap()
-            enable = PySpin.CBooleanPtr(nodemap.GetNode("AcquisitionFrameRateEnable"))
-            if PySpin.IsWritable(enable):
-                enable.SetValue(True)
-            node = PySpin.CFloatPtr(nodemap.GetNode("AcquisitionFrameRate"))
-            if PySpin.IsWritable(node):
-                lo, hi = float(node.GetMin()), float(node.GetMax())
-                node.SetValue(min(hi, max(lo, float(value))))
-                actual = float(node.GetValue())
-                self.target_frame_rate = actual
-                self.recording_fps = actual
-                return True
-        except Exception as exc:
-            print(f"[camera] set_frame_rate: {exc}")
+        with self._camera_lock:
+            if self.cam is None:
+                return False
+            try:
+                nodemap = self.cam.GetNodeMap()
+                enable = PySpin.CBooleanPtr(nodemap.GetNode("AcquisitionFrameRateEnable"))
+                if PySpin.IsWritable(enable):
+                    enable.SetValue(True)
+                node = PySpin.CFloatPtr(nodemap.GetNode("AcquisitionFrameRate"))
+                if PySpin.IsWritable(node):
+                    lo, hi = float(node.GetMin()), float(node.GetMax())
+                    node.SetValue(min(hi, max(lo, float(value))))
+                    actual = float(node.GetValue())
+                    self.target_frame_rate = actual
+                    self.recording_fps = actual
+                    return True
+            except Exception as exc:
+                print(f"[camera] set_frame_rate: {exc}")
         return False
 
     # ------------------------------------------------------------------
