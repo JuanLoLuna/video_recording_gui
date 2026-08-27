@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import csv
-import queue
-import threading
 import time
 from datetime import datetime
-from pathlib import Path
 from typing import Mapping
+
+from backend.async_csv_writer import AsyncCsvWriter
 
 
 DIAGNOSTIC_FIELDS = [
@@ -156,91 +154,20 @@ class PreviewDiagnosticsAccumulator:
         return row
 
 
-class AsyncDiagnosticsCsvLogger:
-    """Write diagnostics rows off the GUI thread."""
+class AsyncDiagnosticsCsvLogger(AsyncCsvWriter):
+    """Write diagnostics rows off the GUI thread, one row per second.
 
-    _STOP = object()
+    A thin, behaviour-preserving specialisation of AsyncCsvWriter: per-row
+    flush (this log is small -- ~130 MB over 10 days at 1 Hz) and
+    drop-on-full (an occasional missed diagnostics sample is fine to lose;
+    unlike frame metadata, nothing downstream requires it to be dense).
+    """
 
     def __init__(self, max_pending_rows: int = 120) -> None:
-        self._max_pending_rows = max_pending_rows
-        self._queue: queue.Queue[dict[str, object] | object] | None = None
-        self._thread: threading.Thread | None = None
-        self._path: Path | None = None
-        self._last_error: str | None = None
-        self._dropped_rows = 0
-
-    @property
-    def is_running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
-
-    @property
-    def path(self) -> Path | None:
-        return self._path
-
-    @property
-    def last_error(self) -> str | None:
-        return self._last_error
-
-    @property
-    def dropped_rows(self) -> int:
-        return self._dropped_rows
-
-    def start(self, path: str | Path) -> None:
-        self.stop()
-        self._path = Path(path)
-        self._last_error = None
-        self._dropped_rows = 0
-        self._queue = queue.Queue(maxsize=self._max_pending_rows)
-        self._thread = threading.Thread(
-            target=self._writer_loop,
-            name="preview-diagnostics-writer",
-            daemon=True,
+        super().__init__(
+            DIAGNOSTIC_FIELDS,
+            max_pending_rows=max_pending_rows,
+            flush_every_rows=1,
+            drop_when_full=True,
+            thread_name="preview-diagnostics-writer",
         )
-        self._thread.start()
-
-    def submit(self, row: Mapping[str, object]) -> bool:
-        if self._queue is None or not self.is_running:
-            return False
-        try:
-            self._queue.put_nowait(dict(row))
-            return True
-        except queue.Full:
-            self._dropped_rows += 1
-            return False
-
-    def stop(self, timeout: float = 3.0) -> None:
-        work_queue = self._queue
-        worker = self._thread
-        if work_queue is not None and worker is not None and worker.is_alive():
-            try:
-                work_queue.put(self._STOP, timeout=timeout)
-            except queue.Full:
-                self._last_error = "Diagnostics queue did not drain during shutdown."
-            worker.join(timeout=timeout)
-            if worker.is_alive():
-                self._last_error = "Diagnostics writer did not stop cleanly."
-        self._thread = None
-        self._queue = None
-
-    def _writer_loop(self) -> None:
-        assert self._path is not None
-        assert self._queue is not None
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            with self._path.open("w", newline="", encoding="utf-8") as handle:
-                writer = csv.DictWriter(handle, fieldnames=DIAGNOSTIC_FIELDS)
-                writer.writeheader()
-                handle.flush()
-                while True:
-                    item = self._queue.get()
-                    try:
-                        if item is self._STOP:
-                            break
-                        writer.writerow(
-                            {field: item.get(field, "") for field in DIAGNOSTIC_FIELDS}
-                        )
-                        handle.flush()
-                    finally:
-                        self._queue.task_done()
-        except Exception as exc:
-            self._last_error = f"{exc.__class__.__name__}: {exc}"

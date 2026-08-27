@@ -1,11 +1,13 @@
 # backend/camera_control.py
 import threading
 import time
-import csv
 from dataclasses import dataclass
 
 import numpy as np
 import PySpin
+
+from backend.async_csv_writer import AsyncCsvWriter
+from backend.frame_metadata import METADATA_FIELDS, metadata_csv_path, metadata_row, resolve_sync_label
 
 
 @dataclass(frozen=True)
@@ -108,6 +110,7 @@ class CameraController:
         self._camera_frame_gaps = 0
         self._incomplete_images = 0
         self._acquisition_errors = 0
+        self._append_failures = 0
 
         # Recording state/flags (thread-safe)
         self.recording_active = False          # true while SpinVideo is open
@@ -121,7 +124,19 @@ class CameraController:
         # speed matches the real capture rate.
         self.target_frame_rate = 30.0
         self.record_filename = None
-        self.metadata_records = []
+        # Streams one row per recorded frame to disk incrementally, rather
+        # than buffering the whole session in RAM and writing once on
+        # stop (which lost 100% of metadata on any crash and grew
+        # unbounded over a multi-day session). Never drops a row -- see
+        # backend/async_csv_writer.py.
+        self._metadata_writer = AsyncCsvWriter(
+            METADATA_FIELDS,
+            max_pending_rows=2048,
+            flush_every_rows=300,
+            flush_every_seconds=5.0,
+            drop_when_full=False,
+            thread_name="frame-metadata-writer",
+        )
         self.frame_counter = 0
 
         # --- Sync marker state (for CSV logging) ---
@@ -320,13 +335,21 @@ class CameraController:
         if self.recording_active or self.record_start_requested:
             return True, "Recording already starting or in progress."
 
+        # Open the metadata CSV synchronously, on the calling (GUI) thread,
+        # so a bad output path fails the start immediately instead of
+        # silently losing every frame's metadata for the whole session.
+        self._metadata_writer.start(metadata_csv_path(filename))
+        if not self._metadata_writer.wait_until_open():
+            return False, f"Cannot open metadata CSV: {self._metadata_writer.last_error}"
+
         self.record_filename = filename
         self.recording_fps = fps
-        self.metadata_records = []
         self.record_start_requested = True
         self.record_stop_requested = False
         # Reset recording frame counter
         self.frame_counter = 0
+        with self._acquisition_stats_lock:
+            self._append_failures = 0
 
         return True, f"Recording requested: {filename}"
 
@@ -377,57 +400,18 @@ class CameraController:
                 except Exception as exc:
                     print("Error closing recorder:", exc)
 
-                # Write metadata CSV (simple csv module, no pandas)
-                if self.record_filename and self.metadata_records:
-                    csv_path = self.record_filename.rsplit(".", 1)[0] + "_metadata.csv"
-                    fieldnames = [
-                        "record_frame_index",
-                        "camera_frame_id",
-                        "timestamp_us",
-                        "system_time",
-                        "sync_pulse",
-                        "sync_label",
-                        "adl_id",
-                        "adl_label",
-                    ]
-
-                    try:
-                        with open(csv_path, "w", newline="") as f:
-                            writer = csv.DictWriter(f, fieldnames=fieldnames)
-                            writer.writeheader()
-
-                            for rec in self.metadata_records:
-                                if not isinstance(rec, dict):
-                                    continue
-
-                                row = {
-                                    "record_frame_index": int(rec.get("record_frame_index", 0)),
-                                    "camera_frame_id": (
-                                        "" if rec.get("camera_frame_id") is None
-                                        else int(rec.get("camera_frame_id"))
-                                    ),
-                                    "timestamp_us": (
-                                        "" if rec.get("timestamp_us") is None
-                                        else int(rec.get("timestamp_us"))
-                                    ),
-                                    "system_time": float(rec.get("system_time", 0.0)),
-                                    "sync_pulse": bool(rec.get("sync_pulse", False)),
-                                    "sync_label": "" if rec.get("sync_label") is None else str(rec.get("sync_label")),
-                                    "adl_id": (
-                                        "" if rec.get("adl_id") is None
-                                        else int(rec.get("adl_id"))
-                                    ),
-                                    "adl_label": "" if rec.get("adl_label") is None else str(rec.get("adl_label")),
-                                }
-                                writer.writerow(row)
-                    except Exception as exc:
-                        print("Error writing metadata CSV:", exc)
+                # Drains any queued/overflowed rows and closes the CSV.
+                # Rows themselves were already written incrementally during
+                # recording -- see the frame-append block below.
+                self._metadata_writer.stop()
+                writer_error = self._metadata_writer.last_error
+                if writer_error:
+                    print("Error writing metadata CSV:", writer_error)
 
                 # Reset recording state
                 self.recording_active = False
                 self.record_stop_requested = False
                 self.avi_recorder = None
-                self.metadata_records = []
                 self.record_filename = None
 
             # --------------------------------------------------
@@ -499,25 +483,32 @@ class CameraController:
                         adl_id = None
                         adl_label = None
 
-                # Increment only for recorded frames
-                self.frame_counter += 1
+                # Append before incrementing/logging: a failed Append must
+                # not advance record_frame_index, or the CSV's frame index
+                # permanently desynchronises from the AVI's actual frame
+                # count for the rest of the (possibly multi-day) session.
                 try:
                     self.avi_recorder.Append(image)
                 except Exception as exc:
                     print("Error appending frame:", exc)
-
-                self.metadata_records.append(
-                    {
-                        "record_frame_index": int(self.frame_counter),
-                        "camera_frame_id": int(frame_id) if frame_id is not None else None,
-                        "timestamp_us": int(timestamp_us) if timestamp_us is not None else None,
-                        "system_time": float(time.time()),
-                        "sync_pulse": bool(sync_this_frame),
-                        "sync_label": label_event if label_event else sync_label,
-                        "adl_id": adl_id,
-                        "adl_label": adl_label,
-                    }
-                )
+                    with self._acquisition_stats_lock:
+                        self._append_failures += 1
+                else:
+                    self.frame_counter += 1
+                    self._metadata_writer.submit(
+                        metadata_row(
+                            {
+                                "record_frame_index": self.frame_counter,
+                                "camera_frame_id": frame_id,
+                                "timestamp_us": timestamp_us,
+                                "system_time": time.time(),
+                                "sync_pulse": sync_this_frame,
+                                "sync_label": resolve_sync_label(label_event, sync_label),
+                                "adl_id": adl_id,
+                                "adl_label": adl_label,
+                            }
+                        )
+                    )
 
             # --------------------------------------------------
             # Preview: store latest frame
@@ -594,6 +585,8 @@ class CameraController:
                 "camera_frame_gaps": self._camera_frame_gaps,
                 "incomplete_images": self._incomplete_images,
                 "acquisition_errors": self._acquisition_errors,
+                "append_failures": self._append_failures,
+                "metadata_overflow_rows": self._metadata_writer.overflow_rows,
             }
 
     # ------------------------------------------------------------------
