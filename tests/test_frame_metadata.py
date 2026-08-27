@@ -45,6 +45,8 @@ class MetadataRowTests(unittest.TestCase):
                 "adl_id": 7,
                 "adl_label": "Writing",
                 "segment": 0,
+                "segment_file": "",
+                "segment_frame_index": 0,
             },
         )
 
@@ -79,7 +81,26 @@ class MetadataRowTests(unittest.TestCase):
 
     def test_legacy_field_order_is_unchanged(self):
         self.assertEqual(METADATA_FIELDS[:8], LEGACY_METADATA_FIELDS)
-        self.assertEqual(METADATA_FIELDS[-1], "segment")
+        self.assertEqual(METADATA_FIELDS[8:], ["segment", "segment_file", "segment_frame_index"])
+
+    def test_segment_file_and_frame_index_default_to_empty_and_zero(self):
+        row = metadata_row(
+            {"record_frame_index": 1, "system_time": 0.0}
+        )
+        self.assertEqual(row["segment_file"], "")
+        self.assertEqual(row["segment_frame_index"], 0)
+
+    def test_segment_file_and_frame_index_pass_through(self):
+        row = metadata_row(
+            {
+                "record_frame_index": 1,
+                "system_time": 0.0,
+                "segment_file": "recording_X-0007.avi",
+                "segment_frame_index": 42,
+            }
+        )
+        self.assertEqual(row["segment_file"], "recording_X-0007.avi")
+        self.assertEqual(row["segment_frame_index"], 42)
 
 
 class ResolveSyncLabelTests(unittest.TestCase):

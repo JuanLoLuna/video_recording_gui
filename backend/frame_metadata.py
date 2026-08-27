@@ -24,10 +24,20 @@ LEGACY_METADATA_FIELDS = [
 ]
 
 # "segment" tracks camera-recovery timeline breaks (Phase 1.4); it starts at
-# 0 for every session and increments on each auto-reinit. Appended at the
-# end -- every downstream consumer of this CSV reads columns by name, so
-# adding a trailing column is additive and safe.
-METADATA_FIELDS = LEGACY_METADATA_FIELDS + ["segment"]
+# 0 for every session and increments on each auto-reinit.
+#
+# "segment_file"/"segment_frame_index" (Phase 2) track video ROTATION
+# instead: which physical AVI a frame landed in, and its position within
+# that file. These change on every rotation (scheduled or fault-forced),
+# while "segment" only changes on a fault -- so "segment_file changed but
+# segment did not" means a routine scheduled rotation, and "both changed"
+# means a fault-forced one, without needing to cross-reference the
+# segment manifest for that distinction.
+#
+# All three are appended at the end -- every downstream consumer of this
+# CSV reads columns by name, so adding trailing columns is additive and
+# safe.
+METADATA_FIELDS = LEGACY_METADATA_FIELDS + ["segment", "segment_file", "segment_frame_index"]
 
 
 @dataclass(frozen=True)
@@ -41,6 +51,8 @@ class FrameMetadata:
     adl_id: int | None = None
     adl_label: str | None = None
     segment: int = 0
+    segment_file: str = ""
+    segment_frame_index: int = 0
 
 
 def resolve_sync_label(label_event: str | None, sync_label: str | None) -> str | None:
@@ -67,6 +79,8 @@ def metadata_row(record: FrameMetadata | Mapping[str, object]) -> dict[str, obje
             "adl_id": record.adl_id,
             "adl_label": record.adl_label,
             "segment": record.segment,
+            "segment_file": record.segment_file,
+            "segment_frame_index": record.segment_frame_index,
         }
     else:
         rec = record
@@ -85,6 +99,8 @@ def metadata_row(record: FrameMetadata | Mapping[str, object]) -> dict[str, obje
         "adl_id": "" if rec.get("adl_id") is None else int(rec.get("adl_id")),
         "adl_label": "" if rec.get("adl_label") is None else str(rec.get("adl_label")),
         "segment": int(rec.get("segment", 0)),
+        "segment_file": str(rec.get("segment_file", "")),
+        "segment_frame_index": int(rec.get("segment_frame_index", 0)),
     }
 
 
