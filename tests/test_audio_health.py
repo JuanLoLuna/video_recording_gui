@@ -134,6 +134,39 @@ class ResolveDeviceIndexByNameTests(unittest.TestCase):
         devices = [{"name": "USB Mic", "max_input_channels": 1}]
         self.assertEqual(resolve_device_index_by_name("  USB Mic  ", devices), 0)
 
+    def test_without_hostapi_a_name_collision_matches_the_first_candidate(self):
+        # Some drivers report the same generic name for two physically
+        # different devices -- without a hostapi hint, name alone can't
+        # tell them apart, so the first match wins (documenting, not
+        # endorsing, the ambiguity that motivated the hostapi parameter).
+        devices = [
+            {"name": "Microphone Array", "max_input_channels": 2, "hostapi": 0},
+            {"name": "Microphone Array", "max_input_channels": 1, "hostapi": 1},
+        ]
+        self.assertEqual(resolve_device_index_by_name("Microphone Array", devices), 0)
+
+    def test_hostapi_disambiguates_a_name_collision(self):
+        devices = [
+            {"name": "Microphone Array", "max_input_channels": 2, "hostapi": 0},
+            {"name": "Microphone Array", "max_input_channels": 1, "hostapi": 1},
+        ]
+        self.assertEqual(
+            resolve_device_index_by_name("Microphone Array", devices, hostapi=1), 1
+        )
+        self.assertEqual(
+            resolve_device_index_by_name("Microphone Array", devices, hostapi=0), 0
+        )
+
+    def test_hostapi_mismatch_with_no_other_candidate_returns_none(self):
+        devices = [{"name": "USB Mic", "max_input_channels": 1, "hostapi": 0}]
+        self.assertIsNone(resolve_device_index_by_name("USB Mic", devices, hostapi=1))
+
+    def test_hostapi_none_keeps_the_old_name_only_behavior(self):
+        devices = [{"name": "USB Mic", "max_input_channels": 1, "hostapi": 3}]
+        self.assertEqual(
+            resolve_device_index_by_name("USB Mic", devices, hostapi=None), 0
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

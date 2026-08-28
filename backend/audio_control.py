@@ -767,6 +767,7 @@ class SessionAudioRecorder:
                         )
 
                     device_name = str(info.get("name", "")).strip()
+                    device_hostapi = info.get("hostapi")
                     while not self._stop.is_set():
                         try:
                             with stream:
@@ -803,7 +804,9 @@ class SessionAudioRecorder:
                                 devices = sd.query_devices()
                             except Exception:
                                 devices = []
-                            idx = resolve_device_index_by_name(device_name, devices)
+                            idx = resolve_device_index_by_name(
+                                device_name, devices, hostapi=device_hostapi
+                            )
                             if idx is None:
                                 continue
 
