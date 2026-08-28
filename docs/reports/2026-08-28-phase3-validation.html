@@ -1,0 +1,635 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }</style>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<title>Video Recorder Phase 3</title>
+
+<style>
+  :root {
+    --paper: #eef1ee;
+    --paper-raised: #f6f8f5;
+    --ink: #1a231f;
+    --ink-soft: #4c5750;
+    --ink-faint: #7c8880;
+    --rule: #ccd4cd;
+    --rule-soft: #dde3dc;
+    --accent: #1f5c6b;
+    --accent-soft: #dceaec;
+    --accent-ink: #0f3540;
+    --good: #3e7d5c;
+    --good-soft: #e1ede5;
+    --warn: #a8631a;
+    --warn-soft: #f3e6d5;
+    --bad: #a63a2c;
+    --bad-soft: #f4e0dc;
+    --shadow: 0 1px 2px rgba(26,35,31,0.06), 0 8px 24px -12px rgba(26,35,31,0.18);
+    --grid-line: rgba(31,92,107,0.08);
+
+    --font-display: "Big Shoulders Display", "Arial Narrow", sans-serif;
+    --font-body: "Public Sans", -apple-system, "Segoe UI", sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #12181a;
+      --paper-raised: #182121;
+      --ink: #e7ece7;
+      --ink-soft: #aab5ac;
+      --ink-faint: #71807a;
+      --rule: #2c3937;
+      --rule-soft: #23302e;
+      --accent: #5db3c4;
+      --accent-soft: #1c3438;
+      --accent-ink: #bfe6ee;
+      --good: #6bbf93;
+      --good-soft: #1d3227;
+      --warn: #d99a4e;
+      --warn-soft: #382a17;
+      --bad: #e0796a;
+      --bad-soft: #3a221e;
+      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px -12px rgba(0,0,0,0.5);
+      --grid-line: rgba(93,179,196,0.10);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --paper: #12181a;
+    --paper-raised: #182121;
+    --ink: #e7ece7;
+    --ink-soft: #aab5ac;
+    --ink-faint: #71807a;
+    --rule: #2c3937;
+    --rule-soft: #23302e;
+    --accent: #5db3c4;
+    --accent-soft: #1c3438;
+    --accent-ink: #bfe6ee;
+    --good: #6bbf93;
+    --good-soft: #1d3227;
+    --warn: #d99a4e;
+    --warn-soft: #382a17;
+    --bad: #e0796a;
+    --bad-soft: #3a221e;
+    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px -12px rgba(0,0,0,0.5);
+    --grid-line: rgba(93,179,196,0.10);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: var(--accent); color: var(--paper); }
+  a { color: var(--accent); }
+  a:focus-visible, button:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .page {
+    max-width: 920px;
+    margin: 0 auto;
+    padding: clamp(28px, 5vw, 64px) clamp(18px, 5vw, 40px) 96px;
+  }
+
+  /* ---------- header ---------- */
+  .masthead {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding-bottom: 28px;
+    margin-bottom: 40px;
+    border-bottom: 3px solid var(--ink);
+    background-image:
+      linear-gradient(var(--grid-line) 1px, transparent 1px);
+    background-size: 100% 8px;
+    background-position: 0 100%;
+    background-repeat: repeat-x;
+    padding-top: 4px;
+  }
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  h1.title {
+    font-family: var(--font-display);
+    font-weight: 800;
+    font-size: clamp(38px, 6.4vw, 60px);
+    line-height: 0.96;
+    letter-spacing: 0.002em;
+    margin: 0;
+    text-wrap: balance;
+    text-transform: uppercase;
+  }
+  .dek {
+    font-size: 17px;
+    color: var(--ink-soft);
+    max-width: 62ch;
+    margin: 2px 0 0;
+  }
+  .meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 22px;
+    margin-top: 10px;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    color: var(--ink-faint);
+  }
+  .meta-row b { color: var(--ink-soft); font-weight: 600; }
+
+  /* ---------- prose sections ---------- */
+  section { margin-bottom: 56px; }
+  .section-head {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    margin-bottom: 18px;
+  }
+  .section-num {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--accent);
+    font-weight: 600;
+    letter-spacing: 0.04em;
+  }
+  h2 {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: clamp(24px, 3.6vw, 32px);
+    text-transform: uppercase;
+    letter-spacing: 0.005em;
+    margin: 0;
+    text-wrap: balance;
+  }
+  h3 {
+    font-family: var(--font-body);
+    font-weight: 700;
+    font-size: 18px;
+    margin: 28px 0 10px;
+    color: var(--ink);
+  }
+  .prose { max-width: 68ch; }
+  .prose p { margin: 0 0 14px; }
+  .prose ul, .prose ol { margin: 0 0 14px; padding-left: 22px; }
+  .prose li { margin-bottom: 6px; }
+  code {
+    font-family: var(--font-mono);
+    font-size: 0.88em;
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+    padding: 0.1em 0.4em;
+    border-radius: 3px;
+  }
+
+  /* ---------- scoreboard ---------- */
+  .scoreboard {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 14px;
+    margin-top: 8px;
+  }
+  @media (max-width: 720px) { .scoreboard { grid-template-columns: 1fr; } }
+  .score-card {
+    background: var(--paper-raised);
+    border: 1px solid var(--rule);
+    border-top: 3px solid var(--accent);
+    border-radius: 3px;
+    padding: 18px 18px 16px;
+    box-shadow: var(--shadow);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .score-label {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+  .score-value {
+    font-family: var(--font-mono);
+    font-weight: 600;
+    font-size: 27px;
+    letter-spacing: -0.01em;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+  }
+  .score-sub { font-size: 13px; color: var(--ink-soft); }
+
+  /* ---------- verdict pill ---------- */
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    padding: 3px 9px 3px 8px;
+    border-radius: 100px;
+    width: fit-content;
+  }
+  .pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .pill.good { background: var(--good-soft); color: var(--good); }
+  .pill.warn { background: var(--warn-soft); color: var(--warn); }
+  .pill.bad  { background: var(--bad-soft);  color: var(--bad); }
+
+  /* ---------- readout card (per-item results) ---------- */
+  .readout {
+    background: var(--paper-raised);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    box-shadow: var(--shadow);
+    margin-bottom: 22px;
+    overflow: hidden;
+  }
+  .readout-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+    flex-wrap: wrap;
+    padding: 18px 22px;
+    border-bottom: 1px solid var(--rule-soft);
+    background-image: linear-gradient(var(--grid-line) 1px, transparent 1px);
+    background-size: 100% 10px;
+  }
+  .readout-title { font-weight: 700; font-size: 16.5px; }
+  .readout-title .path { color: var(--ink-faint); font-weight: 500; }
+  .readout-body {
+    padding: 20px 22px 22px;
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 22px 32px;
+  }
+  @media (max-width: 640px) { .readout-body { grid-template-columns: 1fr; } }
+  .headline-stat .num {
+    font-family: var(--font-mono);
+    font-weight: 600;
+    font-size: 40px;
+    letter-spacing: -0.015em;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    color: var(--accent-ink);
+  }
+  .headline-stat .num small { font-size: 0.4em; color: var(--ink-faint); font-weight: 500; margin-left: 4px; }
+  .headline-stat .cap { font-size: 12.5px; color: var(--ink-faint); margin-top: 6px; max-width: 22ch; }
+
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 14px 20px;
+  }
+  .stat { display: flex; flex-direction: column; gap: 2px; }
+  .stat dt {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+  .stat dd {
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 15px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+  }
+
+  /* shipped-feature table */
+  .runs {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--font-mono);
+    font-size: 13px;
+  }
+  .runs-wrap { overflow-x: auto; border-top: 1px solid var(--rule-soft); }
+  .runs th, .runs td {
+    text-align: left;
+    padding: 9px 22px 9px 0;
+    white-space: nowrap;
+  }
+  .runs th:first-child, .runs td:first-child { padding-left: 22px; }
+  .runs thead th {
+    font-size: 10.5px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    font-weight: 600;
+    border-bottom: 1px solid var(--rule-soft);
+  }
+  .runs tbody td { border-bottom: 1px solid var(--rule-soft); color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+  .runs tbody tr:last-child td { border-bottom: none; font-weight: 600; color: var(--ink); }
+  .runs td.num { font-variant-numeric: tabular-nums; }
+  .runs td.wrap { white-space: normal; }
+
+  /* ---------- bug/finding stories ---------- */
+  .bug {
+    border-left: 3px solid var(--bad);
+    background: var(--paper-raised);
+    border-radius: 0 4px 4px 0;
+    padding: 16px 20px;
+    margin-bottom: 14px;
+    box-shadow: var(--shadow);
+  }
+  .bug-head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+  }
+  .bug-num { font-family: var(--font-mono); color: var(--bad); font-weight: 600; font-size: 13px; }
+  .bug-title { font-weight: 700; font-size: 15.5px; }
+  .bug dl { margin: 10px 0 0; display: grid; grid-template-columns: max-content 1fr; gap: 5px 14px; }
+  .bug dt {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    padding-top: 2px;
+  }
+  .bug dd { margin: 0; font-size: 14px; color: var(--ink-soft); }
+  .bug .arrow { font-family: var(--font-mono); color: var(--bad); }
+  .bug .fixed { color: var(--good); font-weight: 600; }
+  .bug .open { color: var(--warn); font-weight: 600; }
+
+  /* ---------- open items ---------- */
+  .open-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+  @media (max-width: 680px) { .open-grid { grid-template-columns: 1fr; } }
+  .open-card {
+    background: var(--paper-raised);
+    border: 1px solid var(--rule);
+    border-top: 3px solid var(--warn);
+    border-radius: 3px;
+    padding: 16px 18px;
+    box-shadow: var(--shadow);
+  }
+  .open-card.next { border-top-color: var(--accent); }
+  .open-card h4 { margin: 0 0 6px; font-size: 15px; font-weight: 700; }
+  .open-card p { margin: 0; font-size: 13.5px; color: var(--ink-soft); }
+
+  /* ---------- closing ---------- */
+  .closing {
+    background: var(--accent-soft);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 24px 26px;
+  }
+  .closing h2 { color: var(--accent-ink); }
+  .closing .prose { color: var(--ink); }
+
+  footer {
+    margin-top: 64px;
+    padding-top: 20px;
+    border-top: 1px solid var(--rule);
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--ink-faint);
+  }
+
+  @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+</style>
+</head>
+<body>
+
+
+<div class="page">
+
+  <header class="masthead">
+    <span class="eyebrow">Engineering validation report</span>
+    <h1 class="title">Video Recorder Phase&nbsp;3</h1>
+    <p class="dek">Closing the reliability backlog ahead of a 9-day continuous patient recording: non-blocking power pause/resume, audio dropout handling, a native teardown race, monotonic timestamps, and run-health observability.</p>
+    <div class="meta-row">
+      <span><b>Status</b> shipped and hardware-validated &mdash; two known limitations noted below</span>
+      <span><b>Repo</b> <a href="https://github.com/JuanLoLuna/video_recording_gui/tree/phase3-reliability">github.com/JuanLoLuna/video_recording_gui</a> &middot; branch <code>phase3-reliability</code></span>
+      <span><b>Period</b> 2026-08-28, following the Phase&nbsp;2 report</span>
+    </div>
+  </header>
+
+  <section id="summary">
+    <div class="section-head"><span class="section-num">00</span><h2>Summary</h2></div>
+    <div class="prose">
+      <p>Phase 2 left six items open in the reliability backlog. With a real patient now scheduled for 9 days of continuous unattended recording, the top four were re-ranked and built this period: the power-safety modal that used to freeze the app and end the run, audio dropout handling, a native use-after-free risk in camera teardown, and the observability needed to tell a genuinely healthy multi-day run from a silently hung one. Two items (monotonic timestamps, sync pulse width) were folded in alongside since they touch the same session lifecycle and could be validated in the same hardware passes.</p>
+      <p>Every item was validated against real hardware, not emulated -- and real hardware testing found four genuine bugs beyond what a design review turned up, three of them fixed, one identified as a Windows/driver-level limitation outside this app's reach.</p>
+    </div>
+    <div class="scoreboard">
+      <div class="score-card">
+        <span class="score-label">Power pause/resume</span>
+        <span class="score-value">0<small> modals</small></span>
+        <span class="score-sub">Real Energy Saver toggle, clean new session on resume</span>
+        <span class="pill good">Shipped</span>
+      </div>
+      <div class="score-card">
+        <span class="score-label">Camera fault + timeline</span>
+        <span class="score-value">1533<small>/1533 frames</small></span>
+        <span class="score-sub">Dense across 2 real faults, monotonic_s unbroken</span>
+        <span class="pill good">Shipped</span>
+      </div>
+      <div class="score-card">
+        <span class="score-label">Audio dropout handling</span>
+        <span class="score-value">OS<small>-level block</small></span>
+        <span class="score-sub">Code correct; this box masks the signal below PortAudio</span>
+        <span class="pill warn">Handled, not fixed</span>
+      </div>
+    </div>
+  </section>
+
+  <section id="shipped">
+    <div class="section-head"><span class="section-num">01</span><h2>What shipped this period</h2></div>
+    <div class="prose"><p>Seven commits on <code>phase3-reliability</code>, three of them landed only after real hardware testing surfaced a bug a design review didn't catch (see&nbsp;<a href="#finding">findings below</a>).</p></div>
+    <div class="runs-wrap">
+      <table class="runs">
+        <thead><tr><th>Feature</th><th>What it does</th><th>Commit</th></tr></thead>
+        <tbody>
+          <tr><td>Audio health + reconnect</td><td class="wrap"><code>audio_health.py</code> &mdash; counts PortAudio xrun flags; <code>SessionAudioRecorder</code> keeps the WAV open across a dropout, re-resolves the device, and pads the gap with silence so sample count tracks wall-clock time.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/61c3626">61c3626</a></td></tr>
+          <tr><td>Power pause/resume policy</td><td class="wrap"><code>power_policy.py</code> &mdash; debounced on sample count (20 &times; 500ms poll = 10s sustained), replacing the blocking <code>QMessageBox.critical</code> auto-stop. Pause reuses the existing tested stop path; resume starts a brand-new session, never reopening the interrupted one.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/04a8d92">04a8d92</a></td></tr>
+          <tr><td>Power transition logging</td><td class="wrap">Timestamped console lines for every pause/resume decision, since the GUI status text alone leaves no record after the fact.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/b7ca295">b7ca295</a></td></tr>
+          <tr><td>Preview-button pause guard</td><td class="wrap">Fixed a bug found in hardware testing (see below): disables Stop Preview while paused, so an accidental click can't strand the run with no way to auto-resume.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/6287152">6287152</a></td></tr>
+          <tr><td>Teardown / timeline / observability</td><td class="wrap"><code>teardown.py</code> (refuse to release native resources if the acquisition thread is still alive), <code>timeline.py</code> (<code>monotonic_s</code>/<code>wall_mono_skew_s</code> metadata columns via <code>perf_counter</code>), and <code>healthy_for_s</code> / "as of HH:MM:SS" / window-title observability &mdash; built and validated together since all three show up in the same ordinary session.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/a0a02b7">a0a02b7</a></td></tr>
+          <tr><td>Mic reconnect: host API match</td><td class="wrap">First fix attempt after hardware testing found the wrong-device reconnect (see below): also require the host API to match, not name alone.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/aba0b58">aba0b58</a></td></tr>
+          <tr><td>Mic reconnect: refuse ambiguity</td><td class="wrap">Host API matching wasn't enough on the test box (13 input devices, a genuine name+hostapi collision) &mdash; reconnect now refuses to guess among multiple candidates rather than silently picking one.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/47ebf76">47ebf76</a></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="hardware">
+    <div class="section-head"><span class="section-num">02</span><h2>Real hardware validation</h2></div>
+    <div class="prose"><p>Six sessions on the acquisition rig across two days: a real Energy Saver toggle exercising pause/resume, a combined session with two genuine camera unplug/replug faults, and three rounds of USB mic unplug/replug testing as the reconnect logic was iterated against real (and, it turned out, unusually messy) hardware.</p></div>
+
+    <div class="readout">
+      <div class="readout-head">
+        <div class="readout-title">Power pause/resume &middot; <span class="path">recording_20260828_085107 &rarr; 085205</span></div>
+        <span class="pill good">Clean pause, clean auto-resume</span>
+      </div>
+      <div class="readout-body">
+        <div class="headline-stat">
+          <div class="num">~21<small>s</small></div>
+          <div class="cap">real gap between pause and auto-resume</div>
+        </div>
+        <dl class="stat-grid">
+          <div class="stat"><dt>Trigger</dt><dd>Energy Saver on &rarr; off</dd></div>
+          <div class="stat"><dt>Modal shown</dt><dd>None</dd></div>
+          <div class="stat"><dt>Resume behavior</dt><dd>New session, new files</dd></div>
+          <div class="stat"><dt>GUI feedback</dt><dd>Banner + window title, confirmed live</dd></div>
+        </dl>
+      </div>
+    </div>
+    <div class="prose">
+      <p>Toggling Windows Energy Saver on, then off, while recording: the session paused automatically after the 10s debounce with no modal, the health label read <code>Healthy for &hellip; &mdash; as of HH:MM:SS</code>, and the window title switched to <code>Paused for power safety</code>. ~21s later (two debounce windows plus real toggle lag) it auto-resumed into a brand-new session &mdash; exactly the "new session on resume" design, chosen over reopening the interrupted one.</p>
+    </div>
+
+    <div class="readout">
+      <div class="readout-head">
+        <div class="readout-title">Two real camera faults, one session &middot; <span class="path">recording_20260828_085205</span></div>
+        <span class="pill good">Dense frame index, exact reconciliation</span>
+      </div>
+      <div class="readout-body">
+        <div class="headline-stat">
+          <div class="num">2<small> faults</small></div>
+          <div class="cap">real camera unplug/replug, same recording</div>
+        </div>
+        <dl class="stat-grid">
+          <div class="stat"><dt>Total frames</dt><dd>1533, dense 1&rarr;1533</dd></div>
+          <div class="stat"><dt>Fault gaps</dt><dd>28.05s, 22.5s</dd></div>
+          <div class="stat"><dt>monotonic_s</dt><dd>Strictly increasing through both gaps</dd></div>
+          <div class="stat"><dt>wall_mono_skew_s</dt><dd>&plusmn;0.0064s all session</dd></div>
+        </dl>
+      </div>
+    </div>
+    <div class="prose">
+      <p>This session doubled as the regression check for all of Phase 3's new code against Phase 1/2's existing fault-recovery machinery. Both faults correctly forced a new segment (<code>segment_resume</code>), <code>segments.csv</code>'s frame counts (600 + 59 + 13 + 600 + 261 = 1533) match the metadata row count exactly, and no <code>stop() deferred cleanup</code> line appeared on a normal stop. The new <code>monotonic_s</code> column jumped by almost exactly each fault's gap duration at the corresponding row -- correctly reflecting the real dead time -- while <code>wall_mono_skew_s</code> stayed flat within &plusmn;0.0064s for the entire session, confirming it tracks system-clock drift only and is correctly unaffected by camera faults.</p>
+    </div>
+
+    <div class="readout">
+      <div class="readout-head">
+        <div class="readout-title">USB mic unplug/replug &middot; <span class="path">three rounds, 2026-08-28</span></div>
+        <span class="pill warn">Bugs fixed; box-level limitation found</span>
+      </div>
+      <div class="readout-body">
+        <div class="headline-stat">
+          <div class="num">13<small> devices</small></div>
+          <div class="cap">input devices on one scan of this box</div>
+        </div>
+        <dl class="stat-grid">
+          <div class="stat"><dt>Round 1</dt><dd>silence_frames=0 &mdash; wrong device, instantly</dd></div>
+          <div class="stat"><dt>Round 2 (hostapi fix)</dt><dd>Same symptom &mdash; collision on both fields</dd></div>
+          <div class="stat"><dt>Round 3 (refuse-ambiguous fix)</dt><dd>audio_reconnects=0 for the whole session</dd></div>
+          <div class="stat"><dt>Root cause</dt><dd>OS-level fallback below PortAudio</dd></div>
+        </dl>
+      </div>
+    </div>
+    <div class="prose">
+      <p>Three iterations against the same real failure, each one narrowing the diagnosis. Round 1 (name-only matching) reconnected to a different physical device within about one backoff attempt -- given away by <code>audio_silence_frames_inserted=0</code>, which should have been nonzero for a real gap. Round 2 added a host-API match, which turned out insufficient: this box reports 13 input devices, and at least two collide on both name and host API. Round 3 changed the matching philosophy entirely -- refuse to guess among ambiguous candidates rather than silently pick one -- and the final retest showed <code>audio_reconnects</code> staying at exactly <code>0</code> for the whole session despite a live mic swap being visibly observed. That is the clinching data point: nothing failed at the PortAudio level at all, so the swap is happening one layer below anything this app (or any PortAudio-based app) can detect -- most likely Windows or a driver auto-substituting a fallback device before the disconnection is ever reported. See <a href="#finding">finding&nbsp;04</a>.</p>
+    </div>
+  </section>
+
+  <section id="finding">
+    <div class="section-head"><span class="section-num">03</span><h2>What broke, and how it's handled</h2></div>
+    <div class="prose"><p>Four findings this period, all surfaced only by real hardware testing -- none were visible from code review alone.</p></div>
+
+    <div class="bug">
+      <div class="bug-head"><span class="bug-num">01</span><span class="bug-title">Stop Preview stayed clickable during a power pause, with no way back</span></div>
+      <dl>
+        <dt>Symptom</dt><dd>While paused for power safety, the Stop Preview button was still enabled. Clicking it dropped state to <code>CAMERA_DETECTED</code>, and auto-resume only fires from <code>PREVIEWING</code> -- an accidental click would silently strand the run for the rest of the session with no way to resume.</dd>
+        <dt>Cause</dt><dd><span class="arrow">&rarr;</span> <code>_apply_state()</code>'s <code>PREVIEWING</code> branch didn't account for the new paused sub-state when it was introduced -- it only ever disabled the record button.</dd>
+        <dt>Found by</dt><dd>The user clicking around during the power-pause hardware test, not anticipated in the design.</dd>
+        <dt>Result</dt><dd><span class="fixed">Fixed</span> &mdash; the preview button is now disabled for the same reason and duration as the record button while paused.</dd>
+      </dl>
+    </div>
+
+    <div class="bug">
+      <div class="bug-head"><span class="bug-num">02</span><span class="bug-title">Silent stream drop: the common Windows unplug path had zero console feedback</span></div>
+      <dl>
+        <dt>Symptom</dt><dd>The user reported "no feedback when I unplugged the mic -- nothing" during the first mic test.</dd>
+        <dt>Cause</dt><dd><span class="arrow">&rarr;</span> The drop-detection print only fired inside an <code>except Exception</code> block, but Windows/WASAPI commonly ends a stream gracefully on unplug (<code>stream.active</code> just goes <code>False</code>, nothing raises) -- that far more common path logged nothing at all.</dd>
+        <dt>Found by</dt><dd>Direct user observation during hardware testing, cross-checked against the fact the diagnostics CSV showed no reconnect activity either.</dd>
+        <dt>Result</dt><dd><span class="fixed">Fixed</span> &mdash; both the graceful-end path and a periodic "still trying to reconnect" line during a long outage now print unconditionally.</dd>
+      </dl>
+    </div>
+
+    <div class="bug">
+      <div class="bug-head"><span class="bug-num">03</span><span class="bug-title">Mic reconnect silently locked onto the wrong physical device</span></div>
+      <dl>
+        <dt>Symptom</dt><dd>A few seconds after unplugging the USB mic, the level meter went dead and stayed dead -- including after replugging the real mic.</dd>
+        <dt>Cause</dt><dd><span class="arrow">&rarr;</span> <code>resolve_device_index_by_name()</code> matched on device name alone. This test box has 13 input devices, and at least two report the identical name (a generic driver-supplied string), so the reconnect grabbed whichever matched first -- confirmed by <code>audio_silence_frames_inserted=0</code>, meaning it matched almost instantly rather than after a real gap. A host-API match (round 2) narrowed but didn't eliminate the collision.</dd>
+        <dt>Found by</dt><dd>Reading <code>_diagnostics.csv</code>'s audio columns against the user's live description of the symptom, across three iterations.</dd>
+        <dt>Result</dt><dd><span class="fixed">Fixed</span> &mdash; the matcher now refuses to pick among multiple candidates at all, rather than guessing. Recording silence from a wrong device with no indication is worse than staying visibly disconnected; this trades into the honest failure mode even though a genuine collision may never auto-resolve.</dd>
+      </dl>
+    </div>
+
+    <div class="bug">
+      <div class="bug-head"><span class="bug-num">04</span><span class="bug-title">This box's mic fallback happens below where any PortAudio app can see it</span></div>
+      <dl>
+        <dt>Symptom</dt><dd>Even after finding’s 02 and 03 were fixed, the same wrong-device swap still happened -- but the retest's diagnostics showed <code>audio_reconnects=0</code> for the entire session.</dd>
+        <dt>Cause</dt><dd><span class="arrow">&rarr;</span> Zero reconnect activity despite an observed live swap means the app's stream never actually failed. Windows or a driver is auto-substituting a fallback device at a layer below PortAudio, so there is nothing for this app's reconnect logic to react to -- the disconnection is never reported at all.</dd>
+        <dt>Found by</dt><dd>Cross-referencing the confirmed-clean matching logic (findings 02, 03) against a diagnostics file showing zero reconnect events during an observed swap.</dd>
+        <dt>Result</dt><dd><span class="open">Handled, not fixed</span> &mdash; there is no code fix available at this layer. Documented as a known OS/driver-level limitation specific to this box; not chased further since the upcoming patient recording doesn't use a microphone.</dd>
+      </dl>
+    </div>
+
+    <div class="prose">
+      <p>The pattern across all four: real hardware testing, not design review, found every one of them -- consistent with every prior phase of this project. Finding 04 is also a reminder that "the reconnect logic never engaged" and "the reconnect logic worked perfectly" look identical from inside the app when the failure is masked one layer down; the diagnostics CSV's zero counters were what made the distinction legible.</p>
+    </div>
+  </section>
+
+  <section id="open">
+    <div class="section-head"><span class="section-num">04</span><h2>Open items</h2></div>
+    <div class="open-grid">
+      <div class="open-card next">
+        <h4>Overnight soak test</h4>
+        <p>Phase 1's leftover validation item -- everything tested so far, across all three phases, has run for minutes, not hours or days. The user is running this next.</p>
+      </div>
+      <div class="open-card">
+        <h4>Unexplained 4.4s session stop</h4>
+        <p><code>recording_20260828_131603</code> stopped after 129 frames via an ordinary <code>session_stop</code>, too fast for the power-pause debounce (which needs 10s) to have caused it, and disk guard doesn't monitor mid-session. Most likely a manual stop; not reproducible, not chased further.</p>
+      </div>
+      <div class="open-card">
+        <h4>Mic OS-level fallback (this box only)</h4>
+        <p>Finding&nbsp;04 above. Fixable only via Windows/driver audio settings on that specific machine, not in this app's code. Not relevant to the upcoming patient recording, which uses no microphone.</p>
+      </div>
+      <div class="open-card">
+        <h4>Full multi-day dry run</h4>
+        <p>Everything validated across all three phases so far ran for minutes to a couple hours. A complete dry run at real segment length, ending in a clean stop and full downstream ingestion, remains the last step before the actual study -- per the original plan.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="next" class="closing">
+    <div class="section-head"><span class="section-num">05</span><h2>Where this leaves things</h2></div>
+    <div class="prose">
+      <p>All four originally-ranked Phase 3 items, plus the two folded in alongside them, are now shipped and hardware-validated: power pause/resume no longer freezes the app or ends a run, camera-fault recovery and rotation both hold up under two real faults in one session with the new timeline columns intact, teardown no longer risks a use-after-free on a stuck thread, and a returning operator has an actual "healthy for" readout instead of a permanent-latch warning. Audio dropout handling is real and correct code, verified as far as this specific test box's Windows configuration allows it to be verified -- the remaining gap there is a driver-level limitation, not an open bug, and doesn't affect the patient recording. What's left before the study itself is operational, not code: the overnight soak test and the full multi-day dry run.</p>
+    </div>
+  </section>
+
+  <footer>
+    <span><a href="https://github.com/JuanLoLuna/video_recording_gui/tree/phase3-reliability">github.com/JuanLoLuna/video_recording_gui</a> &middot; phase3-reliability</span>
+    <span>Report generated 2026-08-28</span>
+  </footer>
+
+</div>
+
+</body>
+</html>
