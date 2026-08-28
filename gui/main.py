@@ -700,15 +700,27 @@ class MainWindow(QWidget):
 
         if decision.action == "pause":
             self._power_paused = True
+            print(
+                f"[power] {datetime.now().isoformat()} pausing recording "
+                f"automatically: {decision.reason}"
+            )
             self._stop_recording_session(
                 f"Recording paused automatically: {decision.reason}"
             )
         elif decision.action == "resume":
             self._power_paused = False
+            print(
+                f"[power] {datetime.now().isoformat()} resuming recording "
+                "automatically after sustained-safe power"
+            )
             if not self._begin_recording_session(bypass_confirmation=True):
                 # Couldn't actually start a new session (camera/disk issue) --
                 # go back to waiting for the next sustained-safe window
                 # instead of silently giving up for the rest of the run.
+                print(
+                    f"[power] {datetime.now().isoformat()} resume attempt "
+                    "failed to start a new session; will retry"
+                )
                 self._power_policy_state = PowerPolicyState(paused=True)
                 self._power_paused = True
                 self._apply_state()
