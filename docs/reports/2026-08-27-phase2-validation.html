@@ -448,11 +448,14 @@
         <span class="pill good">Validated</span>
       </div>
       <div class="score-card">
-        <span class="score-label">Downstream sync pipeline</span>
+        <span class="score-label">Box sync pipeline</span>
         <span class="score-value">32<small>/33 lost</small></span>
-        <span class="score-sub">Blocking bug in a different repo, unfixed</span>
-        <span class="pill bad">Not safe to deploy</span>
+        <span class="score-sub">Blocking bug in a different repo, unfixed &mdash; non-patient path only</span>
+        <span class="pill warn">Scoped, not blocking</span>
       </div>
+    </div>
+    <div class="prose">
+      <p><strong>Update (2026-08-27, after this report was first filed):</strong> the <code>inventory.py</code> collision below only matters for the existing Box-based reconciliation pipeline, which is used for non-patient data. Patient recordings will go through a separate, not-yet-built pipeline that never touches Box or <code>inventory.py</code>, so this bug does not block using segmented video for the next patient. <code>video-segmentation</code> has since been merged to <code>main</code> on that basis. The bug itself is still real and still open for whoever owns the Box path.</p>
     </div>
   </section>
 
@@ -565,13 +568,13 @@
   <section id="open">
     <div class="section-head"><span class="section-num">04</span><h2>Open items</h2></div>
     <div class="open-grid">
-      <div class="open-card next">
-        <h4>inventory.py collision &mdash; blocking, other repo</h4>
-        <p><code>smart_sleeve_data_processing/pipelines/reconcile/inventory.py</code>'s <code>norm_video_key</code> strips the <code>-NNNN</code> suffix and uses the result as a dict key on both sides of sync reconciliation. Every segment of a session collapses to one key, last-writer-wins &mdash; 32 of 33 segments would be silently dropped, never copied, never reported missing. Not fixed. Segmentation cannot go live in the study until this lands.</p>
+      <div class="open-card">
+        <h4>inventory.py collision &mdash; open, other repo, non-patient path only</h4>
+        <p><code>smart_sleeve_data_processing/pipelines/reconcile/inventory.py</code>'s <code>norm_video_key</code> strips the <code>-NNNN</code> suffix and uses the result as a dict key on both sides of sync reconciliation. Every segment of a session collapses to one key, last-writer-wins &mdash; 32 of 33 segments would be silently dropped, never copied, never reported missing. Still not fixed, but scoped: this only affects the existing Box-based reconciliation pipeline for non-patient data. Patient recordings use a separate pipeline that never lands in Box, so this no longer gates using segmented video for the study.</p>
       </div>
-      <div class="open-card next">
-        <h4>Merge to main</h4>
-        <p>Deliberately held on <code>video-segmentation</code> pending the validation in this report and the cross-repo fixes below.</p>
+      <div class="open-card">
+        <h4>Merge to main &mdash; done</h4>
+        <p><code>video-segmentation</code> merged to <code>main</code> on 2026-08-27, since the <code>inventory.py</code> blocker turned out not to apply to the patient recording pipeline.</p>
       </div>
       <div class="open-card">
         <h4>video_fiducial_diagnose.py segment-aware read</h4>
@@ -595,7 +598,7 @@
   <section id="next" class="closing">
     <div class="section-head"><span class="section-num">05</span><h2>Where this leaves things</h2></div>
     <div class="prose">
-      <p>Rotation itself is proven solid under real repetition (32 consecutive clean boundaries) and under a real fault (the gap landed exactly where the design intended, with the right markers in both the metadata and the manifest). What's left is entirely outside this repo: the sync/ingestion pipeline has a data-loss bug that predates segmentation but that segmentation would trigger on every single session, and a few other downstream readers need to become segment-aware or memory-safe before a 10-day recording's output can move through the rest of the study's pipeline. This branch is not merged to <code>main</code> until at least the <code>inventory.py</code> fix lands.</p>
+      <p>Rotation itself is proven solid under real repetition (32 consecutive clean boundaries) and under a real fault (the gap landed exactly where the design intended, with the right markers in both the metadata and the manifest). The sync/ingestion data-loss bug found during this validation is real and still open, but it turned out to be scoped to the existing Box-based pipeline for non-patient data &mdash; the patient recording pipeline is separate and never touches it. On that basis <code>video-segmentation</code> has been merged to <code>main</code>. The other downstream readers (segment-aware reads, chunked metadata parsing) still need to catch up before a full 10-day recording's output moves cleanly through the rest of the study's pipeline, but none of that blocks recording the next patient.</p>
     </div>
   </section>
 
