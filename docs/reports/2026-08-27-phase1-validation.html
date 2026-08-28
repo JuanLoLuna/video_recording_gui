@@ -1,0 +1,580 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }</style>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<title>Video Recorder Phase 1</title>
+
+<style>
+  :root {
+    --paper: #eef1ee;
+    --paper-raised: #f6f8f5;
+    --ink: #1a231f;
+    --ink-soft: #4c5750;
+    --ink-faint: #7c8880;
+    --rule: #ccd4cd;
+    --rule-soft: #dde3dc;
+    --accent: #1f5c6b;
+    --accent-soft: #dceaec;
+    --accent-ink: #0f3540;
+    --good: #3e7d5c;
+    --good-soft: #e1ede5;
+    --warn: #a8631a;
+    --warn-soft: #f3e6d5;
+    --bad: #a63a2c;
+    --bad-soft: #f4e0dc;
+    --shadow: 0 1px 2px rgba(26,35,31,0.06), 0 8px 24px -12px rgba(26,35,31,0.18);
+    --grid-line: rgba(31,92,107,0.08);
+
+    --font-display: "Big Shoulders Display", "Arial Narrow", sans-serif;
+    --font-body: "Public Sans", -apple-system, "Segoe UI", sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #12181a;
+      --paper-raised: #182121;
+      --ink: #e7ece7;
+      --ink-soft: #aab5ac;
+      --ink-faint: #71807a;
+      --rule: #2c3937;
+      --rule-soft: #23302e;
+      --accent: #5db3c4;
+      --accent-soft: #1c3438;
+      --accent-ink: #bfe6ee;
+      --good: #6bbf93;
+      --good-soft: #1d3227;
+      --warn: #d99a4e;
+      --warn-soft: #382a17;
+      --bad: #e0796a;
+      --bad-soft: #3a221e;
+      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px -12px rgba(0,0,0,0.5);
+      --grid-line: rgba(93,179,196,0.10);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --paper: #12181a;
+    --paper-raised: #182121;
+    --ink: #e7ece7;
+    --ink-soft: #aab5ac;
+    --ink-faint: #71807a;
+    --rule: #2c3937;
+    --rule-soft: #23302e;
+    --accent: #5db3c4;
+    --accent-soft: #1c3438;
+    --accent-ink: #bfe6ee;
+    --good: #6bbf93;
+    --good-soft: #1d3227;
+    --warn: #d99a4e;
+    --warn-soft: #382a17;
+    --bad: #e0796a;
+    --bad-soft: #3a221e;
+    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px -12px rgba(0,0,0,0.5);
+    --grid-line: rgba(93,179,196,0.10);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: var(--accent); color: var(--paper); }
+  a { color: var(--accent); }
+  a:focus-visible, button:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .page {
+    max-width: 920px;
+    margin: 0 auto;
+    padding: clamp(28px, 5vw, 64px) clamp(18px, 5vw, 40px) 96px;
+  }
+
+  /* ---------- header ---------- */
+  .masthead {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding-bottom: 28px;
+    margin-bottom: 40px;
+    border-bottom: 3px solid var(--ink);
+    background-image:
+      linear-gradient(var(--grid-line) 1px, transparent 1px);
+    background-size: 100% 8px;
+    background-position: 0 100%;
+    background-repeat: repeat-x;
+    padding-top: 4px;
+  }
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  h1.title {
+    font-family: var(--font-display);
+    font-weight: 800;
+    font-size: clamp(38px, 6.4vw, 60px);
+    line-height: 0.96;
+    letter-spacing: 0.002em;
+    margin: 0;
+    text-wrap: balance;
+    text-transform: uppercase;
+  }
+  .dek {
+    font-size: 17px;
+    color: var(--ink-soft);
+    max-width: 62ch;
+    margin: 2px 0 0;
+  }
+  .meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 22px;
+    margin-top: 10px;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    color: var(--ink-faint);
+  }
+  .meta-row b { color: var(--ink-soft); font-weight: 600; }
+
+  /* ---------- prose sections ---------- */
+  section { margin-bottom: 56px; }
+  .section-head {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    margin-bottom: 18px;
+  }
+  .section-num {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--accent);
+    font-weight: 600;
+    letter-spacing: 0.04em;
+  }
+  h2 {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: clamp(24px, 3.6vw, 32px);
+    text-transform: uppercase;
+    letter-spacing: 0.005em;
+    margin: 0;
+    text-wrap: balance;
+  }
+  h3 {
+    font-family: var(--font-body);
+    font-weight: 700;
+    font-size: 18px;
+    margin: 28px 0 10px;
+    color: var(--ink);
+  }
+  .prose { max-width: 68ch; }
+  .prose p { margin: 0 0 14px; }
+  .prose ul, .prose ol { margin: 0 0 14px; padding-left: 22px; }
+  .prose li { margin-bottom: 6px; }
+  code {
+    font-family: var(--font-mono);
+    font-size: 0.88em;
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+    padding: 0.1em 0.4em;
+    border-radius: 3px;
+  }
+
+  /* ---------- scoreboard ---------- */
+  .scoreboard {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 14px;
+    margin-top: 8px;
+  }
+  @media (max-width: 720px) { .scoreboard { grid-template-columns: 1fr; } }
+  .score-card {
+    background: var(--paper-raised);
+    border: 1px solid var(--rule);
+    border-top: 3px solid var(--accent);
+    border-radius: 3px;
+    padding: 18px 18px 16px;
+    box-shadow: var(--shadow);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .score-label {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+  .score-value {
+    font-family: var(--font-mono);
+    font-weight: 600;
+    font-size: 27px;
+    letter-spacing: -0.01em;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+  }
+  .score-sub { font-size: 13px; color: var(--ink-soft); }
+
+  /* ---------- verdict pill ---------- */
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    padding: 3px 9px 3px 8px;
+    border-radius: 100px;
+    width: fit-content;
+  }
+  .pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .pill.good { background: var(--good-soft); color: var(--good); }
+  .pill.warn { background: var(--warn-soft); color: var(--warn); }
+  .pill.bad  { background: var(--bad-soft);  color: var(--bad); }
+
+  /* ---------- readout card (per-item results) ---------- */
+  .readout {
+    background: var(--paper-raised);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    box-shadow: var(--shadow);
+    margin-bottom: 22px;
+    overflow: hidden;
+  }
+  .readout-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+    flex-wrap: wrap;
+    padding: 18px 22px;
+    border-bottom: 1px solid var(--rule-soft);
+    background-image: linear-gradient(var(--grid-line) 1px, transparent 1px);
+    background-size: 100% 10px;
+  }
+  .readout-title { font-weight: 700; font-size: 16.5px; }
+  .readout-title .path { color: var(--ink-faint); font-weight: 500; }
+  .readout-body {
+    padding: 20px 22px 22px;
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 22px 32px;
+  }
+  @media (max-width: 640px) { .readout-body { grid-template-columns: 1fr; } }
+  .headline-stat .num {
+    font-family: var(--font-mono);
+    font-weight: 600;
+    font-size: 40px;
+    letter-spacing: -0.015em;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    color: var(--accent-ink);
+  }
+  .headline-stat .num small { font-size: 0.4em; color: var(--ink-faint); font-weight: 500; margin-left: 4px; }
+  .headline-stat .cap { font-size: 12.5px; color: var(--ink-faint); margin-top: 6px; max-width: 22ch; }
+
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 14px 20px;
+  }
+  .stat { display: flex; flex-direction: column; gap: 2px; }
+  .stat dt {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+  .stat dd {
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 15px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+  }
+
+  /* shipped-feature table */
+  .runs {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--font-mono);
+    font-size: 13px;
+  }
+  .runs-wrap { overflow-x: auto; border-top: 1px solid var(--rule-soft); }
+  .runs th, .runs td {
+    text-align: left;
+    padding: 9px 22px 9px 0;
+    white-space: nowrap;
+  }
+  .runs th:first-child, .runs td:first-child { padding-left: 22px; }
+  .runs thead th {
+    font-size: 10.5px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    font-weight: 600;
+    border-bottom: 1px solid var(--rule-soft);
+  }
+  .runs tbody td { border-bottom: 1px solid var(--rule-soft); color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+  .runs tbody tr:last-child td { border-bottom: none; font-weight: 600; color: var(--ink); }
+  .runs td.num { font-variant-numeric: tabular-nums; }
+  .runs td.wrap { white-space: normal; }
+
+  /* ---------- bug/finding stories ---------- */
+  .bug {
+    border-left: 3px solid var(--bad);
+    background: var(--paper-raised);
+    border-radius: 0 4px 4px 0;
+    padding: 16px 20px;
+    margin-bottom: 14px;
+    box-shadow: var(--shadow);
+  }
+  .bug-head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+  }
+  .bug-num { font-family: var(--font-mono); color: var(--bad); font-weight: 600; font-size: 13px; }
+  .bug-title { font-weight: 700; font-size: 15.5px; }
+  .bug dl { margin: 10px 0 0; display: grid; grid-template-columns: max-content 1fr; gap: 5px 14px; }
+  .bug dt {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    padding-top: 2px;
+  }
+  .bug dd { margin: 0; font-size: 14px; color: var(--ink-soft); }
+  .bug .arrow { font-family: var(--font-mono); color: var(--bad); }
+  .bug .fixed { color: var(--good); font-weight: 600; }
+  .bug .open { color: var(--warn); font-weight: 600; }
+
+  /* ---------- open items ---------- */
+  .open-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+  @media (max-width: 680px) { .open-grid { grid-template-columns: 1fr; } }
+  .open-card {
+    background: var(--paper-raised);
+    border: 1px solid var(--rule);
+    border-top: 3px solid var(--warn);
+    border-radius: 3px;
+    padding: 16px 18px;
+    box-shadow: var(--shadow);
+  }
+  .open-card.next { border-top-color: var(--accent); }
+  .open-card h4 { margin: 0 0 6px; font-size: 15px; font-weight: 700; }
+  .open-card p { margin: 0; font-size: 13.5px; color: var(--ink-soft); }
+
+  /* ---------- closing ---------- */
+  .closing {
+    background: var(--accent-soft);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 24px 26px;
+  }
+  .closing h2 { color: var(--accent-ink); }
+  .closing .prose { color: var(--ink); }
+
+  footer {
+    margin-top: 64px;
+    padding-top: 20px;
+    border-top: 1px solid var(--rule);
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--ink-faint);
+  }
+
+  @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+</style>
+</head>
+<body>
+
+
+<div class="page">
+
+  <header class="masthead">
+    <span class="eyebrow">Engineering validation report</span>
+    <h1 class="title">Video Recorder Phase&nbsp;1</h1>
+    <p class="dek">Hardening the SmartSleeve video-recording GUI to survive a 10-day unattended session: sleep prevention, unbounded audio, crash-safe metadata, and camera-fault recovery &mdash; validated on the real acquisition rig, including a genuine 17-second camera dropout.</p>
+    <div class="meta-row">
+      <span><b>Status</b> shipped &mdash; merged to <code>main</code></span>
+      <span><b>Repo</b> <a href="https://github.com/JuanLoLuna/video_recording_gui/tree/main">github.com/JuanLoLuna/video_recording_gui</a> &middot; branch <code>main</code></span>
+      <span><b>Period</b> 2026-08-26 &ndash; 2026-08-27</span>
+    </div>
+  </header>
+
+  <section id="summary">
+    <div class="section-head"><span class="section-num">00</span><h2>Summary</h2></div>
+    <div class="prose">
+      <p>The recording GUI was built and tuned for sessions of a few minutes to half an hour &mdash; real ADL sessions in the study data run 2&ndash;32 minutes. A 10-day continuous session breaks assumptions that duration never surfaced: metadata buffered entirely in RAM, a WAV format with a hard 4&nbsp;GiB ceiling, an acquisition loop with no recovery from a camera fault, and nothing stopping Windows from sleeping mid-session.</p>
+      <p>Four fixes shipped and merged into <code>main</code> this period, backed by 98 unit tests and, for the fault-recovery path, a real camera unplug/replug on the acquisition rig &mdash; not just an emulated failure.</p>
+    </div>
+    <div class="scoreboard">
+      <div class="score-card">
+        <span class="score-label">Camera-fault recovery</span>
+        <span class="score-value">17.2<small>s gap</small></span>
+        <span class="score-sub">Real unplug/replug, clean auto-recovery</span>
+        <span class="pill good">Validated</span>
+      </div>
+      <div class="score-card">
+        <span class="score-label">Metadata durability</span>
+        <span class="score-value">0<small> rows lost</small></span>
+        <span class="score-sub">Streamed incrementally, never buffered whole</span>
+        <span class="pill good">Shipped</span>
+      </div>
+      <div class="score-card">
+        <span class="score-label">Unit tests</span>
+        <span class="score-value">98<small>/98 pass</small></span>
+        <span class="score-sub">Zero mocking, pure-function isolation</span>
+        <span class="pill good">Shipped</span>
+      </div>
+    </div>
+  </section>
+
+  <section id="shipped">
+    <div class="section-head"><span class="section-num">01</span><h2>What shipped this period</h2></div>
+    <div class="prose"><p>Five commits, each with its own tests in the same commit, following the repo&rsquo;s existing convention (<code>unittest</code>, no mocking, clocks and factories injected by keyword).</p></div>
+    <div class="runs-wrap">
+      <table class="runs">
+        <thead><tr><th>Feature</th><th>What it does</th><th>Commit</th></tr></thead>
+        <tbody>
+          <tr><td>Sleep prevention</td><td class="wrap"><code>power_keepalive.py</code> &mdash; <code>SetThreadExecutionState</code>, applied on record start and self-healing every 500&nbsp;ms from the existing power-status timer in case some intervening event clears it.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/ddbe214">ddbe214</a></td></tr>
+          <tr><td>RF64 audio</td><td class="wrap"><code>audio_format.py</code> &mdash; probes the installed libsndfile at runtime (<code>sf.available_formats()</code>) and prefers RF64, then Sony Wave64, both unlimited-size, both readable under a <code>.wav</code> extension. Falls back to a byte-budgeted plain WAV if neither is available.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/ef1e2a4">ef1e2a4</a></td></tr>
+          <tr><td>Streaming metadata</td><td class="wrap"><code>async_csv_writer.py</code> / <code>frame_metadata.py</code> &mdash; one row per frame written incrementally instead of buffered in a Python list for the whole session; a full write-queue spills to an overflow deque rather than dropping, preserving the dense <code>1..N</code> frame index downstream tooling requires.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/cce737e">cce737e</a></td></tr>
+          <tr><td>Camera-fault watchdog</td><td class="wrap"><code>acquisition_watchdog.py</code> / <code>timeline_break.py</code> &mdash; a bounded <code>GetNextImage</code> timeout plus exponential backoff turns a silent forever-block or a busy-spin into a detected, auto-retried fault. No give-up action: a camera unplugged for hours just keeps retrying cheaply.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/2952224">2952224</a></td></tr>
+          <tr><td>Recoverable warning banner</td><td class="wrap"><code>recording_warnings.py</code> &mdash; replaces a permanent-latch integrity warning with active/recovered/hidden state, so the GUI can actually indicate health again after the watchdog fixes something.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/9aa3a2d">9aa3a2d</a></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="hardware">
+    <div class="section-head"><span class="section-num">02</span><h2>Real hardware validation</h2></div>
+    <div class="prose"><p>Two sessions on the actual acquisition rig, not an emulated fault: an early smoke test right after the core pieces landed, and a deliberate camera unplug/replug mid-recording.</p></div>
+
+    <div class="readout">
+      <div class="readout-head">
+        <div class="readout-title">Camera unplug/replug &middot; <span class="path">recording_20260827_184055</span></div>
+        <span class="pill good">Recovered cleanly</span>
+      </div>
+      <div class="readout-body">
+        <div class="headline-stat">
+          <div class="num">17.172<small>s</small></div>
+          <div class="cap">measured gap, camera unplugged mid-recording</div>
+        </div>
+        <dl class="stat-grid">
+          <div class="stat"><dt>Camera reinits</dt><dd>1</dd></div>
+          <div class="stat"><dt>Frames lost (est.)</dt><dd>515</dd></div>
+          <div class="stat"><dt>record_frame_index</dt><dd>1&ndash;773, no gaps</dd></div>
+          <div class="stat"><dt>camera_frame_gaps</dt><dd>0</dd></div>
+        </dl>
+      </div>
+    </div>
+    <div class="prose">
+      <p>Frame 172 was the last one appended before the camera dropped; the watchdog detected the stall (<code>acquisition_errors</code> climbed to 7 across the outage while it retried with exponential backoff), reinitialized the camera once it reappeared, and frame 173 resumed cleanly &mdash; <code>camera_frame_id</code> reset from 31320 to 1 (a hardware counter reset on the reconnected device), but <code>record_frame_index</code> never skipped a beat. The events sidecar recorded the break precisely: <code>{"cause": "camera_reinit", "note": "no frame for 17.2s; do not fit across this", "gap_s": 17.172, "record_frame_index": 172}</code>. The recording continued for another 600 frames and stopped cleanly on request.</p>
+    </div>
+
+    <div class="readout">
+      <div class="readout-head">
+        <div class="readout-title">Early smoke test &middot; <span class="path">recording_20260825_170550</span></div>
+        <span class="pill good">Core pieces confirmed working together</span>
+      </div>
+      <div class="readout-body">
+        <div class="headline-stat">
+          <div class="num">1280<small> frames</small></div>
+          <div class="cap">~52s, streaming metadata + RF64 audio infra, no crash</div>
+        </div>
+        <dl class="stat-grid">
+          <div class="stat"><dt>incomplete_images</dt><dd>0</dd></div>
+          <div class="stat"><dt>acquisition_errors</dt><dd>0</dd></div>
+          <div class="stat"><dt>camera_frame_gaps</dt><dd>219</dd></div>
+        </dl>
+      </div>
+    </div>
+    <div class="prose">
+      <p>This run predates the watchdog (its diagnostics schema has no <code>camera_reinits</code>/<code>append_failures</code> columns yet) and shows 219 <code>camera_frame_gaps</code> over 1280 frames with no recovery mechanism in place &mdash; exactly the class of problem the fault-recovery work that followed was built to address. Included here as the first proof the streaming-metadata and audio-format infrastructure held up end to end, not as a validated fault-recovery result on its own.</p>
+    </div>
+  </section>
+
+  <section id="finding">
+    <div class="section-head"><span class="section-num">03</span><h2>What broke, and how it&rsquo;s handled</h2></div>
+    <div class="prose"><p>One finding this period, caught by the user&rsquo;s own testing rather than by inspection.</p></div>
+
+    <div class="bug">
+      <div class="bug-head"><span class="bug-num">01</span><span class="bug-title">The recording-integrity warning stayed red for the rest of a session after the watchdog fixed the fault</span></div>
+      <dl>
+        <dt>Symptom</dt><dd>During the camera unplug/replug test, the GUI&rsquo;s integrity-warning text turned red as expected during the outage &mdash; but stayed red for the remainder of the recording even after the watchdog recovered cleanly, with no way to tell "still broken" from "fixed a while ago."</dd>
+        <dt>Cause</dt><dd><span class="arrow">&rarr;</span> <code>_recording_integrity_warning</code> was a plain boolean, set once on the first fault and only ever cleared at the start of the next recording &mdash; a latch, not a health indicator.</dd>
+        <dt>Found by</dt><dd>The user&rsquo;s own hardware test, not a code review &mdash; the exact kind of thing that only shows up once you actually recover from a real fault and keep watching the screen afterward.</dd>
+        <dt>Result</dt><dd><span class="fixed">Fixed</span> &mdash; <code>RecordingWarningTracker</code> now tracks active/recovered/hidden state from event timestamps instead of a latch, and the banner can be dismissed once read, reopening only on a genuine new episode.</dd>
+      </dl>
+    </div>
+
+    <div class="prose">
+      <p>The general lesson: a health indicator driven by a boolean that only ever goes one direction isn&rsquo;t a health indicator, it&rsquo;s an incident log with one entry. Anything meant to answer "is it okay <em>right now</em>" needs a window and a recovery path built in from the start, not bolted on after the first time someone notices it stuck.</p>
+    </div>
+  </section>
+
+  <section id="open">
+    <div class="section-head"><span class="section-num">04</span><h2>Open items</h2></div>
+    <div class="open-grid">
+      <div class="open-card next">
+        <h4>Overnight / multi-hour soak test</h4>
+        <p>Confirms sleep prevention actually holds for hours (not just the short test window used so far) and that the WAV genuinely grows past the old ~13.5h plain-WAV ceiling. Not yet run.</p>
+      </div>
+      <div class="open-card next">
+        <h4>Kill-process mid-recording test</h4>
+        <p>Confirms the metadata CSV survives up to within a few seconds of a hard kill, rather than being empty or truncated to nothing. Not yet run.</p>
+      </div>
+      <div class="open-card">
+        <h4>Phase 3 backlog</h4>
+        <p>A ranked list of remaining correctness/observability items &mdash; the power auto-stop still shows a blocking modal instead of pausing gracefully, the teardown path doesn&rsquo;t yet wait for an in-flight camera reinit, audio xruns aren&rsquo;t counted and a dropped mic doesn&rsquo;t reconnect. Not started.</p>
+      </div>
+      <div class="open-card">
+        <h4>Windows power-plan settings</h4>
+        <p><code>SetThreadExecutionState</code> only suppresses idle sleep &mdash; it&rsquo;s ignored on Modern Standby, lid-close, and user-initiated sleep. The <code>powercfg</code> standby/hibernate/disk timeouts and lid-close=Do&nbsp;Nothing settings on the actual recording machine are a required operational backstop, unconfirmed as of this report.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="next" class="closing">
+    <div class="section-head"><span class="section-num">05</span><h2>Where this leaves things</h2></div>
+    <div class="prose">
+      <p>The four survival fixes are shipped, merged, and validated against a real fault on real hardware &mdash; a 17-second camera dropout recovered with zero metadata loss and zero frame-index disruption, which is exactly the failure mode a 10-day unattended session was expected to hit. The soak and kill-process tests are what stand between "validated against the failures we deliberately caused" and "confirmed for the actual duration and shutdown modes the study needs." Phase&nbsp;2 (video segmentation, covered in its own report) builds directly on top of this, including reusing the same watchdog to force a segment boundary on a fault.</p>
+    </div>
+  </section>
+
+  <footer>
+    <span><a href="https://github.com/JuanLoLuna/video_recording_gui/tree/main">github.com/JuanLoLuna/video_recording_gui</a> &middot; main</span>
+    <span>Report generated 2026-08-27</span>
+  </footer>
+
+</div>
+
+</body>
+</html>
