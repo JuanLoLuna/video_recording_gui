@@ -54,6 +54,7 @@ from backend.preview_diagnostics import (
     PreviewDiagnosticsAccumulator,
 )
 from backend.power_status import assess_power_safety, read_power_status
+from backend.power_policy import PowerPolicyState, next_power_action
 from backend.recording_warnings import RecordingWarningTracker
 from backend.recording_paths import SessionPaths, resolve_output_dir
 from backend.disk_guard import assess_disk, sample_disk_usage
@@ -489,7 +490,8 @@ class MainWindow(QWidget):
 
         self._current_power_status = read_power_status()
         self._power_assessment = assess_power_safety(self._current_power_status)
-        self._power_auto_stop_in_progress = False
+        self._power_policy_state = PowerPolicyState()
+        self._power_paused = False
 
         # Sleep prevention while recording (Windows-only; no-op elsewhere).
         self._keepalive_request = KeepAwakeRequest(system=True, display=False, away_mode=True)
@@ -569,8 +571,12 @@ class MainWindow(QWidget):
             self.detect_button.setEnabled(False)
             self.preview_button.setEnabled(True)
             self.preview_button.setText("Stop Preview")
-            self.record_button.setEnabled(True)
-            self.record_button.setText("Start Recording")
+            if self._power_paused:
+                self.record_button.setEnabled(False)
+                self.record_button.setText("Paused for power safety — resuming automatically")
+            else:
+                self.record_button.setEnabled(True)
+                self.record_button.setText("Start Recording")
 
         elif self.state == AppState.RECORDING:
             self.detect_button.setEnabled(False)
@@ -632,6 +638,9 @@ class MainWindow(QWidget):
         )
         text = self._power_assessment.summary
         tooltip = self._power_assessment.reason or ""
+        if self._power_paused:
+            text = f"{text} — recording paused, will resume automatically"
+            background, foreground = colors["danger"]
         if self.state == AppState.RECORDING:
             text = f"{text} — {keepalive_assessment.summary}"
             if keepalive_assessment.reason:
@@ -682,22 +691,27 @@ class MainWindow(QWidget):
         self._update_power_status_display()
         self._apply_power_safety_to_controls()
 
-        if (
-            self.state == AppState.RECORDING
-            and self._power_assessment.recording_blocked
-            and not self._power_auto_stop_in_progress
-        ):
-            self._power_auto_stop_in_progress = True
-            reason = self._power_assessment.reason or self._power_assessment.summary
+        self._power_policy_state, decision = next_power_action(
+            self._power_policy_state,
+            recording_blocked=self._power_assessment.recording_blocked,
+            recording=self.state == AppState.RECORDING,
+            reason=self._power_assessment.reason or self._power_assessment.summary,
+        )
+
+        if decision.action == "pause":
+            self._power_paused = True
             self._stop_recording_session(
-                f"Recording stopped automatically: {reason}"
+                f"Recording paused automatically: {decision.reason}"
             )
-            QMessageBox.critical(
-                self,
-                "Recording stopped for power safety",
-                f"The recording was stopped to protect file integrity.\n\n{reason}",
-            )
-            self._power_auto_stop_in_progress = False
+        elif decision.action == "resume":
+            self._power_paused = False
+            if not self._begin_recording_session(bypass_confirmation=True):
+                # Couldn't actually start a new session (camera/disk issue) --
+                # go back to waiting for the next sustained-safe window
+                # instead of silently giving up for the rest of the run.
+                self._power_policy_state = PowerPolicyState(paused=True)
+                self._power_paused = True
+                self._apply_state()
 
     def _confirm_power_safe_to_record(self) -> bool:
         """Re-read power immediately before recording and request consent if low."""
@@ -740,23 +754,35 @@ class MainWindow(QWidget):
         self.output_dir_label.setText(shown)
         self.output_dir_label.setToolTip(shown)
 
-    def _confirm_disk_safe_to_record(self, output_dir) -> bool:
-        """Refuse (or confirm) a run whose planned duration can't fit."""
+    def _confirm_disk_safe_to_record(
+        self, output_dir, *, bypass_confirmation: bool = False
+    ) -> bool:
+        """Refuse (or confirm) a run whose planned duration can't fit.
+
+        bypass_confirmation is set for the automatic power-resume path: a
+        hard block still refuses to start, but a soft low-disk warning that
+        would normally ask a human is accepted rather than blocking an
+        unattended resume on a dialog nobody is there to answer.
+        """
         try:
             sample = sample_disk_usage(output_dir, at_s=time.monotonic())
         except OSError as exc:
-            QMessageBox.warning(
-                self,
-                "Could not check free disk space",
-                f"Continuing without a disk-space check.\n\n{exc}",
-            )
+            if not bypass_confirmation:
+                QMessageBox.warning(
+                    self,
+                    "Could not check free disk space",
+                    f"Continuing without a disk-space check.\n\n{exc}",
+                )
             return True
 
         verdict = assess_disk(sample)
         if verdict.recording_blocked:
-            QMessageBox.warning(self, "Recording blocked by disk space", verdict.reason)
+            if not bypass_confirmation:
+                QMessageBox.warning(self, "Recording blocked by disk space", verdict.reason)
             return False
         if verdict.level == "warning" and verdict.requires_confirmation:
+            if bypass_confirmation:
+                return True
             choice = QMessageBox.question(
                 self,
                 "Low disk space warning",
@@ -1213,96 +1239,115 @@ class MainWindow(QWidget):
     def on_record_clicked(self):
         # Start recording
         if self.state == AppState.PREVIEWING:
-            if not self._confirm_power_safe_to_record():
-                return
-
-            # SessionPaths is the single place deriving every session
-            # artifact name (video segments, wav, metadata, diagnostics,
-            # segments manifest, events) from one stem, so they can't
-            # drift out of sync with each other.
-            output_dir = resolve_output_dir(explicit=self._configured_output_dir)
-            if not self._confirm_disk_safe_to_record(output_dir):
-                return
-            session_paths = SessionPaths.for_session(output_dir, datetime.now())
-
-            self._keepalive_state = apply_keep_awake(self._keepalive_request)
-
-            self.record_button.setEnabled(False)
-            self.record_button.setText("Starting recording… please wait")
-            self.status_label.setText("Starting recording…")
-            QApplication.processEvents()
-
-            # Use the camera's real acquisition rate so AVI playback speed matches.
-            fps = self.camera.get_acquisition_frame_rate() or 30.0
-            ok, msg = self.camera.start_recording(session_paths, fps=fps)
-            self.status_label.setText(msg)
-            QApplication.processEvents()
-
-            if not ok:
-                self._apply_state()
-                return
-
-            self._recording_warnings.reset()
-            self._update_recording_warning_banner()
-            self._start_preview_diagnostics_logging(session_paths.diagnostics_csv)
-
-            self._stop_mic_preview()
-            # Parallel WAV sharing the same session stem as the video segments.
-            audio_device = self.audio_input_combo.currentData()
-            self._session_audio = None
-            if audio_device is not None:
-                wav_path = str(session_paths.wav)
-                try:
-                    self._session_audio = SessionAudioRecorder()
-                    out_dev = self.audio_output_combo.currentData()
-                    self._session_audio.start(
-                        wav_path,
-                        int(audio_device),
-                        monitor=self.audio_monitor_checkbox.isChecked(),
-                        output_device=int(out_dev) if out_dev is not None else None,
-                    )
-                    format_choice = self._session_audio.audio_format_choice
-                    format_note = f" ({format_choice.reason})" if format_choice is not None else ""
-                    self.audio_label.setText(
-                        f"Microphone: recording to {wav_path}{format_note}"
-                    )
-                    if self.audio_monitor_checkbox.isChecked():
-                        QTimer.singleShot(
-                            500,
-                            lambda w=wav_path: self._notify_recording_monitor_status(w),
-                        )
-                except Exception as exc:
-                    self._session_audio = None
-                    print(f"Audio recording failed: {exc}")
-                    self.audio_label.setText(f"Microphone: failed ({exc}) — video only")
-
-            # 1) fire a 100 ms hardware pulse
-            if self.pulse_manager is not None and sys.platform.startswith("win"):
-                try:
-                    self.pulse_manager.request_pulse(
-                        width_s=SYNC_WIDTH_RECORD,
-                        label="record_start",
-                    )
-                except Exception as e:
-                    print("Record-start pulse failed:", e)
-
-            # 2) tell the camera to mark frames in this window only
-            # if we actually sent a hardware pulse
-            if self.pulse_manager is not None and sys.platform.startswith("win"):
-                self.camera.notify_sync_pulse_window(
-                    width_s=SYNC_WIDTH_RECORD,
-                    label="record_start",
-                )
-
-            self.manual_sync_count = 0  # reset manual counter
-            self._reset_label_marker_session()
-
-            self.state = AppState.RECORDING
-            self._apply_state()
+            self._begin_recording_session()
 
         # Stop recording
         elif self.state == AppState.RECORDING:
             self._stop_recording_session("Recording stopped.")
+
+    def _begin_recording_session(self, *, bypass_confirmation: bool = False) -> bool:
+        """Start a brand-new recording session.
+
+        Used both by the manual Start Recording button and by automatic
+        power-resume. bypass_confirmation skips every human-facing dialog
+        for the automatic path -- the sustained-safe debounce in
+        next_power_action() already stands in for that confirmation, and
+        nobody is there to answer a dialog at 3am. Returns whether a new
+        session actually started.
+        """
+        if self.state != AppState.PREVIEWING:
+            return False
+
+        if not bypass_confirmation:
+            if not self._confirm_power_safe_to_record():
+                return False
+
+        # SessionPaths is the single place deriving every session
+        # artifact name (video segments, wav, metadata, diagnostics,
+        # segments manifest, events) from one stem, so they can't
+        # drift out of sync with each other.
+        output_dir = resolve_output_dir(explicit=self._configured_output_dir)
+        if not self._confirm_disk_safe_to_record(
+            output_dir, bypass_confirmation=bypass_confirmation
+        ):
+            return False
+        session_paths = SessionPaths.for_session(output_dir, datetime.now())
+
+        self._keepalive_state = apply_keep_awake(self._keepalive_request)
+
+        self.record_button.setEnabled(False)
+        self.record_button.setText("Starting recording… please wait")
+        self.status_label.setText("Starting recording…")
+        QApplication.processEvents()
+
+        # Use the camera's real acquisition rate so AVI playback speed matches.
+        fps = self.camera.get_acquisition_frame_rate() or 30.0
+        ok, msg = self.camera.start_recording(session_paths, fps=fps)
+        self.status_label.setText(msg)
+        QApplication.processEvents()
+
+        if not ok:
+            self._apply_state()
+            return False
+
+        self._recording_warnings.reset()
+        self._update_recording_warning_banner()
+        self._start_preview_diagnostics_logging(session_paths.diagnostics_csv)
+
+        self._stop_mic_preview()
+        # Parallel WAV sharing the same session stem as the video segments.
+        audio_device = self.audio_input_combo.currentData()
+        self._session_audio = None
+        if audio_device is not None:
+            wav_path = str(session_paths.wav)
+            try:
+                self._session_audio = SessionAudioRecorder()
+                out_dev = self.audio_output_combo.currentData()
+                self._session_audio.start(
+                    wav_path,
+                    int(audio_device),
+                    monitor=self.audio_monitor_checkbox.isChecked(),
+                    output_device=int(out_dev) if out_dev is not None else None,
+                )
+                format_choice = self._session_audio.audio_format_choice
+                format_note = f" ({format_choice.reason})" if format_choice is not None else ""
+                self.audio_label.setText(
+                    f"Microphone: recording to {wav_path}{format_note}"
+                )
+                if self.audio_monitor_checkbox.isChecked():
+                    QTimer.singleShot(
+                        500,
+                        lambda w=wav_path: self._notify_recording_monitor_status(w),
+                    )
+            except Exception as exc:
+                self._session_audio = None
+                print(f"Audio recording failed: {exc}")
+                self.audio_label.setText(f"Microphone: failed ({exc}) — video only")
+
+        # 1) fire a 100 ms hardware pulse
+        if self.pulse_manager is not None and sys.platform.startswith("win"):
+            try:
+                self.pulse_manager.request_pulse(
+                    width_s=SYNC_WIDTH_RECORD,
+                    label="record_start",
+                )
+            except Exception as e:
+                print("Record-start pulse failed:", e)
+
+        # 2) tell the camera to mark frames in this window only
+        # if we actually sent a hardware pulse
+        if self.pulse_manager is not None and sys.platform.startswith("win"):
+            self.camera.notify_sync_pulse_window(
+                width_s=SYNC_WIDTH_RECORD,
+                label="record_start",
+            )
+
+        self.manual_sync_count = 0  # reset manual counter
+        self._reset_label_marker_session()
+
+        self.state = AppState.RECORDING
+        self._apply_state()
+        return True
 
     def _stop_recording_session(self, status_message: str) -> None:
         """Use the existing stop path for manual and power-safety stops."""
