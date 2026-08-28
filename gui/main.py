@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFrame,
     QMessageBox,
+    QFileDialog,
 )
 from PySide6.QtCore import QTimer, Qt, QUrl
 from PySide6.QtGui import QDesktopServices, QImage, QPixmap
@@ -54,6 +55,8 @@ from backend.preview_diagnostics import (
 )
 from backend.power_status import assess_power_safety, read_power_status
 from backend.recording_warnings import RecordingWarningTracker
+from backend.recording_paths import SessionPaths, resolve_output_dir
+from backend.disk_guard import assess_disk, sample_disk_usage
 from backend.power_keepalive import (
     KeepAwakeRequest,
     KeepAwakeState,
@@ -194,6 +197,20 @@ class MainWindow(QWidget):
         self.detect_button = QPushButton("Detect camera")
         self.detect_button.clicked.connect(self.on_detect_clicked)
         setup_inner.addWidget(self.detect_button)
+
+        # --- Output folder (persists for this session only; set
+        # SLEEVE_VIDEO_GUI_OUTPUT_DIR to persist across launches -- there is
+        # no QSettings precedent in this repo) ---
+        output_dir_row = QHBoxLayout()
+        output_dir_row.addWidget(QLabel("Output folder"))
+        self.output_dir_label = QLabel()
+        self.output_dir_label.setWordWrap(True)
+        self.output_dir_label.setStyleSheet("color: #555;")
+        output_dir_row.addWidget(self.output_dir_label, stretch=1)
+        self.choose_output_dir_button = QPushButton("Browse…")
+        self.choose_output_dir_button.clicked.connect(self.on_choose_output_dir_clicked)
+        output_dir_row.addWidget(self.choose_output_dir_button)
+        setup_inner.addLayout(output_dir_row)
 
         # --- Collapsible camera image tuning (Spinnaker GenICam) ---
         self._camera_tuning_expanded = False
@@ -458,6 +475,13 @@ class MainWindow(QWidget):
         self._preview_diagnostics = PreviewDiagnosticsAccumulator()
         self._preview_diagnostics_logger = AsyncDiagnosticsCsvLogger()
         self._recording_warnings = RecordingWarningTracker()
+
+        # Output folder: None means "let resolve_output_dir() pick" (env
+        # var, then cwd). Set by on_choose_output_dir_clicked; not
+        # persisted across launches -- use SLEEVE_VIDEO_GUI_OUTPUT_DIR for
+        # that.
+        self._configured_output_dir: str | None = None
+        self._refresh_output_dir_label()
         self.preview_diagnostics_timer = QTimer(self)
         self.preview_diagnostics_timer.timeout.connect(
             self._sample_preview_diagnostics
@@ -701,6 +725,47 @@ class MainWindow(QWidget):
             QMessageBox.StandardButton.No,
         )
         return choice == QMessageBox.StandardButton.Yes
+
+    def on_choose_output_dir_clicked(self) -> None:
+        current = self._configured_output_dir or str(resolve_output_dir(create=False))
+        chosen = QFileDialog.getExistingDirectory(self, "Choose output folder", current)
+        if chosen:
+            self._configured_output_dir = chosen
+            self._refresh_output_dir_label()
+
+    def _refresh_output_dir_label(self) -> None:
+        # create=False: just show where a recording would land, without
+        # side-effecting the filesystem merely by displaying it.
+        shown = self._configured_output_dir or str(resolve_output_dir(create=False))
+        self.output_dir_label.setText(shown)
+        self.output_dir_label.setToolTip(shown)
+
+    def _confirm_disk_safe_to_record(self, output_dir) -> bool:
+        """Refuse (or confirm) a run whose planned duration can't fit."""
+        try:
+            sample = sample_disk_usage(output_dir, at_s=time.monotonic())
+        except OSError as exc:
+            QMessageBox.warning(
+                self,
+                "Could not check free disk space",
+                f"Continuing without a disk-space check.\n\n{exc}",
+            )
+            return True
+
+        verdict = assess_disk(sample)
+        if verdict.recording_blocked:
+            QMessageBox.warning(self, "Recording blocked by disk space", verdict.reason)
+            return False
+        if verdict.level == "warning" and verdict.requires_confirmation:
+            choice = QMessageBox.question(
+                self,
+                "Low disk space warning",
+                f"{verdict.reason}\n\nStart recording anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            return choice == QMessageBox.StandardButton.Yes
+        return True
 
     def _refresh_setup_options_toggle_text(self) -> None:
         if not hasattr(self, "setup_options_toggle"):
@@ -1151,11 +1216,16 @@ class MainWindow(QWidget):
             if not self._confirm_power_safe_to_record():
                 return
 
-            self._keepalive_state = apply_keep_awake(self._keepalive_request)
+            # SessionPaths is the single place deriving every session
+            # artifact name (video segments, wav, metadata, diagnostics,
+            # segments manifest, events) from one stem, so they can't
+            # drift out of sync with each other.
+            output_dir = resolve_output_dir(explicit=self._configured_output_dir)
+            if not self._confirm_disk_safe_to_record(output_dir):
+                return
+            session_paths = SessionPaths.for_session(output_dir, datetime.now())
 
-            # SpinVideo adds its own suffix; avoid a double ".avi"
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"recording_{timestamp}"
+            self._keepalive_state = apply_keep_awake(self._keepalive_request)
 
             self.record_button.setEnabled(False)
             self.record_button.setText("Starting recording… please wait")
@@ -1164,7 +1234,7 @@ class MainWindow(QWidget):
 
             # Use the camera's real acquisition rate so AVI playback speed matches.
             fps = self.camera.get_acquisition_frame_rate() or 30.0
-            ok, msg = self.camera.start_recording(filename, fps=fps)
+            ok, msg = self.camera.start_recording(session_paths, fps=fps)
             self.status_label.setText(msg)
             QApplication.processEvents()
 
@@ -1174,14 +1244,14 @@ class MainWindow(QWidget):
 
             self._recording_warnings.reset()
             self._update_recording_warning_banner()
-            self._start_preview_diagnostics_logging(filename)
+            self._start_preview_diagnostics_logging(session_paths.diagnostics_csv)
 
             self._stop_mic_preview()
-            # Parallel WAV with same session base name as video (recording_<ts>.avi / .wav)
+            # Parallel WAV sharing the same session stem as the video segments.
             audio_device = self.audio_input_combo.currentData()
             self._session_audio = None
             if audio_device is not None:
-                wav_path = f"{filename}.wav"
+                wav_path = str(session_paths.wav)
                 try:
                     self._session_audio = SessionAudioRecorder()
                     out_dev = self.audio_output_combo.currentData()
@@ -1254,10 +1324,9 @@ class MainWindow(QWidget):
         self.state = AppState.PREVIEWING
         self._apply_state()
 
-    def _start_preview_diagnostics_logging(self, recording_basename: str) -> None:
+    def _start_preview_diagnostics_logging(self, diagnostics_path) -> None:
         """Start a sidecar diagnostics CSV for this recording session."""
         self._preview_diagnostics.reset(self.camera.get_acquisition_stats())
-        diagnostics_path = f"{recording_basename}_diagnostics.csv"
         self._preview_diagnostics_logger.start(diagnostics_path)
 
     def _stop_preview_diagnostics_logging(self) -> None:
