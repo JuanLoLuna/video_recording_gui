@@ -769,6 +769,7 @@ class SessionAudioRecorder:
                     device_name = str(info.get("name", "")).strip()
                     device_hostapi = info.get("hostapi")
                     while not self._stop.is_set():
+                        dropped_with_exception = False
                         try:
                             with stream:
                                 with self._stream_lock:
@@ -780,10 +781,21 @@ class SessionAudioRecorder:
                                     with self._stream_lock:
                                         self._stream = None
                         except Exception as exc:
+                            dropped_with_exception = True
                             print(f"[audio] input stream dropped: {exc}; reconnecting")
 
                         if self._stop.is_set():
                             break
+
+                        # Windows/WASAPI commonly ends the stream gracefully
+                        # on an unplug (stream.active just goes False) rather
+                        # than raising -- print here too, or a drop in that
+                        # (more common) case would be entirely silent.
+                        if not dropped_with_exception:
+                            print(
+                                f"[audio] input stream for '{device_name}' ended "
+                                "unexpectedly; reconnecting"
+                            )
 
                         # Stream ended without a stop request: the device dropped
                         # (e.g. USB unplug). Keep the WAV open, re-resolve the
@@ -808,6 +820,13 @@ class SessionAudioRecorder:
                                 device_name, devices, hostapi=device_hostapi
                             )
                             if idx is None:
+                                # Rate-limited: reassurance that this is still
+                                # retrying, not spam on every 0.2-5s backoff.
+                                if attempt == 1 or attempt % 10 == 0:
+                                    print(
+                                        f"[audio] still trying to reconnect to "
+                                        f"'{device_name}' (attempt {attempt})"
+                                    )
                                 continue
 
                             def reconnect_cb(

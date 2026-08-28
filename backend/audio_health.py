@@ -116,29 +116,32 @@ def resolve_device_index_by_name(
     device_name: str, devices: list[dict], *, hostapi: int | None = None,
 ) -> int | None:
     """Find a device's current index by its captured name (and, optionally,
-    its host API).
+    its host API) -- but only if exactly one candidate matches.
 
     PortAudio device indices shift after USB re-enumeration; matching by name
     (as sounddevice's query_devices() reports it) survives that shuffle where
     matching by the original index would not. Name alone is not always
     unique, though: some drivers report the same generic name (e.g.
-    "Microphone Array") for two physically different devices, so a plain
-    name match can silently reconnect to the wrong one once the intended
-    device is unplugged. When hostapi is given, also require it to match --
-    two devices sharing a name are usually exposed through different host
-    APIs even when their names collide, so this disambiguates most such
-    cases (not a hardware ID, which PortAudio doesn't expose for USB
-    devices, but a meaningful narrowing).
+    "Microphone Array") for several physically different devices -- observed
+    in practice with over a dozen input entries on one test box, some of
+    them non-functional. hostapi narrows that in the common case, but
+    real hardware can still collide on both name AND host API.
+
+    Silently guessing among multiple candidates risks locking onto a
+    non-functional device and recording silence for the rest of the run
+    with no indication anything is wrong -- worse than staying disconnected,
+    which is at least visible (the reconnect loop keeps retrying and the
+    gap keeps growing in the logs). So: return None on any genuine
+    ambiguity rather than picking the first match, even though that means
+    a colliding name may never auto-resolve.
     """
     target_name = device_name.strip()
-    for i, d in enumerate(devices):
-        if not isinstance(d, dict):
-            continue
-        if str(d.get("name", "")).strip() != target_name:
-            continue
-        if int(d.get("max_input_channels", 0) or 0) < 1:
-            continue
-        if hostapi is not None and d.get("hostapi") != hostapi:
-            continue
-        return i
-    return None
+    candidates = [
+        i
+        for i, d in enumerate(devices)
+        if isinstance(d, dict)
+        and str(d.get("name", "")).strip() == target_name
+        and int(d.get("max_input_channels", 0) or 0) >= 1
+        and (hostapi is None or d.get("hostapi") == hostapi)
+    ]
+    return candidates[0] if len(candidates) == 1 else None
