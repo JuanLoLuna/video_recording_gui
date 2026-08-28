@@ -22,6 +22,13 @@ from typing import Any
 import numpy as np
 
 from backend.audio_format import AudioFormatChoice, AudioWriteBudget, choose_audio_format
+from backend.audio_health import (
+    AudioHealthCounters,
+    AudioHealthSnapshot,
+    plan_reconnect,
+    resolve_device_index_by_name,
+    silence_frames_for_gap,
+)
 
 
 def _resolve_audio_format(
@@ -91,6 +98,7 @@ def _run_split_monitor_streams(
     on_input_mono: Callable[[Any], None],
     blocksize: int = 1024,
     on_monitor_started: Callable[[], None] | None = None,
+    on_status: Callable[[Any], None] | None = None,
 ) -> bool:
     """
     Input-only + output-only streams with a small queue (Windows-friendly when
@@ -106,6 +114,8 @@ def _run_split_monitor_streams(
     ) -> None:
         if stop_event.is_set():
             raise sd.CallbackStop
+        if on_status is not None:
+            on_status(status)
         on_input_mono(indata)
         try:
             audio_q.put_nowait(indata.copy())
@@ -567,10 +577,14 @@ class SessionAudioRecorder:
         self._level_smoothed = 0.0
         self.had_duplex_output = False
         self.audio_format_choice: AudioFormatChoice | None = None
+        self.health = AudioHealthCounters()
 
     def level_0_100(self) -> int:
         with self._level_lock:
             return int(min(100, max(0, round(self._level_smoothed * 100.0))))
+
+    def health_snapshot(self) -> AudioHealthSnapshot:
+        return self.health.snapshot()
 
     def _feed_level(self, indata: Any) -> None:
         peak = float(np.max(np.abs(indata)))
@@ -664,6 +678,7 @@ class SessionAudioRecorder:
                     ) -> None:
                         if self._stop.is_set():
                             raise sd.CallbackStop
+                        self.health.note_status(status)
                         self._feed_level(indata)
                         f.write(indata.copy())
                         budget.note_frames(frames)
@@ -683,6 +698,7 @@ class SessionAudioRecorder:
                         ) -> None:
                             if self._stop.is_set():
                                 raise sd.CallbackStop
+                            self.health.note_status(status)
                             self._feed_level(indata)
                             f.write(indata.copy())
                             budget.note_frames(frames)
@@ -726,6 +742,7 @@ class SessionAudioRecorder:
                                 on_monitor_started=lambda: setattr(
                                     self, "had_duplex_output", True
                                 ),
+                                on_status=self.health.note_status,
                             )
                             if not used_split_monitor:
                                 print(
@@ -735,6 +752,8 @@ class SessionAudioRecorder:
                                 )
 
                     if used_split_monitor:
+                        # Split-monitor is a rarer Windows fallback that already
+                        # blocks internally until stop; no reconnect support here.
                         return
 
                     if stream is None:
@@ -747,15 +766,87 @@ class SessionAudioRecorder:
                             callback=input_cb,
                         )
 
-                    with stream:
-                        with self._stream_lock:
-                            self._stream = stream
+                    device_name = str(info.get("name", "")).strip()
+                    while not self._stop.is_set():
                         try:
-                            while stream.active:
-                                time.sleep(0.05)
-                        finally:
-                            with self._stream_lock:
-                                self._stream = None
+                            with stream:
+                                with self._stream_lock:
+                                    self._stream = stream
+                                try:
+                                    while stream.active and not self._stop.is_set():
+                                        time.sleep(0.05)
+                                finally:
+                                    with self._stream_lock:
+                                        self._stream = None
+                        except Exception as exc:
+                            print(f"[audio] input stream dropped: {exc}; reconnecting")
+
+                        if self._stop.is_set():
+                            break
+
+                        # Stream ended without a stop request: the device dropped
+                        # (e.g. USB unplug). Keep the WAV open, re-resolve the
+                        # device by name (its index may have shifted on
+                        # re-enumeration), and pad the gap with silence so the
+                        # sample count stays aligned with wall-clock time.
+                        drop_time = time.monotonic()
+                        self.had_duplex_output = False
+                        stream = None
+                        attempt = 0
+                        while stream is None and not self._stop.is_set():
+                            attempt += 1
+                            plan = plan_reconnect(device_name, attempt)
+                            self._stop.wait(plan.backoff_s)
+                            if self._stop.is_set():
+                                break
+                            try:
+                                devices = sd.query_devices()
+                            except Exception:
+                                devices = []
+                            idx = resolve_device_index_by_name(device_name, devices)
+                            if idx is None:
+                                continue
+
+                            def reconnect_cb(
+                                indata: Any,
+                                frames: int,
+                                time_info: Any,
+                                status: Any,
+                            ) -> None:
+                                if self._stop.is_set():
+                                    raise sd.CallbackStop
+                                self.health.note_status(status)
+                                self._feed_level(indata)
+                                f.write(indata.copy())
+                                budget.note_frames(frames)
+                                if budget.should_stop():
+                                    self._stop.set()
+
+                            try:
+                                stream = sd.InputStream(
+                                    device=idx,
+                                    channels=channels,
+                                    samplerate=samplerate,
+                                    dtype="float32",
+                                    blocksize=1024,
+                                    callback=reconnect_cb,
+                                )
+                            except Exception:
+                                stream = None
+
+                        if stream is None:
+                            # Stop was requested while still trying to reconnect.
+                            break
+
+                        gap_s = time.monotonic() - drop_time
+                        n_silence = silence_frames_for_gap(gap_s, samplerate)
+                        if n_silence > 0:
+                            f.write(np.zeros((n_silence, channels), dtype="float32"))
+                        self.health.note_reconnect()
+                        print(
+                            f"[audio] reconnected to '{device_name}' after "
+                            f"{gap_s:.2f}s ({n_silence} silence frames inserted)"
+                        )
             except Exception as exc:
                 print(f"[audio] recording failed: {exc}")
 

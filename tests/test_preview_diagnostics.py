@@ -87,6 +87,20 @@ class PreviewDiagnosticsAccumulatorTests(unittest.TestCase):
         self.assertEqual(row["append_failures"], 0)
         self.assertEqual(row["camera_reinits"], 0)
 
+    def test_audio_health_stats_are_deltas_like_camera_stats(self):
+        accumulator = PreviewDiagnosticsAccumulator()
+        accumulator.reset(
+            {"audio_xruns": 1, "audio_reconnects": 0, "audio_silence_frames_inserted": 0},
+            now=0.0,
+        )
+        row = accumulator.sample(
+            {"audio_xruns": 4, "audio_reconnects": 1, "audio_silence_frames_inserted": 480},
+            now=1.0,
+        )
+        self.assertEqual(row["audio_xruns"], 3)
+        self.assertEqual(row["audio_reconnects"], 1)
+        self.assertEqual(row["audio_silence_frames_inserted"], 480)
+
 
 class AsyncDiagnosticsCsvLoggerTests(unittest.TestCase):
     def test_writes_rows_with_the_expected_schema(self):

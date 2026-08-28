@@ -1367,7 +1367,13 @@ class MainWindow(QWidget):
 
     def _sample_preview_diagnostics(self) -> None:
         """Update GUI health once per second and queue a CSV row if recording."""
-        row = self._preview_diagnostics.sample(self.camera.get_acquisition_stats())
+        stats = dict(self.camera.get_acquisition_stats())
+        if self._session_audio is not None:
+            audio_health = self._session_audio.health_snapshot()
+            stats["audio_xruns"] = audio_health.total_xruns
+            stats["audio_reconnects"] = audio_health.reconnects
+            stats["audio_silence_frames_inserted"] = audio_health.silence_frames_inserted
+        row = self._preview_diagnostics.sample(stats)
         if self._preview_diagnostics_logger.is_running:
             self._preview_diagnostics_logger.submit(row)
 
@@ -1379,6 +1385,7 @@ class MainWindow(QWidget):
         errors = int(row["acquisition_errors"])
         append_failures = int(row["append_failures"])
         camera_reinits = int(row["camera_reinits"])
+        audio_reconnects = int(row["audio_reconnects"])
 
         if self.state == AppState.RECORDING:
             now_s = time.monotonic()
@@ -1391,6 +1398,11 @@ class MainWindow(QWidget):
             if camera_reinits:
                 self._recording_warnings.note_issue(
                     f"camera reconnected after a fault ({camera_reinits} reinit(s))",
+                    now_s=now_s,
+                )
+            if audio_reconnects:
+                self._recording_warnings.note_issue(
+                    f"microphone reconnected after a dropout ({audio_reconnects} time(s))",
                     now_s=now_s,
                 )
         self._update_recording_warning_banner()

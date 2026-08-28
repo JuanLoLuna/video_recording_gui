@@ -28,6 +28,9 @@ DIAGNOSTIC_FIELDS = [
     "acquisition_errors",
     "append_failures",
     "camera_reinits",
+    "audio_xruns",
+    "audio_reconnects",
+    "audio_silence_frames_inserted",
 ]
 
 
@@ -146,6 +149,9 @@ class PreviewDiagnosticsAccumulator:
             "acquisition_errors": stat_delta("acquisition_errors"),
             "append_failures": stat_delta("append_failures"),
             "camera_reinits": stat_delta("camera_reinits"),
+            "audio_xruns": stat_delta("audio_xruns"),
+            "audio_reconnects": stat_delta("audio_reconnects"),
+            "audio_silence_frames_inserted": stat_delta("audio_silence_frames_inserted"),
         }
 
         self._interval_started_at = sampled_at
