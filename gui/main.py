@@ -569,12 +569,16 @@ class MainWindow(QWidget):
 
         elif self.state == AppState.PREVIEWING:
             self.detect_button.setEnabled(False)
-            self.preview_button.setEnabled(True)
             self.preview_button.setText("Stop Preview")
             if self._power_paused:
+                # Stopping preview here would drop state to CAMERA_DETECTED,
+                # and auto-resume only fires from PREVIEWING -- an accidental
+                # click would silently strand the run with no way to resume.
+                self.preview_button.setEnabled(False)
                 self.record_button.setEnabled(False)
                 self.record_button.setText("Paused for power safety — resuming automatically")
             else:
+                self.preview_button.setEnabled(True)
                 self.record_button.setEnabled(True)
                 self.record_button.setText("Start Recording")
 
