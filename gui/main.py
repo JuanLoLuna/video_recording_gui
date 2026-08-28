@@ -55,7 +55,7 @@ from backend.preview_diagnostics import (
 )
 from backend.power_status import assess_power_safety, read_power_status
 from backend.power_policy import PowerPolicyState, next_power_action
-from backend.recording_warnings import RecordingWarningTracker
+from backend.recording_warnings import RecordingWarningTracker, format_duration_s
 from backend.recording_paths import SessionPaths, resolve_output_dir
 from backend.disk_guard import assess_disk, sample_disk_usage
 from backend.power_keepalive import (
@@ -1240,7 +1240,9 @@ class MainWindow(QWidget):
             self.timer.stop()
             self.preview_diagnostics_timer.stop()
             self._stop_preview_diagnostics_logging()
-            self.camera.stop()
+            ok, msg = self.camera.stop()
+            if not ok:
+                print(f"[camera] stop() deferred cleanup: {msg}")
             self.preview_running = False
             self.image_label.setPixmap(QPixmap())
             self.image_label.setText("No video")
@@ -1306,7 +1308,7 @@ class MainWindow(QWidget):
             self._apply_state()
             return False
 
-        self._recording_warnings.reset()
+        self._recording_warnings.reset(now_s=time.monotonic())
         self._update_recording_warning_banner()
         self._start_preview_diagnostics_logging(session_paths.diagnostics_csv)
 
@@ -1468,13 +1470,32 @@ class MainWindow(QWidget):
                 )
         self._update_recording_warning_banner()
 
+        # "as of HH:MM:SS" is the one thing on this label that only a live
+        # Qt event loop can advance: a fully hung loop stops this timer from
+        # firing at all, so every other field would otherwise keep showing
+        # its last (possibly healthy-looking) reading forever with no way
+        # to tell a frozen GUI from a genuinely quiet recording.
+        as_of = datetime.now().strftime("%H:%M:%S")
         if age_value == "":
-            text = f"Preview pipeline: no new frame ({rendered_fps:.1f} displayed fps)"
+            text = f"as of {as_of} — Preview pipeline: no new frame ({rendered_fps:.1f} displayed fps)"
             color = "#b71c1c"
         else:
             age_ms = float(age_value)
-            text = f"Preview pipeline: {age_ms:.0f} ms, {rendered_fps:.1f} displayed fps"
+            text = (
+                f"as of {as_of} — Preview pipeline: {age_ms:.0f} ms, "
+                f"{rendered_fps:.1f} displayed fps"
+            )
             color = "#2e7d32" if age_ms <= 250.0 else "#e65100"
+
+        if self.state == AppState.RECORDING:
+            warning_state = self._recording_warnings.summarize(now_s=time.monotonic())
+            if warning_state.healthy_for_s is not None:
+                text = f"Healthy for {format_duration_s(warning_state.healthy_for_s)} — {text}"
+            self.setWindowTitle(f"SmartSleeve Recorder — Recording ({as_of})")
+        elif self._power_paused:
+            self.setWindowTitle("SmartSleeve Recorder — Paused for power safety")
+        else:
+            self.setWindowTitle("SmartSleeve Recorder")
 
         # A delayed one-second diagnostics timer indicates that the Qt event
         # loop itself was unable to run, even if it catches up with a fresh
@@ -1596,7 +1617,9 @@ class MainWindow(QWidget):
         except Exception as e:
             print("Error stopping timer on close:", e)
         try:
-            self.camera.stop()
+            ok, msg = self.camera.stop()
+            if not ok:
+                print(f"[camera] stop() deferred cleanup on close: {msg}")
         except Exception as e:
             print("Error stopping camera on close:", e)
 

@@ -47,6 +47,8 @@ class MetadataRowTests(unittest.TestCase):
                 "segment": 0,
                 "segment_file": "",
                 "segment_frame_index": 0,
+                "monotonic_s": 0.0,
+                "wall_mono_skew_s": 0.0,
             },
         )
 
@@ -81,7 +83,28 @@ class MetadataRowTests(unittest.TestCase):
 
     def test_legacy_field_order_is_unchanged(self):
         self.assertEqual(METADATA_FIELDS[:8], LEGACY_METADATA_FIELDS)
-        self.assertEqual(METADATA_FIELDS[8:], ["segment", "segment_file", "segment_frame_index"])
+        self.assertEqual(
+            METADATA_FIELDS[8:],
+            [
+                "segment",
+                "segment_file",
+                "segment_frame_index",
+                "monotonic_s",
+                "wall_mono_skew_s",
+            ],
+        )
+
+    def test_monotonic_s_and_skew_pass_through_and_round(self):
+        row = metadata_row(
+            {
+                "record_frame_index": 1,
+                "system_time": 0.0,
+                "monotonic_s": 12.3456789,
+                "wall_mono_skew_s": -0.0001234567,
+            }
+        )
+        self.assertEqual(row["monotonic_s"], 12.345679)
+        self.assertEqual(row["wall_mono_skew_s"], -0.000123)
 
     def test_segment_file_and_frame_index_default_to_empty_and_zero(self):
         row = metadata_row(

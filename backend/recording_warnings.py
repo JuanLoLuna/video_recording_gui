@@ -22,6 +22,22 @@ from dataclasses import dataclass
 DEFAULT_RECOVERED_WINDOW_S = 15.0
 
 
+def format_duration_s(seconds: float) -> str:
+    """"Healthy for 3d 4h" instead of a raw second count, for a headline a
+    returning operator can read at a glance after being away for days."""
+    total = int(max(0.0, seconds))
+    days, rem = divmod(total, 86_400)
+    hours, rem = divmod(rem, 3_600)
+    minutes, secs = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
 @dataclass(frozen=True)
 class WarningEvent:
     at_s: float
@@ -35,6 +51,7 @@ class WarningBannerState:
     headline: str
     detail: str
     total_events: int
+    healthy_for_s: float | None  # None until a session start time is known
 
 
 class RecordingWarningTracker:
@@ -46,13 +63,20 @@ class RecordingWarningTracker:
         self._last_event_at: float | None = None
         self._dismissed = False
         self._dismissed_level: str | None = None
+        self._session_start_s: float | None = None
 
-    def reset(self) -> None:
-        """Call at the start of each new recording session."""
+    def reset(self, *, now_s: float | None = None) -> None:
+        """Call at the start of each new recording session.
+
+        now_s, if given, becomes the baseline healthy_for_s counts from
+        until the first issue -- a returning operator needs "healthy for
+        3d 4h", not a raw missing-frame count.
+        """
         self._events.clear()
         self._last_event_at = None
         self._dismissed = False
         self._dismissed_level = None
+        self._session_start_s = now_s
 
     def note_issue(self, message: str, *, now_s: float) -> None:
         self._events.append(WarningEvent(at_s=now_s, message=message))
@@ -67,12 +91,21 @@ class RecordingWarningTracker:
 
     def summarize(self, *, now_s: float) -> WarningBannerState:
         if not self._events:
+            healthy_for_s = (
+                None if self._session_start_s is None else max(0.0, now_s - self._session_start_s)
+            )
             return WarningBannerState(
-                visible=False, level="hidden", headline="", detail="", total_events=0
+                visible=False,
+                level="hidden",
+                headline="",
+                detail="",
+                total_events=0,
+                healthy_for_s=healthy_for_s,
             )
 
         elapsed = now_s - self._last_event_at
         level = "active" if elapsed < self._recovered_window_s else "recovered"
+        healthy_for_s = 0.0 if level == "active" else max(0.0, elapsed)
 
         if self._dismissed and level == self._dismissed_level:
             visible = False
@@ -102,4 +135,5 @@ class RecordingWarningTracker:
             headline=headline,
             detail=detail,
             total_events=len(self._events),
+            healthy_for_s=healthy_for_s,
         )

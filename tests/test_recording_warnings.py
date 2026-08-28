@@ -1,6 +1,6 @@
 import unittest
 
-from backend.recording_warnings import RecordingWarningTracker
+from backend.recording_warnings import RecordingWarningTracker, format_duration_s
 
 
 class RecordingWarningTrackerTests(unittest.TestCase):
@@ -85,6 +85,49 @@ class RecordingWarningTrackerTests(unittest.TestCase):
         # 10s after the *second* event, still well within the window.
         state = tracker.summarize(now_s=20.0)
         self.assertEqual(state.level, "active")
+
+    def test_healthy_for_s_is_none_without_a_known_session_start(self):
+        tracker = RecordingWarningTracker()
+        self.assertIsNone(tracker.summarize(now_s=100.0).healthy_for_s)
+
+    def test_healthy_for_s_counts_from_session_start_with_no_issues(self):
+        tracker = RecordingWarningTracker()
+        tracker.reset(now_s=1000.0)
+        state = tracker.summarize(now_s=1090.0)
+        self.assertEqual(state.healthy_for_s, 90.0)
+
+    def test_healthy_for_s_is_zero_while_active(self):
+        tracker = RecordingWarningTracker(recovered_window_s=15.0)
+        tracker.reset(now_s=0.0)
+        tracker.note_issue("boom", now_s=5.0)
+        state = tracker.summarize(now_s=10.0)
+        self.assertEqual(state.level, "active")
+        self.assertEqual(state.healthy_for_s, 0.0)
+
+    def test_healthy_for_s_counts_from_the_last_issue_once_recovered(self):
+        tracker = RecordingWarningTracker(recovered_window_s=15.0)
+        tracker.reset(now_s=0.0)
+        tracker.note_issue("boom", now_s=5.0)
+        state = tracker.summarize(now_s=25.0)
+        self.assertEqual(state.level, "recovered")
+        self.assertEqual(state.healthy_for_s, 20.0)
+
+
+class FormatDurationSTests(unittest.TestCase):
+    def test_seconds_only(self):
+        self.assertEqual(format_duration_s(45), "45s")
+
+    def test_minutes_and_seconds(self):
+        self.assertEqual(format_duration_s(90), "1m 30s")
+
+    def test_hours_and_minutes_drops_seconds(self):
+        self.assertEqual(format_duration_s(3 * 3600 + 61), "3h 1m")
+
+    def test_days_and_hours_drops_minutes(self):
+        self.assertEqual(format_duration_s(3 * 86_400 + 4 * 3600 + 30 * 60), "3d 4h")
+
+    def test_negative_clamps_to_zero(self):
+        self.assertEqual(format_duration_s(-5), "0s")
 
 
 if __name__ == "__main__":

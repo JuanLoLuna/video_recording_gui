@@ -37,7 +37,19 @@ LEGACY_METADATA_FIELDS = [
 # All three are appended at the end -- every downstream consumer of this
 # CSV reads columns by name, so adding trailing columns is additive and
 # safe.
-METADATA_FIELDS = LEGACY_METADATA_FIELDS + ["segment", "segment_file", "segment_frame_index"]
+#
+# "monotonic_s"/"wall_mono_skew_s" (Phase 3.5) are additive in the same way:
+# a perf_counter() reading (session-relative, not comparable across a
+# restart) and the drift between it and system_time since the session
+# started. See backend/timeline.py for why perf_counter() and not
+# time.monotonic().
+METADATA_FIELDS = LEGACY_METADATA_FIELDS + [
+    "segment",
+    "segment_file",
+    "segment_frame_index",
+    "monotonic_s",
+    "wall_mono_skew_s",
+]
 
 
 @dataclass(frozen=True)
@@ -53,6 +65,8 @@ class FrameMetadata:
     segment: int = 0
     segment_file: str = ""
     segment_frame_index: int = 0
+    monotonic_s: float = 0.0
+    wall_mono_skew_s: float = 0.0
 
 
 def resolve_sync_label(label_event: str | None, sync_label: str | None) -> str | None:
@@ -81,6 +95,8 @@ def metadata_row(record: FrameMetadata | Mapping[str, object]) -> dict[str, obje
             "segment": record.segment,
             "segment_file": record.segment_file,
             "segment_frame_index": record.segment_frame_index,
+            "monotonic_s": record.monotonic_s,
+            "wall_mono_skew_s": record.wall_mono_skew_s,
         }
     else:
         rec = record
@@ -101,6 +117,8 @@ def metadata_row(record: FrameMetadata | Mapping[str, object]) -> dict[str, obje
         "segment": int(rec.get("segment", 0)),
         "segment_file": str(rec.get("segment_file", "")),
         "segment_frame_index": int(rec.get("segment_frame_index", 0)),
+        "monotonic_s": round(float(rec.get("monotonic_s", 0.0)), 6),
+        "wall_mono_skew_s": round(float(rec.get("wall_mono_skew_s", 0.0)), 6),
     }
 
 

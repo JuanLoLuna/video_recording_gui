@@ -31,6 +31,8 @@ from backend.segment_policy import (
     should_roll,
 )
 from backend.segment_manifest import SegmentManifestEntry, SegmentManifestWriter, manifest_row
+from backend.teardown import assess_teardown_readiness
+from backend.timeline import TimelineBaseline, compute_wall_mono_skew_s
 
 
 # Spinnaker's own buffer pool is the decoupling queue between frame arrival
@@ -193,6 +195,9 @@ class CameraController:
         # changing on the exact same row, matching frame_metadata.py's
         # documented invariant.
         self._metadata_segment = 0
+        self._timeline_baseline = TimelineBaseline(
+            session_start_wall_s=0.0, session_start_mono_s=0.0
+        )
         # One row per segment (~960/session); reused across record start/
         # stop cycles like _metadata_writer, started fresh in start_recording.
         self._segment_manifest_writer = SegmentManifestWriter()
@@ -311,6 +316,10 @@ class CameraController:
           - Request recording stop (if active) and wait briefly
           - Stop acquisition thread
           - DeInit camera, clear camera list, release system
+
+        Returns (ok, message). ok is False only in the rare case the
+        acquisition thread did not exit in time -- see the teardown-safety
+        note below.
         """
         # If recording is active or queued, request stop and give loop time.
         # Since Phase 2, finishing a stop means closing a segment (possibly
@@ -338,12 +347,32 @@ class CameraController:
                 pass
 
         # Wait for thread to exit
+        thread_alive = False
         if self._acq_thread is not None:
             try:
                 self._acq_thread.join(timeout=2.0)
             except Exception:
                 pass
-            self._acq_thread = None
+            thread_alive = self._acq_thread.is_alive()
+            if not thread_alive:
+                self._acq_thread = None
+
+        self.acquiring = False
+        self._latest_frame = None
+        self._latest_preview_frame = None
+
+        # The 90s wait above already covers an ordinary large-segment close;
+        # reaching here with the thread still alive means it is genuinely
+        # stuck, not just slow. DeInit/ReleaseInstance while it might still
+        # be touching self.cam/self.system is a use-after-free in native
+        # code, not a catchable exception -- so deliberately leak the handle
+        # instead of releasing it. self.cam/self.cam_list/self.system are
+        # left as-is (not cleared) so a caller can tell teardown didn't
+        # finish, rather than reporting a clean stop that didn't happen.
+        decision = assess_teardown_readiness(acquisition_thread_alive=thread_alive)
+        if not decision.safe_to_release:
+            print(f"[camera] teardown deferred: {decision.reason}")
+            return False, decision.reason
 
         # DeInit camera
         if self.cam is not None:
@@ -364,9 +393,7 @@ class CameraController:
         # Release system
         self._cleanup_system()
 
-        self.acquiring = False
-        self._latest_frame = None
-        self._latest_preview_frame = None
+        return True, ""
 
     def _cleanup_system(self):
         if self.system is not None:
@@ -871,6 +898,10 @@ class CameraController:
         self._mark_next_frame_segment_resume = False
         self._metadata_segment = 0
         self._max_frames_per_segment = segment_frames_for(fps, resolve_segment_seconds())
+        self._timeline_baseline = TimelineBaseline(
+            session_start_wall_s=time.time(),
+            session_start_mono_s=time.perf_counter(),
+        )
 
         self.recording_fps = fps
         self.record_start_requested = True
@@ -1112,13 +1143,15 @@ class CameraController:
                     else:
                         row_sync_label = resolve_sync_label(label_event, sync_label)
 
+                    row_wall_s = time.time()
+                    row_mono_s = time.perf_counter()
                     self._metadata_writer.submit(
                         metadata_row(
                             {
                                 "record_frame_index": self.frame_counter,
                                 "camera_frame_id": frame_id,
                                 "timestamp_us": timestamp_us,
-                                "system_time": time.time(),
+                                "system_time": row_wall_s,
                                 "sync_pulse": sync_this_frame,
                                 "sync_label": row_sync_label,
                                 "adl_id": adl_id,
@@ -1126,6 +1159,12 @@ class CameraController:
                                 "segment": self._metadata_segment,
                                 "segment_file": self._session_paths.video_final(self._segment_index).name,
                                 "segment_frame_index": self._frames_in_segment,
+                                "monotonic_s": row_mono_s,
+                                "wall_mono_skew_s": compute_wall_mono_skew_s(
+                                    self._timeline_baseline,
+                                    wall_s=row_wall_s,
+                                    mono_s=row_mono_s,
+                                ),
                             }
                         )
                     )
