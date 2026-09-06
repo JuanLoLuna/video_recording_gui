@@ -364,6 +364,20 @@ class MainWindow(QWidget):
         session_layout.setContentsMargins(0, 4, 0, 0)
         session_layout.setSpacing(6)
 
+        # Large blinking "recording" cue — hard to miss even from across the room.
+        self.rec_indicator_label = QLabel("● RECORDING")
+        self.rec_indicator_label.setAlignment(Qt.AlignCenter)
+        self.rec_indicator_label.setStyleSheet(
+            "QLabel { color: white; background-color: #c62828; border-radius: 4px;"
+            " font-size: 20px; font-weight: bold; padding: 6px; }"
+        )
+        self.rec_indicator_label.setVisible(False)
+        session_layout.addWidget(self.rec_indicator_label)
+        self._rec_blink_on = True
+        self.rec_blink_timer = QTimer(self)
+        self.rec_blink_timer.setInterval(600)
+        self.rec_blink_timer.timeout.connect(self._toggle_rec_blink)
+
         self.preview_button = QPushButton("Start Preview")
         self.preview_button.clicked.connect(self.on_preview_clicked)
 
@@ -838,6 +852,26 @@ class MainWindow(QWidget):
             self.preview_button.setVisible(True)
             self.status_label.setMaximumHeight(16_777_215)
         self._refresh_setup_options_toggle_text()
+
+        if rec:
+            self.setWindowTitle("● REC — Camera Preview")
+            self._rec_blink_on = True
+            self.rec_indicator_label.setVisible(True)
+            if not self.rec_blink_timer.isActive():
+                self.rec_blink_timer.start()
+        else:
+            self.setWindowTitle("Camera Preview")
+            self.rec_blink_timer.stop()
+            self.rec_indicator_label.setVisible(False)
+
+    def _toggle_rec_blink(self) -> None:
+        """Blink the REC banner so it stays noticeable even in peripheral vision."""
+        self._rec_blink_on = not self._rec_blink_on
+        self.rec_indicator_label.setStyleSheet(
+            "QLabel { color: white; background-color: %s; border-radius: 4px;"
+            " font-size: 20px; font-weight: bold; padding: 6px; }"
+            % ("#c62828" if self._rec_blink_on else "#7a1414")
+        )
 
     def _on_camera_tuning_toggle(self) -> None:
         self._camera_tuning_expanded = not self._camera_tuning_expanded
