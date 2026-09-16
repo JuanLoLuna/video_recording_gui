@@ -1470,7 +1470,8 @@ class MainWindow(QWidget):
             stats["audio_xruns"] = audio_health.total_xruns
             stats["audio_reconnects"] = audio_health.reconnects
             stats["audio_silence_frames_inserted"] = audio_health.silence_frames_inserted
-        row = self._preview_diagnostics.sample(stats)
+        camera_state = self.camera.get_diagnostics_camera_state()
+        row = self._preview_diagnostics.sample(stats, camera_state=camera_state)
         if self._preview_diagnostics_logger.is_running:
             self._preview_diagnostics_logger.submit(row)
 

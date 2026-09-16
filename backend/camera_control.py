@@ -1398,6 +1398,30 @@ class CameraController:
             return float(self.target_frame_rate)
         return limits[2]
 
+    def get_diagnostics_camera_state(self) -> dict[str, float | None]:
+        """Exposure/gain/frame-rate-ceiling gauges for the diagnostics CSV.
+
+        Nothing here writes to the camera -- this is read-only, so it's
+        safe to poll once a second regardless of whether ExposureAuto/
+        GainAuto are enabled. The point is to catch AcquisitionFrameRate's
+        achievable ceiling (limits[1], "GetMax()") sagging below the
+        requested rate as auto-exposure/auto-gain drift upward over a
+        recording -- the camera can't outrun 1 / ExposureTime, and neither
+        control is ever set by this app (see gui/main.py's Gain/Gamma/
+        BlackLevel-only controls), so whatever the driver defaults to
+        (typically ExposureAuto=Continuous) governs unchecked.
+        """
+        frame_rate_limits = self.get_frame_rate_limits()
+        exposure_limits = self.get_image_param_limits("ExposureTime")
+        gain_limits = self.get_image_param_limits("Gain")
+        return {
+            "frame_rate_ceiling_fps": (
+                None if frame_rate_limits is None else frame_rate_limits[1]
+            ),
+            "exposure_time_us": None if exposure_limits is None else exposure_limits[2],
+            "gain_db": None if gain_limits is None else gain_limits[2],
+        }
+
     def set_frame_rate(self, value: float) -> bool:
         """
         Set AcquisitionFrameRate (clamped to the camera's supported range) and

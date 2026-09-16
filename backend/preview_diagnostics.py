@@ -31,6 +31,9 @@ DIAGNOSTIC_FIELDS = [
     "audio_xruns",
     "audio_reconnects",
     "audio_silence_frames_inserted",
+    "exposure_time_us",
+    "frame_rate_ceiling_fps",
+    "gain_db",
 ]
 
 
@@ -97,10 +100,12 @@ class PreviewDiagnosticsAccumulator:
         *,
         now: float | None = None,
         wall_time: str | None = None,
+        camera_state: Mapping[str, float | None] | None = None,
     ) -> dict[str, object]:
         sampled_at = time.monotonic() if now is None else float(now)
         interval_s = max(0.001, sampled_at - self._interval_started_at)
         stats = dict(acquisition_stats or {})
+        camera_state = dict(camera_state or {})
 
         def stat_delta(name: str) -> int:
             current = int(stats.get(name, 0))
@@ -152,6 +157,14 @@ class PreviewDiagnosticsAccumulator:
             "audio_xruns": stat_delta("audio_xruns"),
             "audio_reconnects": stat_delta("audio_reconnects"),
             "audio_silence_frames_inserted": stat_delta("audio_silence_frames_inserted"),
+            # Gauges, not counters: the camera's *current* reading each
+            # interval, not a delta -- used to catch AcquisitionFrameRate's
+            # achievable ceiling (frame_rate_ceiling_fps) collapsing below
+            # the requested rate as ExposureAuto/GainAuto drift exposure_time_us
+            # / gain_db upward over the course of a recording.
+            "exposure_time_us": _rounded(camera_state.get("exposure_time_us")),
+            "frame_rate_ceiling_fps": _rounded(camera_state.get("frame_rate_ceiling_fps")),
+            "gain_db": _rounded(camera_state.get("gain_db")),
         }
 
         self._interval_started_at = sampled_at
