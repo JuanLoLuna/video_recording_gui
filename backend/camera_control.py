@@ -137,11 +137,13 @@ class CameraController:
       - Connecting to first camera
       - Running an acquisition loop in a background thread
       - Providing latest frame for preview
-      - Recording to AVI via SpinVideo (MJPEG)
+      - Recording to AVI via SpinVideo (uncompressed AVIOption)
       - Logging per-recorded-frame metadata to CSV
 
-    All SpinVideo operations (Open, Append, Close) happen ONLY
-    inside the acquisition thread to avoid crashes.
+    Open() and Append() happen only on the acquisition thread. Close() is
+    the exception: it's handed off to a dedicated closer thread (see
+    _closer_queue/_closer_thread) because it can take long enough to
+    risk dropping frames if run inline.
     """
 
     def __init__(self):
@@ -728,9 +730,18 @@ class CameraController:
         # never fire first. reconcile_part_files/the closer thread handle
         # it gracefully if it ever does.
         writer.SetMaximumFileSize(DEFAULT_SDK_MAX_FILE_SIZE_MB)
-        opt = PySpin.MJPGOption()
+        # Uncompressed, not MJPGOption: profiling showed Append() costing
+        # ~17-20ms/frame with MJPGOption(quality=75), almost entirely CPU
+        # spent JPEG-encoding inside the SDK call -- enough by itself to cap
+        # throughput at ~55fps regardless of camera/exposure/buffer settings
+        # (confirmed: the sensor produced frames at ~100fps in one test,
+        # measured via camera_frame_id, while append-bound delivery still
+        # held at ~50fps). AVIOption drops the encode step entirely.
+        # Trade-off: files are far larger (no compression), so segments will
+        # hit DEFAULT_MAX_BYTES/roll over much sooner than the 900s target
+        # duration segment_policy.py assumes -- expected, not a bug.
+        opt = PySpin.AVIOption()
         opt.frameRate = self.recording_fps
-        opt.quality = 75
         writer.Open(str(part_base), opt)
         return writer
 

@@ -3,7 +3,7 @@
 Nothing in this app previously called shutil.disk_usage: when the output
 volume filled, Append() started raising, the exception was caught and
 printed, and the app kept "recording" indefinitely while producing
-nothing. This module classifies free space against the measured MJPEG
+nothing. This module classifies free space against the recording
 bitrate so the GUI can warn early and refuse to start a run that
 can't possibly fit.
 """
@@ -16,9 +16,15 @@ from pathlib import Path
 from typing import Callable
 
 
-# Measured from a real sample (3,480,960,398 B / 1900.9 s) -- see the
-# hardening plan's "corrected facts" section.
-DEFAULT_BYTES_PER_HOUR = 6_593_000_000
+# Uncompressed 1280x1024 Mono8 (1.31 MB/frame) at the 100 fps target:
+# 1,310,720 B/frame * 100 fps * 3600 s/h ~= 471.9 GB/h. Recording switched
+# from MJPGOption to AVIOption (uncompressed) after profiling showed
+# JPEG encoding inside Append() costing ~17-20ms/frame, enough by itself
+# to cap throughput around 55fps regardless of camera settings. The old
+# value here (6,593,000,000 B/h, measured from a real MJPEG sample) would
+# now be off by ~70x -- badly overestimating how much recording time a
+# given amount of free space actually buys.
+DEFAULT_BYTES_PER_HOUR = 471_900_000_000
 DEFAULT_WARN_HOURS = 24.0
 DEFAULT_CRITICAL_HOURS = 6.0
 DEFAULT_MIN_FREE_BYTES = 20 * 1024**3  # 20 GiB

@@ -21,7 +21,10 @@ def make_sample(free_gib: float, *, total_gib: float = 2000.0) -> DiskSample:
 
 class AssessDiskTests(unittest.TestCase):
     def test_plenty_of_space_is_safe(self):
-        verdict = assess_disk(make_sample(1000.0))
+        # 30h worth at the default rate: safely above DEFAULT_WARN_HOURS
+        # regardless of what DEFAULT_BYTES_PER_HOUR currently is.
+        free_gib = DEFAULT_BYTES_PER_HOUR * 30 / 1024**3
+        verdict = assess_disk(make_sample(free_gib, total_gib=free_gib * 2))
         self.assertEqual(verdict.level, "safe")
         self.assertFalse(verdict.recording_blocked)
         self.assertFalse(verdict.requires_confirmation)
