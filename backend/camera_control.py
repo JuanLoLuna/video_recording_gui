@@ -1374,6 +1374,29 @@ class CameraController:
                 return None
         return None
 
+    def get_exposure_time_limits(self) -> tuple[float, float, float] | None:
+        """(min, max, current) for ExposureTime, with `max` additionally
+        capped to the current frame period (see EXPOSURE_FRAME_PERIOD_HEADROOM
+        / _clamp_exposure_to_frame_period).
+
+        The raw node max is a sensor-wide ceiling with no relation to the
+        current fps -- often multiple seconds, vs. the ~10ms window that
+        actually matters at 100fps -- so without this, a GUI slider built
+        from get_image_param_limits("ExposureTime") spends almost its
+        entire travel on values that can't sustain the current frame rate,
+        making fine adjustment in the range that matters effectively
+        impossible by drag.
+        """
+        limits = self.get_image_param_limits("ExposureTime")
+        if limits is None:
+            return None
+        mn, mx, cur = limits
+        fps = self.get_acquisition_frame_rate()
+        if fps and fps > 0:
+            period_max = (1_000_000.0 / fps) * EXPOSURE_FRAME_PERIOD_HEADROOM
+            mx = min(mx, max(mn, period_max))
+        return mn, mx, cur
+
     def set_image_param(self, param_name: str, value: float) -> bool:
         """Write Gain / Gamma / BlackLevel (float or integer node)."""
         if self.cam is None or not self.acquiring or self._recovering.is_set():

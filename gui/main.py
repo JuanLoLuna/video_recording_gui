@@ -276,12 +276,31 @@ class MainWindow(QWidget):
             )
             row.addWidget(sl, stretch=1)
             row.addWidget(val_lbl)
-            container = QWidget()
-            container.setLayout(row)
+
+            # ExposureTime's usable range is bounded by the current frame
+            # rate (get_exposure_time_limits), not the sensor's raw max --
+            # explain that here, since otherwise "why did my range shrink"
+            # is non-obvious.
+            range_caption = None
+            if nodename == "ExposureTime":
+                container_layout = QVBoxLayout()
+                container_layout.setContentsMargins(0, 0, 0, 0)
+                container_layout.setSpacing(0)
+                container_layout.addLayout(row)
+                range_caption = QLabel("")
+                range_caption.setWordWrap(True)
+                range_caption.setStyleSheet("color: #777; font-size: 10px;")
+                container_layout.addWidget(range_caption)
+                container = QWidget()
+                container.setLayout(container_layout)
+            else:
+                container = QWidget()
+                container.setLayout(row)
             tuning_layout.addWidget(container, 1 + i // 2, i % 2)
             self._slider_meta[nodename] = {
                 "slider": sl,
                 "label": val_lbl,
+                "range_caption": range_caption,
                 "min": 0.0,
                 "max": 1.0,
                 "steps": self._image_slider_resolution,
@@ -960,13 +979,19 @@ class MainWindow(QWidget):
         for node, meta in self._slider_meta.items():
             sl = meta["slider"]
             lbl = meta["label"]
-            limits = self.camera.get_image_param_limits(node)
+            caption = meta.get("range_caption")
+            if node == "ExposureTime":
+                limits = self.camera.get_exposure_time_limits()
+            else:
+                limits = self.camera.get_image_param_limits(node)
             if limits is None:
                 meta["supported"] = False
                 sl.blockSignals(True)
                 sl.setEnabled(False)
                 lbl.setText("N/A")
                 sl.blockSignals(False)
+                if caption is not None:
+                    caption.setText("")
                 continue
             mn, mx, cur = limits
             meta["min"], meta["max"] = mn, mx
@@ -984,8 +1009,14 @@ class MainWindow(QWidget):
                 )
                 sl.setEnabled(self._slider_can_tune(node, acquiring))
                 t = (cur - mn) / (mx - mn)
-                sl.setValue(int(round(t * steps)))
+                sl.setValue(int(round(min(1.0, max(0.0, t)) * steps)))
                 lbl.setText(f"{cur:.4g}")
+            if caption is not None:
+                fps = self.camera.get_acquisition_frame_rate()
+                caption.setText(
+                    f"Range limited by frame rate: {mn/1000:.2f}–{mx/1000:.2f} ms "
+                    f"at {fps:.1f} fps (90% of the {1000/fps:.2f} ms frame period)."
+                )
             sl.blockSignals(False)
 
     def _sync_auto_mode_combos_from_camera(self) -> None:
