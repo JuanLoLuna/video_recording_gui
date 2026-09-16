@@ -1428,6 +1428,29 @@ class CameraController:
                 print(f"[camera] set_image_param {param_name}: {exc}")
         return False
 
+    def get_bool_param(self, param_name: str) -> bool | None:
+        """Return a GenICam boolean node's current value, or None if
+        unavailable (e.g. 'AcquisitionFrameRateEnable', 'TriggerMode' is an
+        enum not bool -- use get_enum_param for that one).
+        """
+        if self.cam is None or not self.acquiring or self._recovering.is_set():
+            return None
+        with self._camera_lock:
+            if self.cam is None:
+                return None
+            try:
+                nodemap = self.cam.GetNodeMap()
+                raw_node = nodemap.GetNode(param_name)
+                if raw_node is None:
+                    return None
+                node = PySpin.CBooleanPtr(raw_node)
+                if not PySpin.IsReadable(node):
+                    return None
+                return bool(node.GetValue())
+            except Exception:
+                return None
+        return None
+
     def get_enum_param(self, param_name: str) -> tuple[str, list[str]] | None:
         """Return (current_entry_name, available_entry_names) for a GenICam
         enumeration node (e.g. 'ExposureAuto', 'GainAuto'), or None if
@@ -1561,12 +1584,21 @@ class CameraController:
         the driver defaults to governs unchecked); and
         DeviceLinkThroughputLimit capping actual delivery independent of
         AcquisitionFrameRate, which can read back the full requested value
-        while still being throttled underneath.
+        while still being throttled underneath; and a third: AcquisitionFrame-
+        RateEnable / TriggerMode silently NOT being what this app assumes,
+        which would make the camera ignore AcquisitionFrameRate entirely
+        and free-run at whatever exposure+readout allows (or wait on an
+        external trigger) -- indistinguishable from the outside except by
+        reading these back directly, since GetValue() on the rate/exposure/
+        gain nodes themselves only echoes the requested setpoint, not
+        confirmation the sensor is actually obeying it.
         """
         frame_rate_limits = self.get_frame_rate_limits()
         exposure_limits = self.get_image_param_limits("ExposureTime")
         gain_limits = self.get_image_param_limits("Gain")
         throughput_limit = self.get_device_link_throughput_limit()
+        frame_rate_enable = self.get_bool_param("AcquisitionFrameRateEnable")
+        trigger_mode = self.get_enum_param("TriggerMode")
         return {
             "acquisition_frame_rate_fps": (
                 None if frame_rate_limits is None else frame_rate_limits[2]
@@ -1579,6 +1611,8 @@ class CameraController:
             "device_link_throughput_limit_bps": (
                 None if throughput_limit is None else throughput_limit[0]
             ),
+            "acquisition_frame_rate_enable": frame_rate_enable,
+            "trigger_mode": None if trigger_mode is None else trigger_mode[0],
         }
 
     def set_frame_rate(self, value: float) -> bool:

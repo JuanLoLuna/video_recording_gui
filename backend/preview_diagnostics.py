@@ -36,6 +36,8 @@ DIAGNOSTIC_FIELDS = [
     "frame_rate_ceiling_fps",
     "gain_db",
     "device_link_throughput_limit_bps",
+    "acquisition_frame_rate_enable",
+    "trigger_mode",
 ]
 
 
@@ -174,6 +176,15 @@ class PreviewDiagnosticsAccumulator:
                 "" if camera_state.get("device_link_throughput_limit_bps") is None
                 else int(camera_state["device_link_throughput_limit_bps"])
             ),
+            # Whether the camera is actually obeying AcquisitionFrameRate/
+            # TriggerMode at all -- AcquisitionFrameRate.GetValue() only
+            # echoes the requested setpoint regardless of whether either of
+            # these makes it irrelevant to the sensor's real behavior.
+            "acquisition_frame_rate_enable": (
+                "" if camera_state.get("acquisition_frame_rate_enable") is None
+                else int(bool(camera_state["acquisition_frame_rate_enable"]))
+            ),
+            "trigger_mode": camera_state.get("trigger_mode") or "",
         }
 
         self._interval_started_at = sampled_at
