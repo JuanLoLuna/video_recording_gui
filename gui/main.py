@@ -1608,7 +1608,10 @@ class MainWindow(QWidget):
             stats["audio_reconnects"] = audio_health.reconnects
             stats["audio_silence_frames_inserted"] = audio_health.silence_frames_inserted
         camera_state = self.camera.get_diagnostics_camera_state()
-        row = self._preview_diagnostics.sample(stats, camera_state=camera_state)
+        loop_timing = self.camera.get_and_reset_loop_timing_samples()
+        row = self._preview_diagnostics.sample(
+            stats, camera_state=camera_state, loop_timing=loop_timing
+        )
         if self._preview_diagnostics_logger.is_running:
             self._preview_diagnostics_logger.submit(row)
         self._update_frame_rate_ceiling_hint(camera_state.get("frame_rate_ceiling_fps"))

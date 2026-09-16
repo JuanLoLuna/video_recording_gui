@@ -38,6 +38,12 @@ DIAGNOSTIC_FIELDS = [
     "device_link_throughput_limit_bps",
     "acquisition_frame_rate_enable",
     "trigger_mode",
+    "grab_ms",
+    "grab_ms_p95",
+    "append_ms",
+    "append_ms_p95",
+    "ndarray_ms",
+    "ndarray_ms_p95",
 ]
 
 
@@ -51,6 +57,10 @@ def _percentile(values: list[float], percentile: float) -> float | None:
 
 def _rounded(value: float | None) -> float | str:
     return "" if value is None else round(float(value), 3)
+
+
+def _mean(values: list[float]) -> float | None:
+    return None if not values else sum(values) / len(values)
 
 
 class PreviewDiagnosticsAccumulator:
@@ -105,11 +115,13 @@ class PreviewDiagnosticsAccumulator:
         now: float | None = None,
         wall_time: str | None = None,
         camera_state: Mapping[str, float | None] | None = None,
+        loop_timing: Mapping[str, list[float]] | None = None,
     ) -> dict[str, object]:
         sampled_at = time.monotonic() if now is None else float(now)
         interval_s = max(0.001, sampled_at - self._interval_started_at)
         stats = dict(acquisition_stats or {})
         camera_state = dict(camera_state or {})
+        loop_timing = dict(loop_timing or {})
 
         def stat_delta(name: str) -> int:
             current = int(stats.get(name, 0))
@@ -185,6 +197,20 @@ class PreviewDiagnosticsAccumulator:
                 else int(bool(camera_state["acquisition_frame_rate_enable"]))
             ),
             "trigger_mode": camera_state.get("trigger_mode") or "",
+            # Per-stage acquisition-loop timing, mean + p95 across every
+            # frame processed this interval (not just displayed ones) --
+            # pinpoints whether GetNextImage (grab), Append (disk/encode),
+            # or GetNDArray/copy (ndarray) is what caps real throughput.
+            "grab_ms": _rounded(_mean(loop_timing.get("grab_ms") or [])),
+            "grab_ms_p95": _rounded(_percentile(loop_timing.get("grab_ms") or [], 0.95)),
+            "append_ms": _rounded(_mean(loop_timing.get("append_ms") or [])),
+            "append_ms_p95": _rounded(
+                _percentile(loop_timing.get("append_ms") or [], 0.95)
+            ),
+            "ndarray_ms": _rounded(_mean(loop_timing.get("ndarray_ms") or [])),
+            "ndarray_ms_p95": _rounded(
+                _percentile(loop_timing.get("ndarray_ms") or [], 0.95)
+            ),
         }
 
         self._interval_started_at = sampled_at

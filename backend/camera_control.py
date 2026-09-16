@@ -239,6 +239,21 @@ class CameraController:
         self._acquisition_errors = 0
         self._append_failures = 0
 
+        # Per-stage acquisition-loop timing, one raw sample per frame --
+        # separate lock from _acquisition_stats_lock since this is populated
+        # every frame (not just on recording-relevant events) and read/reset
+        # once a second by the GUI's diagnostics sampler (see
+        # get_and_reset_loop_timing_samples). Added to find which stage of
+        # GetNextImage -> Append -> GetNDArray is actually responsible for
+        # the ~50fps ceiling observed even when the sensor itself produces
+        # frames faster (confirmed via camera_frame_id in a real test).
+        self._loop_timing_lock = threading.Lock()
+        self._loop_timing_samples: dict[str, list[float]] = {
+            "grab_ms": [],
+            "append_ms": [],
+            "ndarray_ms": [],
+        }
+
         # Recording state/flags (thread-safe)
         self.recording_active = False          # true while SpinVideo is open
         self.record_start_requested = False    # GUI asks to start
@@ -1127,6 +1142,7 @@ class CameraController:
                 self._apply_watchdog_decision(error_decision)
                 continue
 
+            t_grab_start = time.monotonic()
             try:
                 # grabTimeout is milliseconds (Spinnaker CameraBase::GetNextImage);
                 # bounding it is what turns a silent forever-block into a
@@ -1142,6 +1158,7 @@ class CameraController:
 
             self._watchdog.note_frame_ok(now=time.monotonic())
             retrieved_at = time.monotonic()
+            self._record_loop_timing("grab_ms", (retrieved_at - t_grab_start) * 1000.0)
 
             if image.IsIncomplete():
                 with self._acquisition_stats_lock:
@@ -1204,13 +1221,20 @@ class CameraController:
                 # not advance record_frame_index, or the CSV's frame index
                 # permanently desynchronises from the AVI's actual frame
                 # count for the rest of the (possibly multi-day) session.
+                t_append_start = time.monotonic()
                 try:
                     self.avi_recorder.Append(image)
                 except Exception as exc:
                     print("Error appending frame:", exc)
                     with self._acquisition_stats_lock:
                         self._append_failures += 1
+                    self._record_loop_timing(
+                        "append_ms", (time.monotonic() - t_append_start) * 1000.0
+                    )
                 else:
+                    self._record_loop_timing(
+                        "append_ms", (time.monotonic() - t_append_start) * 1000.0
+                    )
                     self.frame_counter += 1
                     self._frames_in_segment += 1
                     if self._frames_in_segment == 1:
@@ -1254,9 +1278,13 @@ class CameraController:
             # Preview: store latest frame
             # --------------------------------------------------
             try:
+                t_ndarray_start = time.monotonic()
                 arr = image.GetNDArray()
                 arr = np.array(arr, copy=True)
                 published_at = time.monotonic()
+                self._record_loop_timing(
+                    "ndarray_ms", (published_at - t_ndarray_start) * 1000.0
+                )
                 preview_frame = PreviewFrame(
                     image=arr,
                     sequence=preview_sequence,
@@ -1329,6 +1357,22 @@ class CameraController:
                 "metadata_overflow_rows": self._metadata_writer.overflow_rows,
                 "camera_reinits": self._camera_reinits,
             }
+
+    def _record_loop_timing(self, name: str, elapsed_ms: float) -> None:
+        with self._loop_timing_lock:
+            self._loop_timing_samples[name].append(elapsed_ms)
+
+    def get_and_reset_loop_timing_samples(self) -> dict[str, list[float]]:
+        """Pop and clear this interval's per-stage acquisition-loop timing
+        samples (grab_ms/append_ms/ndarray_ms) -- one raw sample per frame
+        processed since the last call. The GUI's once-a-second diagnostics
+        sampler turns these into mean/p95 (see preview_diagnostics.py).
+        """
+        with self._loop_timing_lock:
+            samples = {name: values for name, values in self._loop_timing_samples.items()}
+            for name in self._loop_timing_samples:
+                self._loop_timing_samples[name] = []
+        return samples
 
     # ------------------------------------------------------------------
     # Image controls (GenICam; GUI thread while acquiring)
