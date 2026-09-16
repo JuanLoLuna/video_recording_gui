@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QHBoxLayout,
+    QGridLayout,
     QPushButton,
     QLabel,
     QComboBox,
@@ -216,7 +217,7 @@ class MainWindow(QWidget):
         # --- Collapsible camera image tuning (Spinnaker GenICam) ---
         self._camera_tuning_expanded = False
         self.camera_tuning_toggle = QPushButton(
-            "▶ Camera image — gain, gamma, black level"
+            "▶ Camera image — exposure, gain, gamma, black level"
         )
         self.camera_tuning_toggle.setStyleSheet(
             "QPushButton { text-align: left; padding: 6px 8px; }"
@@ -225,28 +226,59 @@ class MainWindow(QWidget):
         setup_inner.addWidget(self.camera_tuning_toggle)
 
         self.camera_tuning_panel = QWidget()
-        tuning_layout = QVBoxLayout(self.camera_tuning_panel)
+        tuning_layout = QGridLayout(self.camera_tuning_panel)
         tuning_layout.setContentsMargins(12, 4, 8, 4)
+        tuning_layout.setHorizontalSpacing(16)
+
+        # Auto/manual mode for exposure and gain, side by side: this is what
+        # actually makes the sliders below stick. With ExposureAuto/GainAuto
+        # left at the camera's default (typically "Continuous"), the sensor
+        # re-writes ExposureTime/Gain on its own cycle and silently overrides
+        # any value the sliders set -- reported as "the Gain slider does
+        # nothing." Switching to "Off" here is what hands control to the
+        # sliders.
+        self._auto_mode_meta: dict[str, dict] = {}
+        for col, (title, nodename) in enumerate(
+            (("Exposure mode", "ExposureAuto"), ("Gain mode", "GainAuto"))
+        ):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(title))
+            combo = QComboBox()
+            combo.setEnabled(False)
+            row.addWidget(combo, stretch=1)
+            container = QWidget()
+            container.setLayout(row)
+            tuning_layout.addWidget(container, 0, col)
+            self._auto_mode_meta[nodename] = {"combo": combo}
+            combo.currentTextChanged.connect(
+                lambda text, n=nodename: self._on_auto_mode_changed(n, text)
+            )
+
+        # Sliders in two columns to keep the panel compact.
         self._image_slider_resolution = 1000
         self._slider_meta: dict[str, dict] = {}
-        for title, nodename in (
+        slider_params = (
+            ("Exposure (µs)", "ExposureTime"),
             ("Gain", "Gain"),
             ("Gamma", "Gamma"),
             ("Black level", "BlackLevel"),
-        ):
+        )
+        for i, (title, nodename) in enumerate(slider_params):
             row = QHBoxLayout()
             row.addWidget(QLabel(title))
             sl = QSlider(Qt.Orientation.Horizontal)
             sl.setRange(0, self._image_slider_resolution)
             sl.setEnabled(False)
             val_lbl = QLabel("—")
-            val_lbl.setMinimumWidth(76)
+            val_lbl.setMinimumWidth(64)
             val_lbl.setAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
             )
             row.addWidget(sl, stretch=1)
             row.addWidget(val_lbl)
-            tuning_layout.addLayout(row)
+            container = QWidget()
+            container.setLayout(row)
+            tuning_layout.addWidget(container, 1 + i // 2, i % 2)
             self._slider_meta[nodename] = {
                 "slider": sl,
                 "label": val_lbl,
@@ -259,12 +291,13 @@ class MainWindow(QWidget):
                 lambda v, n=nodename: self._on_image_slider_changed(n, v)
             )
 
+        hint_row = 1 + (len(slider_params) + 1) // 2
         self.camera_tuning_hint = QLabel(
             "Start preview to enable these controls (requires Spinnaker / GenICam nodes)."
         )
         self.camera_tuning_hint.setWordWrap(True)
         self.camera_tuning_hint.setStyleSheet("color: #555; font-size: 11px;")
-        tuning_layout.addWidget(self.camera_tuning_hint)
+        tuning_layout.addWidget(self.camera_tuning_hint, hint_row, 0, 1, 2)
         self.camera_tuning_panel.setVisible(False)
         setup_inner.addWidget(self.camera_tuning_panel)
 
@@ -878,8 +911,18 @@ class MainWindow(QWidget):
         self.camera_tuning_panel.setVisible(self._camera_tuning_expanded)
         arrow = "▼" if self._camera_tuning_expanded else "▶"
         self.camera_tuning_toggle.setText(
-            f"{arrow} Camera image — gain, gamma, black level"
+            f"{arrow} Camera image — exposure, gain, gamma, black level"
         )
+
+    def _on_auto_mode_changed(self, node: str, entry_name: str) -> None:
+        meta = self._auto_mode_meta.get(node)
+        if meta is None or not meta["combo"].isEnabled() or not entry_name:
+            return
+        self.camera.set_enum_param(node, entry_name)
+        # Auto mode governs the paired slider (ExposureAuto -> ExposureTime,
+        # GainAuto -> Gain): re-sync so it reflects whatever the camera
+        # actually holds now, and is only editable when mode is "Off".
+        self._sync_image_sliders_from_camera()
 
     def _on_image_slider_changed(self, node: str, slider_value: int) -> None:
         meta = self._slider_meta.get(node)
@@ -895,6 +938,21 @@ class MainWindow(QWidget):
         value = mn + (slider_value / steps) * (mx - mn)
         meta["label"].setText(f"{value:.4g}")
         self.camera.set_image_param(node, value)
+
+    # Sliders whose value the camera will silently override while the
+    # paired Auto mode isn't "Off" -- see _on_auto_mode_changed.
+    _AUTO_MODE_FOR_SLIDER = {"ExposureTime": "ExposureAuto", "Gain": "GainAuto"}
+
+    def _slider_can_tune(self, node: str, acquiring: bool) -> bool:
+        if not acquiring:
+            return False
+        auto_node = self._AUTO_MODE_FOR_SLIDER.get(node)
+        if auto_node is None:
+            return True
+        auto_meta = self._auto_mode_meta.get(auto_node)
+        if auto_meta is None or not auto_meta["combo"].isEnabled():
+            return True
+        return auto_meta["combo"].currentText() == "Off"
 
     def _sync_image_sliders_from_camera(self) -> None:
         """Read limits from the open camera and align sliders (call after preview starts)."""
@@ -920,15 +978,34 @@ class MainWindow(QWidget):
                 sl.setEnabled(False)
                 lbl.setText(f"{cur:.4g}")
             else:
-                can_tune = self.state in (
+                acquiring = self.state in (
                     AppState.PREVIEWING,
                     AppState.RECORDING,
                 )
-                sl.setEnabled(can_tune)
+                sl.setEnabled(self._slider_can_tune(node, acquiring))
                 t = (cur - mn) / (mx - mn)
                 sl.setValue(int(round(t * steps)))
                 lbl.setText(f"{cur:.4g}")
             sl.blockSignals(False)
+
+    def _sync_auto_mode_combos_from_camera(self) -> None:
+        """Read ExposureAuto/GainAuto options + current entry (call after preview starts)."""
+        for node, meta in self._auto_mode_meta.items():
+            combo = meta["combo"]
+            result = self.camera.get_enum_param(node)
+            combo.blockSignals(True)
+            if result is None:
+                combo.clear()
+                combo.setEnabled(False)
+            else:
+                current, entries = result
+                if [combo.itemText(i) for i in range(combo.count())] != entries:
+                    combo.clear()
+                    combo.addItems(entries)
+                combo.setCurrentText(current)
+                can_tune = self.state in (AppState.PREVIEWING, AppState.RECORDING)
+                combo.setEnabled(can_tune)
+            combo.blockSignals(False)
 
     def _sync_frame_rate_from_camera(self) -> None:
         """Read the camera's frame-rate range/current and fill the spin box."""
@@ -946,10 +1023,32 @@ class MainWindow(QWidget):
         spin.setValue(cur)
         spin.blockSignals(False)
         self._update_frame_rate_widget_enabled()
+        self.frame_rate_hint.setStyleSheet("color: #555; font-size: 11px;")
         self.frame_rate_hint.setText(
             f"Camera supports {mn:.1f}–{mx:.1f} fps. Current rate: {cur:.1f} fps "
             f"(also sets AVI playback speed)."
         )
+
+    def _update_frame_rate_ceiling_hint(self, ceiling_fps: float | str | None) -> None:
+        """Warn once a second if the camera can no longer sustain the requested
+        rate -- e.g. ExposureTime has grown too long for the target fps.
+        """
+        if ceiling_fps is None or ceiling_fps == "" or not hasattr(self, "frame_rate_spin"):
+            return
+        requested = self.frame_rate_spin.value()
+        ceiling = float(ceiling_fps)
+        if ceiling + 0.5 < requested:
+            self.frame_rate_hint.setStyleSheet("color: #b00020; font-size: 11px; font-weight: 600;")
+            self.frame_rate_hint.setText(
+                f"Camera can only sustain ~{ceiling:.1f} fps right now (requested "
+                f"{requested:.1f} fps) -- check exposure/gain mode below."
+            )
+        else:
+            self.frame_rate_hint.setStyleSheet("color: #555; font-size: 11px;")
+            self.frame_rate_hint.setText(
+                f"Current rate: {requested:.1f} fps (also sets AVI playback speed). "
+                f"Max sustainable right now: {ceiling:.1f} fps."
+            )
 
     def _on_frame_rate_changed(self, value: float) -> None:
         if not self.frame_rate_spin.isEnabled():
@@ -978,12 +1077,14 @@ class MainWindow(QWidget):
         acquiring = self.state in (AppState.PREVIEWING, AppState.RECORDING)
         if hasattr(self, "camera_tuning_hint"):
             self.camera_tuning_hint.setVisible(not acquiring)
-        for meta in self._slider_meta.values():
+        for node, meta in self._auto_mode_meta.items():
+            meta["combo"].setEnabled(acquiring and meta["combo"].count() > 0)
+        for node, meta in self._slider_meta.items():
             sl = meta["slider"]
             if not meta.get("supported"):
                 sl.setEnabled(False)
                 continue
-            sl.setEnabled(acquiring)
+            sl.setEnabled(self._slider_can_tune(node, acquiring))
 
     def _stop_mic_preview(self) -> None:
         if self._mic_preview is not None:
@@ -1263,6 +1364,7 @@ class MainWindow(QWidget):
             self.preview_button.setText("Stop Preview")
             self.state = AppState.PREVIEWING
             self._apply_state()
+            self._sync_auto_mode_combos_from_camera()
             self._sync_image_sliders_from_camera()
             self._sync_frame_rate_from_camera()
 
@@ -1474,6 +1576,7 @@ class MainWindow(QWidget):
         row = self._preview_diagnostics.sample(stats, camera_state=camera_state)
         if self._preview_diagnostics_logger.is_running:
             self._preview_diagnostics_logger.submit(row)
+        self._update_frame_rate_ceiling_hint(camera_state.get("frame_rate_ceiling_fps"))
 
         age_value = row["preview_age_ms"]
         interval_s = float(row["interval_s"])

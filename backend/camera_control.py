@@ -1357,6 +1357,53 @@ class CameraController:
                 print(f"[camera] set_image_param {param_name}: {exc}")
         return False
 
+    def get_enum_param(self, param_name: str) -> tuple[str, list[str]] | None:
+        """Return (current_entry_name, available_entry_names) for a GenICam
+        enumeration node (e.g. 'ExposureAuto', 'GainAuto'), or None if
+        unavailable. Used to drive the GUI's Auto/Off mode dropdowns.
+        """
+        if self.cam is None or not self.acquiring or self._recovering.is_set():
+            return None
+        with self._camera_lock:
+            if self.cam is None:
+                return None
+            try:
+                nodemap = self.cam.GetNodeMap()
+                node = PySpin.CEnumerationPtr(nodemap.GetNode(param_name))
+                if node is None or not PySpin.IsReadable(node):
+                    return None
+                entries = [
+                    entry.GetSymbolic()
+                    for entry in node.GetEntries()
+                    if PySpin.IsReadable(entry)
+                ]
+                current = node.GetCurrentEntry().GetSymbolic()
+                return current, entries
+            except Exception:
+                return None
+        return None
+
+    def set_enum_param(self, param_name: str, entry_name: str) -> bool:
+        """Write a GenICam enumeration node (e.g. set ExposureAuto to 'Off')."""
+        if self.cam is None or not self.acquiring or self._recovering.is_set():
+            return False
+        with self._camera_lock:
+            if self.cam is None:
+                return False
+            try:
+                nodemap = self.cam.GetNodeMap()
+                node = PySpin.CEnumerationPtr(nodemap.GetNode(param_name))
+                if node is None or not PySpin.IsWritable(node):
+                    return False
+                entry = node.GetEntryByName(entry_name)
+                if entry is None or not PySpin.IsReadable(entry):
+                    return False
+                node.SetIntValue(entry.GetValue())
+                return True
+            except Exception as exc:
+                print(f"[camera] set_enum_param {param_name}={entry_name}: {exc}")
+        return False
+
     # ------------------------------------------------------------------
     # Acquisition frame rate (GenICam; GUI thread while acquiring)
     # ------------------------------------------------------------------
