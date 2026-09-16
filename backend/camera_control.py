@@ -1469,11 +1469,14 @@ class CameraController:
                 node = PySpin.CEnumerationPtr(raw_node)
                 if not PySpin.IsReadable(node):
                     return None
-                entries = [
-                    entry.GetSymbolic()
-                    for entry in node.GetEntries()
-                    if PySpin.IsReadable(entry)
-                ]
+                # GetEntries() returns raw INode pointers, not IEnumEntryPtr
+                # -- .GetSymbolic() only exists on the latter, so each entry
+                # must be re-wrapped with CEnumEntryPtr first.
+                entries = []
+                for raw_entry in node.GetEntries():
+                    entry = PySpin.CEnumEntryPtr(raw_entry)
+                    if PySpin.IsReadable(entry):
+                        entries.append(entry.GetSymbolic())
                 current = node.GetCurrentEntry().GetSymbolic()
                 return current, entries
             except Exception:
@@ -1495,8 +1498,13 @@ class CameraController:
                 node = PySpin.CEnumerationPtr(raw_node)
                 if not PySpin.IsWritable(node):
                     return False
-                entry = node.GetEntryByName(entry_name)
-                if entry is None or not PySpin.IsReadable(entry):
+                # Same as get_enum_param: GetEntryByName() returns a raw
+                # INode, not IEnumEntryPtr -- .GetValue() needs the wrap.
+                raw_entry = node.GetEntryByName(entry_name)
+                if raw_entry is None:
+                    return False
+                entry = PySpin.CEnumEntryPtr(raw_entry)
+                if not PySpin.IsReadable(entry):
                     return False
                 node.SetIntValue(entry.GetValue())
                 return True
