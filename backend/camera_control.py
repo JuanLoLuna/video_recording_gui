@@ -489,8 +489,14 @@ class CameraController:
                     mode.SetIntValue(manual_entry.GetValue())
             count = PySpin.CIntegerPtr(tl_nodemap.GetNode("StreamBufferCountManual"))
             if PySpin.IsWritable(count):
-                target = min(int(count.GetMax()), STREAM_BUFFER_COUNT_TARGET)
+                buffer_max = int(count.GetMax())
+                target = min(buffer_max, STREAM_BUFFER_COUNT_TARGET)
                 count.SetValue(target)
+                applied = int(count.GetValue()) if PySpin.IsReadable(count) else target
+                print(
+                    f"[camera] stream buffer count: applied={applied} "
+                    f"requested={STREAM_BUFFER_COUNT_TARGET} max={buffer_max}"
+                )
         except Exception as exc:
             print(f"[camera] could not configure stream buffer count: {exc}")
 
