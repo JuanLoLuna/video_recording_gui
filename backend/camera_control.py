@@ -1369,8 +1369,11 @@ class CameraController:
                 return None
             try:
                 nodemap = self.cam.GetNodeMap()
-                node = PySpin.CEnumerationPtr(nodemap.GetNode(param_name))
-                if node is None or not PySpin.IsReadable(node):
+                raw_node = nodemap.GetNode(param_name)
+                if raw_node is None:
+                    return None
+                node = PySpin.CEnumerationPtr(raw_node)
+                if not PySpin.IsReadable(node):
                     return None
                 entries = [
                     entry.GetSymbolic()
@@ -1392,8 +1395,11 @@ class CameraController:
                 return False
             try:
                 nodemap = self.cam.GetNodeMap()
-                node = PySpin.CEnumerationPtr(nodemap.GetNode(param_name))
-                if node is None or not PySpin.IsWritable(node):
+                raw_node = nodemap.GetNode(param_name)
+                if raw_node is None:
+                    return False
+                node = PySpin.CEnumerationPtr(raw_node)
+                if not PySpin.IsWritable(node):
                     return False
                 entry = node.GetEntryByName(entry_name)
                 if entry is None or not PySpin.IsReadable(entry):
