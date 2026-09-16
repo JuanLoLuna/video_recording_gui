@@ -38,10 +38,15 @@ from backend.timeline import TimelineBaseline, compute_wall_mono_skew_s
 # Spinnaker's own buffer pool is the decoupling queue between frame arrival
 # and disk writes: deepening it is what makes a rotation-boundary disk
 # stall (up to ~1.6 GB of dirty page cache) survivable without dropping
-# frames. At 1.31 MB/frame (1280x1024 Mono8), 150 buffers is ~197 MB of
-# RAM for ~5s of stall tolerance. Confirmed reachable on the production
-# camera (Phase 0 bench item 2).
-STREAM_BUFFER_COUNT_TARGET = 150
+# frames. At 1.31 MB/frame (1280x1024 Mono8), 500 buffers is ~655 MB of
+# RAM for ~5s of stall tolerance AT 100 FPS. This is sized for the actual
+# operating frame rate (100 fps), not the 30 fps software default:
+# StreamBufferCountManual is only writable before BeginAcquisition(), but
+# the frame rate is normally raised well after that (GUI spin box calls
+# set_frame_rate() post-connect), so the buffer can't be re-sized to match
+# whatever fps the camera ends up running at -- it has to be sized for the
+# fastest rate it will actually see up front.
+STREAM_BUFFER_COUNT_TARGET = 500
 
 
 @dataclass
