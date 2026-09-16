@@ -38,15 +38,15 @@ from backend.timeline import TimelineBaseline, compute_wall_mono_skew_s
 # Spinnaker's own buffer pool is the decoupling queue between frame arrival
 # and disk writes: deepening it is what makes a rotation-boundary disk
 # stall (up to ~1.6 GB of dirty page cache) survivable without dropping
-# frames. At 1.31 MB/frame (1280x1024 Mono8), 500 buffers is ~655 MB of
-# RAM for ~5s of stall tolerance AT 100 FPS. This is sized for the actual
-# operating frame rate (100 fps), not the 30 fps software default:
-# StreamBufferCountManual is only writable before BeginAcquisition(), but
-# the frame rate is normally raised well after that (GUI spin box calls
-# set_frame_rate() post-connect), so the buffer can't be re-sized to match
-# whatever fps the camera ends up running at -- it has to be sized for the
-# fastest rate it will actually see up front.
-STREAM_BUFFER_COUNT_TARGET = 500
+# frames. Sized in SECONDS rather than a fixed frame count, and multiplied
+# against the camera's max achievable fps (see _configure_stream_buffers),
+# not self.target_frame_rate -- StreamBufferCountManual is only writable
+# before BeginAcquisition(), but the frame rate is normally raised well
+# after that (GUI spin box calls set_frame_rate() post-connect), so the
+# buffer can't be re-sized to match whatever fps the camera ends up
+# running at. At 1.31 MB/frame (1280x1024 Mono8) and 100 fps, 5s is ~500
+# buffers / ~655 MB of RAM.
+STREAM_BUFFER_SECONDS_TARGET = 5.0
 
 
 @dataclass
@@ -456,7 +456,6 @@ class CameraController:
         cam.BeginAcquisition(), same constraint as _enable_chunk_data().
         """
         self._enable_chunk_data()
-        self._configure_stream_buffers()
 
         nodemap = self.cam.GetNodeMap()
         acq_mode = PySpin.CEnumerationPtr(nodemap.GetNode("AcquisitionMode"))
@@ -467,6 +466,17 @@ class CameraController:
         if PySpin.IsWritable(frame_rate_enable):
             frame_rate_enable.SetValue(True)
         frame_rate = PySpin.CFloatPtr(nodemap.GetNode("AcquisitionFrameRate"))
+
+        # Must run before frame_rate.SetValue() below: it sizes the buffer
+        # pool off the camera's max achievable fps (frame_rate.GetMax()),
+        # not self.target_frame_rate -- the GUI's fps spin box normally
+        # raises the rate well after this point via set_frame_rate(), which
+        # only touches AcquisitionFrameRate and can't resize buffers live
+        # once BeginAcquisition() has run. Sizing off the ceiling up front
+        # means the buffer is correct no matter what fps gets dialed in
+        # later, instead of silently assuming the 30fps default.
+        self._configure_stream_buffers(frame_rate)
+
         if PySpin.IsWritable(frame_rate):
             lo, hi = float(frame_rate.GetMin()), float(frame_rate.GetMax())
             target = min(hi, max(lo, float(self.target_frame_rate)))
@@ -478,14 +488,23 @@ class CameraController:
             self.target_frame_rate = actual
             self.recording_fps = actual
 
-    def _configure_stream_buffers(self) -> None:
-        """Deepen the transport-layer buffer pool (see STREAM_BUFFER_COUNT_TARGET).
+    def _configure_stream_buffers(self, frame_rate_node=None) -> None:
+        """Deepen the transport-layer buffer pool (see STREAM_BUFFER_SECONDS_TARGET).
 
         TLStream nodes (StreamBufferCountMode/StreamBufferCountManual) are
         accessed via GetTLStreamNodeMap(), a separate nodemap from the
         regular GenICam one used everywhere else in this file.
+
+        `frame_rate_node` is the (already-fetched) AcquisitionFrameRate node
+        from the regular nodemap, used to read the camera's max achievable
+        fps so the buffer is sized for the fastest rate it could ever run
+        at, not whatever self.target_frame_rate happens to be right now.
         """
         try:
+            max_fps = float(self.target_frame_rate)
+            if frame_rate_node is not None and PySpin.IsReadable(frame_rate_node):
+                max_fps = max(max_fps, float(frame_rate_node.GetMax()))
+
             tl_nodemap = self.cam.GetTLStreamNodeMap()
             mode = PySpin.CEnumerationPtr(tl_nodemap.GetNode("StreamBufferCountMode"))
             if PySpin.IsWritable(mode):
@@ -495,12 +514,14 @@ class CameraController:
             count = PySpin.CIntegerPtr(tl_nodemap.GetNode("StreamBufferCountManual"))
             if PySpin.IsWritable(count):
                 buffer_max = int(count.GetMax())
-                target = min(buffer_max, STREAM_BUFFER_COUNT_TARGET)
+                requested = round(max_fps * STREAM_BUFFER_SECONDS_TARGET)
+                target = min(buffer_max, requested)
                 count.SetValue(target)
                 applied = int(count.GetValue()) if PySpin.IsReadable(count) else target
                 print(
                     f"[camera] stream buffer count: applied={applied} "
-                    f"requested={STREAM_BUFFER_COUNT_TARGET} max={buffer_max}"
+                    f"requested={requested} max={buffer_max} "
+                    f"(sized for {max_fps:.1f} fps x {STREAM_BUFFER_SECONDS_TARGET:.0f}s)"
                 )
         except Exception as exc:
             print(f"[camera] could not configure stream buffer count: {exc}")
