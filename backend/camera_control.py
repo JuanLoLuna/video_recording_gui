@@ -1445,28 +1445,63 @@ class CameraController:
             return float(self.target_frame_rate)
         return limits[2]
 
+    def get_device_link_throughput_limit(self) -> tuple[int, int] | None:
+        """Return (current, max) DeviceLinkThroughputLimit in bytes/sec, or
+        None if the camera doesn't expose it.
+
+        This caps the sustained data rate independent of AcquisitionFrameRate
+        -- a GigE/USB3 Vision camera can accept and read back a fixed fps
+        setting (e.g. 100) while still silently throttling actual delivery
+        to whatever this limit allows, with no error surfaced anywhere.
+        """
+        if self.cam is None or not self.acquiring or self._recovering.is_set():
+            return None
+        with self._camera_lock:
+            if self.cam is None:
+                return None
+            try:
+                nodemap = self.cam.GetNodeMap()
+                node = PySpin.CIntegerPtr(nodemap.GetNode("DeviceLinkThroughputLimit"))
+                if node is None or not PySpin.IsReadable(node):
+                    return None
+                return int(node.GetValue()), int(node.GetMax())
+            except Exception:
+                return None
+        return None
+
     def get_diagnostics_camera_state(self) -> dict[str, float | None]:
-        """Exposure/gain/frame-rate-ceiling gauges for the diagnostics CSV.
+        """Exposure/gain/frame-rate/throughput gauges for the diagnostics CSV.
 
         Nothing here writes to the camera -- this is read-only, so it's
         safe to poll once a second regardless of whether ExposureAuto/
-        GainAuto are enabled. The point is to catch AcquisitionFrameRate's
-        achievable ceiling (limits[1], "GetMax()") sagging below the
-        requested rate as auto-exposure/auto-gain drift upward over a
-        recording -- the camera can't outrun 1 / ExposureTime, and neither
-        control is ever set by this app (see gui/main.py's Gain/Gamma/
-        BlackLevel-only controls), so whatever the driver defaults to
-        (typically ExposureAuto=Continuous) governs unchecked.
+        GainAuto are enabled. The point is to catch two independent ways
+        the camera can silently fall short of the requested fps:
+        AcquisitionFrameRate's achievable ceiling (limits[1], "GetMax()")
+        sagging below the requested rate as auto-exposure/auto-gain drift
+        exposure upward over a recording (the camera can't outrun
+        1 / ExposureTime, and neither control is ever set by this app --
+        see gui/main.py's Gain/Gamma/BlackLevel-only controls, so whatever
+        the driver defaults to governs unchecked); and
+        DeviceLinkThroughputLimit capping actual delivery independent of
+        AcquisitionFrameRate, which can read back the full requested value
+        while still being throttled underneath.
         """
         frame_rate_limits = self.get_frame_rate_limits()
         exposure_limits = self.get_image_param_limits("ExposureTime")
         gain_limits = self.get_image_param_limits("Gain")
+        throughput_limit = self.get_device_link_throughput_limit()
         return {
+            "acquisition_frame_rate_fps": (
+                None if frame_rate_limits is None else frame_rate_limits[2]
+            ),
             "frame_rate_ceiling_fps": (
                 None if frame_rate_limits is None else frame_rate_limits[1]
             ),
             "exposure_time_us": None if exposure_limits is None else exposure_limits[2],
             "gain_db": None if gain_limits is None else gain_limits[2],
+            "device_link_throughput_limit_bps": (
+                None if throughput_limit is None else throughput_limit[0]
+            ),
         }
 
     def set_frame_rate(self, value: float) -> bool:

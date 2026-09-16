@@ -32,8 +32,10 @@ DIAGNOSTIC_FIELDS = [
     "audio_reconnects",
     "audio_silence_frames_inserted",
     "exposure_time_us",
+    "acquisition_frame_rate_fps",
     "frame_rate_ceiling_fps",
     "gain_db",
+    "device_link_throughput_limit_bps",
 ]
 
 
@@ -163,8 +165,15 @@ class PreviewDiagnosticsAccumulator:
             # the requested rate as ExposureAuto/GainAuto drift exposure_time_us
             # / gain_db upward over the course of a recording.
             "exposure_time_us": _rounded(camera_state.get("exposure_time_us")),
+            "acquisition_frame_rate_fps": _rounded(
+                camera_state.get("acquisition_frame_rate_fps")
+            ),
             "frame_rate_ceiling_fps": _rounded(camera_state.get("frame_rate_ceiling_fps")),
             "gain_db": _rounded(camera_state.get("gain_db")),
+            "device_link_throughput_limit_bps": (
+                "" if camera_state.get("device_link_throughput_limit_bps") is None
+                else int(camera_state["device_link_throughput_limit_bps"])
+            ),
         }
 
         self._interval_started_at = sampled_at
