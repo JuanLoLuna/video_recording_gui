@@ -35,6 +35,15 @@ from backend.teardown import assess_teardown_readiness
 from backend.timeline import TimelineBaseline, compute_wall_mono_skew_s
 
 
+# Confirmed on the bench: this camera does NOT reliably shrink ExposureTime
+# (or its allowed max) when AcquisitionFrameRate is raised -- exposure sat at
+# 15ms with fps reading 99.96, a combination that can't physically sustain
+# more than ~1/0.015 =~ 66 fps, let alone 100. Nothing enforces the other
+# direction either. So this app clamps ExposureTime itself whenever fps
+# changes, leaving this fraction of the new frame period as headroom for
+# sensor readout (which isn't otherwise visible to us).
+EXPOSURE_FRAME_PERIOD_HEADROOM = 0.9
+
 # Spinnaker's own buffer pool is the decoupling queue between frame arrival
 # and disk writes: deepening it is what makes a rotation-boundary disk
 # stall (up to ~1.6 GB of dirty page cache) survivable without dropping
@@ -487,6 +496,45 @@ class CameraController:
             actual = float(frame_rate.GetValue())
             self.target_frame_rate = actual
             self.recording_fps = actual
+            self._clamp_exposure_to_frame_period(actual)
+
+    def _clamp_exposure_to_frame_period(self, fps: float) -> None:
+        """Cap ExposureTime so it fits the frame period implied by `fps`.
+
+        See EXPOSURE_FRAME_PERIOD_HEADROOM: the camera doesn't reliably do
+        this itself, so whenever the acquisition frame rate changes -- at
+        connect (_configure_camera_nodes) or later via set_frame_rate() --
+        this brings exposure back into a range the sensor can actually
+        sustain, rather than silently capping real throughput while
+        AcquisitionFrameRate reads back whatever was requested.
+
+        Callers already hold _camera_lock (an RLock) or run single-threaded
+        during connect, so this doesn't acquire it itself.
+        """
+        if self.cam is None or fps <= 0:
+            return
+        try:
+            nodemap = self.cam.GetNodeMap()
+            raw_node = nodemap.GetNode("ExposureTime")
+            if raw_node is None:
+                return
+            node = PySpin.CFloatPtr(raw_node)
+            if not PySpin.IsReadable(node) or not PySpin.IsWritable(node):
+                return
+            period_us = 1_000_000.0 / fps
+            safe_max_us = period_us * EXPOSURE_FRAME_PERIOD_HEADROOM
+            current_us = float(node.GetValue())
+            if current_us > safe_max_us:
+                lo = float(node.GetMin())
+                new_value = max(lo, safe_max_us)
+                node.SetValue(new_value)
+                print(
+                    f"[camera] clamped ExposureTime {current_us:.0f}us -> "
+                    f"{new_value:.0f}us to fit {fps:.1f} fps "
+                    f"({period_us:.0f}us period)"
+                )
+        except Exception as exc:
+            print(f"[camera] could not clamp exposure to frame period: {exc}")
 
     def _configure_stream_buffers(self, frame_rate_node=None) -> None:
         """Deepen the transport-layer buffer pool (see STREAM_BUFFER_SECONDS_TARGET).
@@ -1533,6 +1581,7 @@ class CameraController:
                     actual = float(node.GetValue())
                     self.target_frame_rate = actual
                     self.recording_fps = actual
+                    self._clamp_exposure_to_frame_period(actual)
                     return True
             except Exception as exc:
                 print(f"[camera] set_frame_rate: {exc}")

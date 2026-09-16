@@ -1064,6 +1064,10 @@ class MainWindow(QWidget):
         self.frame_rate_hint.setText(
             f"Frame rate set to {actual:.1f} fps (also sets AVI playback speed)."
         )
+        # The backend may have just clamped ExposureTime to fit the new
+        # frame period (see CameraController._clamp_exposure_to_frame_period)
+        # -- refresh the slider so it doesn't show a stale, now-wrong value.
+        self._sync_image_sliders_from_camera()
 
     def _update_frame_rate_widget_enabled(self) -> None:
         """Adjustable only while previewing — locked when idle or recording."""
