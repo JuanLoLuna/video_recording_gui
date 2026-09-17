@@ -69,6 +69,14 @@ from backend.power_keepalive import (
 
 SYNC_WIDTH_RECORD = 0.100  # 100 ms
 
+# Suggested default for the "Compress recordings (MJPEG)" checkbox: fps at
+# or below this defaults it ON. Chosen with ~2x margin over the ~17-20ms/
+# frame MJPEG encode cost profiled on one test machine (33.3ms period at
+# 30fps vs. that ~20ms) -- a starting suggestion, not an enforced limit,
+# since actual encode cost is hardware-dependent (see
+# _apply_compression_default_for_fps / the live append_ms warning).
+COMPRESSION_DEFAULT_MAX_FPS = 30.0
+
 EXPERIMENT_LABELS = {
     "Long Term ADLs": [
         (1, "Pick up coins from purses"),
@@ -335,6 +343,25 @@ class MainWindow(QWidget):
         self.frame_rate_spin.setEnabled(False)
         self.frame_rate_spin.valueChanged.connect(self._on_frame_rate_changed)
         fps_row.addWidget(self.frame_rate_spin)
+        fps_row.addSpacing(20)
+
+        # --- Video compression (MJPEG vs uncompressed) ---
+        # Uncompressed is the safe fallback: MJPEG's JPEG encoding inside
+        # Append() profiled at ~17-20ms/frame on one test machine, enough
+        # by itself to cap throughput well under 100fps there. Defaults to
+        # checked/unchecked based on the current fps (see
+        # _apply_compression_default_for_fps) -- a starting suggestion,
+        # not enforced: _sample_preview_diagnostics warns live (via the
+        # append_ms diagnostic) if it turns out too slow for whatever fps
+        # is actually chosen, regardless of this checkbox's state.
+        # True once the user has clicked the checkbox directly (as opposed
+        # to it being set programmatically by the fps-based default) --
+        # from then on, _apply_compression_default_for_fps leaves it alone.
+        self._compression_manually_set = False
+        self.compression_checkbox = QCheckBox("Compress recordings (MJPEG)")
+        self.compression_checkbox.setEnabled(False)
+        self.compression_checkbox.toggled.connect(self._on_compression_toggled)
+        fps_row.addWidget(self.compression_checkbox)
         fps_row.addStretch(1)
         setup_inner.addLayout(fps_row)
 
@@ -345,23 +372,10 @@ class MainWindow(QWidget):
         self.frame_rate_hint.setStyleSheet("color: #555; font-size: 11px;")
         setup_inner.addWidget(self.frame_rate_hint)
 
-        # --- Video compression (MJPEG vs uncompressed) ---
-        # Uncompressed is the safe default: MJPEG's JPEG encoding inside
-        # Append() profiled at ~17-20ms/frame on one test machine, enough
-        # by itself to cap throughput well under 100fps there. This is an
-        # opt-in for lower frame rates / faster hardware where that cost
-        # fits inside the frame period -- _sample_preview_diagnostics warns
-        # live (via the append_ms diagnostic) if it turns out too slow for
-        # whatever fps ends up chosen.
-        self.compression_checkbox = QCheckBox("Compress recordings (MJPEG)")
-        self.compression_checkbox.setEnabled(False)
-        self.compression_checkbox.toggled.connect(self._on_compression_toggled)
-        setup_inner.addWidget(self.compression_checkbox)
-
         self.compression_hint = QLabel(
-            "Off by default: much smaller files, but the encoding cost can "
-            "cap achievable frame rate on slower hardware. Locked while "
-            "recording."
+            f"Suggested on below ~{COMPRESSION_DEFAULT_MAX_FPS:.0f} fps: much "
+            "smaller files, but the encoding cost can cap achievable frame "
+            "rate on slower hardware. Locked while recording."
         )
         self.compression_hint.setWordWrap(True)
         self.compression_hint.setStyleSheet("color: #555; font-size: 11px;")
@@ -1125,16 +1139,37 @@ class MainWindow(QWidget):
         # frame period (see CameraController._clamp_exposure_to_frame_period)
         # -- refresh the slider so it doesn't show a stale, now-wrong value.
         self._sync_image_sliders_from_camera()
+        self._apply_compression_default_for_fps(actual)
 
     def _on_compression_toggled(self, checked: bool) -> None:
         if not self.compression_checkbox.isEnabled():
             return
+        # Only reached for a genuine click -- programmatic changes elsewhere
+        # always go through blockSignals(). From here on the user's choice
+        # sticks; the fps-based default stops touching this checkbox.
+        self._compression_manually_set = True
         if not self.camera.set_compression_enabled(checked):
             # Refused (recording started between the click and here) --
             # put the checkbox back without re-entering this handler.
             self.compression_checkbox.blockSignals(True)
             self.compression_checkbox.setChecked(not checked)
             self.compression_checkbox.blockSignals(False)
+
+    def _apply_compression_default_for_fps(self, fps: float) -> None:
+        """Suggest compression on/off based on fps -- a starting point
+        only. Once the user has touched the checkbox directly this
+        session, their choice sticks and this stops overriding it.
+        """
+        if self._compression_manually_set:
+            return
+        desired = fps <= COMPRESSION_DEFAULT_MAX_FPS
+        if self.compression_checkbox.isChecked() == desired:
+            return
+        if not self.camera.set_compression_enabled(desired):
+            return
+        self.compression_checkbox.blockSignals(True)
+        self.compression_checkbox.setChecked(desired)
+        self.compression_checkbox.blockSignals(False)
 
     def _update_frame_rate_widget_enabled(self) -> None:
         """Adjustable only while previewing — locked when idle or recording."""
@@ -1439,12 +1474,13 @@ class MainWindow(QWidget):
             self.preview_button.setText("Stop Preview")
             self.state = AppState.PREVIEWING
             self._apply_state()
-            self.compression_checkbox.blockSignals(True)
-            self.compression_checkbox.setChecked(self.camera.get_compression_enabled())
-            self.compression_checkbox.blockSignals(False)
+            # Fresh session: let the fps-based default pick the checkbox
+            # again rather than carrying over a manual choice from before.
+            self._compression_manually_set = False
             self._sync_auto_mode_combos_from_camera()
             self._sync_image_sliders_from_camera()
             self._sync_frame_rate_from_camera()
+            self._apply_compression_default_for_fps(self.camera.get_acquisition_frame_rate())
 
 
         else:
