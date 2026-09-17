@@ -37,11 +37,15 @@ class AssessDiskTests(unittest.TestCase):
         self.assertFalse(verdict.recording_blocked)
         self.assertTrue(verdict.requires_confirmation)
 
-    def test_below_critical_hours_is_blocked(self):
+    def test_below_critical_hours_requires_confirmation_but_does_not_block(self):
+        # A rate-based projection is a judgment call, not a fact about the
+        # disk right now (bytes_per_hour is an estimate) -- confirmable,
+        # not a hard block. Only the absolute min_free_bytes floor blocks.
         hours_3 = DEFAULT_BYTES_PER_HOUR * 3 / 1024**3
         verdict = assess_disk(make_sample(hours_3))
         self.assertEqual(verdict.level, "danger")
-        self.assertTrue(verdict.recording_blocked)
+        self.assertFalse(verdict.recording_blocked)
+        self.assertTrue(verdict.requires_confirmation)
 
     def test_min_free_bytes_floor_dominates_even_with_high_hours_remaining(self):
         # Tiny bytes_per_hour makes hours_remaining huge, but min_free_bytes

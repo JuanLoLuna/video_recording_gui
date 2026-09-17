@@ -884,12 +884,16 @@ class MainWindow(QWidget):
             if not bypass_confirmation:
                 QMessageBox.warning(self, "Recording blocked by disk space", verdict.reason)
             return False
-        if verdict.level == "warning" and verdict.requires_confirmation:
+        if verdict.requires_confirmation:
             if bypass_confirmation:
                 return True
+            title = (
+                "Low disk space warning" if verdict.level == "warning"
+                else "Disk space may not be enough"
+            )
             choice = QMessageBox.question(
                 self,
-                "Low disk space warning",
+                title,
                 f"{verdict.reason}\n\nStart recording anyway?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,

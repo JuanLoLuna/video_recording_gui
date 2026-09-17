@@ -78,18 +78,40 @@ def assess_disk(
         sample.free_bytes / bytes_per_hour if bytes_per_hour > 0 else float("inf")
     )
 
-    if sample.free_bytes <= min_free_bytes or hours_remaining <= critical_hours:
+    # Absolute floor, independent of bytes_per_hour: the disk is genuinely
+    # almost full right now. This is the actual "Append() started raising
+    # and the app kept recording nothing" case from the module docstring,
+    # so it stays a hard block.
+    if sample.free_bytes <= min_free_bytes:
+        return DiskVerdict(
+            level="danger",
+            free_bytes=sample.free_bytes,
+            hours_remaining=hours_remaining,
+            reason=(
+                f"Only {free_gib:.1f} GiB free. Free up space or point the "
+                "output directory at a larger volume before starting."
+            ),
+            recording_blocked=True,
+            requires_confirmation=False,
+        )
+
+    # Rate-based projection: a judgment call about whether THIS session is
+    # likely to outrun free space, not a fact about the disk right now --
+    # bytes_per_hour is an estimate (and can be badly wrong for a short,
+    # deliberate test recording, or after a codec change shifts the real
+    # rate), so this asks rather than blocks.
+    if hours_remaining <= critical_hours:
         return DiskVerdict(
             level="danger",
             free_bytes=sample.free_bytes,
             hours_remaining=hours_remaining,
             reason=(
                 f"Only {free_gib:.1f} GiB free (~{hours_remaining:.1f} h at the "
-                "measured recording rate). Free up space or point the output "
-                "directory at a larger volume before starting."
+                "measured recording rate). This may not be enough for the "
+                "planned session."
             ),
-            recording_blocked=True,
-            requires_confirmation=False,
+            recording_blocked=False,
+            requires_confirmation=True,
         )
 
     if hours_remaining <= warn_hours:
