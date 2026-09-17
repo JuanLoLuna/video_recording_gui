@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass, replace as dataclass_replace
 from pathlib import Path
 
+import cv2
 import numpy as np
 import PySpin
 
@@ -23,7 +24,6 @@ from backend.timeline_break import (
 from backend.recording_paths import SessionPaths
 from backend.segment_policy import (
     BYTES_SAMPLE_INTERVAL_FRAMES,
-    DEFAULT_SDK_MAX_FILE_SIZE_MB,
     reconcile_part_files,
     resolve_segment_seconds,
     segment_frames_for,
@@ -62,7 +62,7 @@ STREAM_BUFFER_SECONDS_TARGET = 5.0
 class _CloserJob:
     """One segment handed from the acquisition thread to the closer thread."""
 
-    writer: object  # PySpin.SpinVideo
+    writer: object  # cv2.VideoWriter
     part_base: Path
     final_path: Path
     segment_index: int
@@ -73,11 +73,16 @@ class _CloserJob:
 class _AppendJob:
     """One frame handed from the acquisition thread to the append thread.
 
-    Ownership of `image` transfers with the job: the acquisition thread
-    must not touch it again after enqueueing (see the acquisition loop's
-    "Preview: store latest frame" section, which runs BEFORE handoff for
-    exactly this reason), and the append thread is responsible for
-    Release()ing it once Append() is done, success or failure.
+    `frame_array` is the same already-copied numpy array built for the
+    preview path (see the acquisition loop's "Preview: store latest
+    frame" section) -- reused rather than copied twice. It's safe to
+    share across threads: nothing mutates it after creation, both the
+    GUI (via _latest_frame) and the append thread only ever read it. This
+    also means the acquisition thread Release()s the PySpin image
+    immediately after that conversion, regardless of recording state --
+    unlike the SpinVideo-based version of this job, it no longer needs to
+    hold the native image buffer open until the append thread is done
+    with it.
 
     sync_this_frame/sync_label/label_event/adl_id/adl_label/
     captured_wall_s/captured_mono_s are captured at grab time, not append
@@ -85,7 +90,7 @@ class _AppendJob:
     with however far behind the append queue is.
     """
 
-    image: object  # PySpin.ImagePtr
+    frame_array: np.ndarray
     frame_id: int | None
     timestamp_us: int | None
     sync_this_frame: bool
@@ -165,18 +170,26 @@ class CameraController:
       - Connecting to first camera
       - Running an acquisition loop in a background thread
       - Providing latest frame for preview
-      - Recording to AVI via SpinVideo (uncompressed AVIOption)
+      - Recording to AVI via cv2.VideoWriter (uncompressed grayscale by
+        default; MJPEG opt-in -- see _use_compression)
       - Logging per-recorded-frame metadata to CSV
+
+    Recording was PySpin's SpinVideo until profiling showed its Append()
+    costing a ~fixed ~18ms/frame regardless of codec or actual disk speed
+    (independently measured at well under 4ms even with a forced fsync,
+    via scripts/disk_write_latency_probe.py) -- overhead internal to
+    SpinVideo itself. scripts/cv2_videowriter_latency_probe.py found
+    cv2.VideoWriter's uncompressed grayscale codec writing the same real
+    frame size in ~2ms.
 
     Open() runs on whichever thread opens that particular segment: the
     acquisition thread for the first segment of a session (start_recording),
-    the append thread for every one after (_maybe_rotate_segment). Append()
-    and Close() are both handed off to their own dedicated threads
-    (_append_queue/_append_thread, _closer_queue/_closer_thread) because
-    each profiled/observed as slow enough to risk dropping frames if run
-    inline -- Append() at a ~fixed ~18ms/frame regardless of codec,
-    consistent with a per-call disk sync cost rather than genuine
-    CPU/bandwidth work.
+    the append thread for every one after (_maybe_rotate_segment).
+    write() and release() are both still handed off to their own
+    dedicated threads (_append_queue/_append_thread,
+    _closer_queue/_closer_thread) -- write() is now fast, but keeping it
+    off the acquisition thread means an occasional slow frame (a disk
+    hiccup, or MJPEG mode) still can't block the next grab.
     """
 
     def __init__(self):
@@ -302,7 +315,7 @@ class CameraController:
         }
 
         # Recording state/flags (thread-safe)
-        self.recording_active = False          # true while SpinVideo is open
+        self.recording_active = False          # true while the video writer is open
         self.record_start_requested = False    # GUI asks to start
         self.record_stop_requested = False     # GUI asks to stop
 
@@ -778,40 +791,72 @@ class CameraController:
     # _run_append_job/_append_queue)
     # ------------------------------------------------------------------
 
-    def _open_segment_writer(self, segment_index: int):
-        """Open a new SpinVideo writer for segment_index at its part path.
+    def _get_frame_dimensions(self) -> tuple[int, int]:
+        """(width, height) from the camera's GenICam nodes.
 
-        SpinVideo always appends its own "-0000" suffix to whatever base
-        path it's given, so this writes to
-        ".../.incomplete/<basename>_part{NNNN}-0000.avi"; the closer
-        thread renames it to the final "<basename>-{NNNN}.avi" after
-        Close() succeeds.
+        Unlike SpinVideo (which inferred size from the first appended
+        frame), cv2.VideoWriter requires it up front at construction.
+        Locked like every other GenICam accessor in this file, so a
+        concurrent reinit can't tear self.cam down mid-read; raises if
+        the handle isn't available (e.g. mid-reinit) rather than
+        returning a sentinel -- callers (_open_segment_writer, via
+        start_recording/_maybe_rotate_segment) already wrap segment-open
+        failures in try/except the same way.
+        """
+        with self._camera_lock:
+            if self.cam is None:
+                raise RuntimeError("camera not available")
+            nodemap = self.cam.GetNodeMap()
+            width_node = PySpin.CIntegerPtr(nodemap.GetNode("Width"))
+            height_node = PySpin.CIntegerPtr(nodemap.GetNode("Height"))
+            return int(width_node.GetValue()), int(height_node.GetValue())
+
+    def _open_segment_writer(self, segment_index: int):
+        """Open a new cv2.VideoWriter for segment_index at its part path.
+
+        Was PySpin's SpinVideo until profiling showed its Append() costing
+        a ~fixed ~18ms/frame regardless of codec (MJPEG vs uncompressed
+        AVIOption) or actual disk speed (independently measured at well
+        under 4ms even with a forced fsync, via
+        scripts/disk_write_latency_probe.py) -- pointing to overhead
+        internal to SpinVideo itself, not disk I/O or encoding. An
+        SDK-independent probe (scripts/cv2_videowriter_latency_probe.py)
+        found cv2.VideoWriter with an uncompressed grayscale codec
+        ("GREY") writes the same real frame size in ~2.2ms.
+
+        Constructs the "-0000.avi" suffixed path ourselves (SpinVideo used
+        to append that suffix automatically) so the closer thread's
+        rename/reconcile logic keeps working unchanged.
         """
         part_base = self._session_paths.video_part_base(segment_index)
         part_base.parent.mkdir(parents=True, exist_ok=True)
-        writer = PySpin.SpinVideo()
-        # SDK-level net, well above our own max_bytes ceiling -- should
-        # never fire first. reconcile_part_files/the closer thread handle
-        # it gracefully if it ever does.
-        writer.SetMaximumFileSize(DEFAULT_SDK_MAX_FILE_SIZE_MB)
-        # MJPEG's JPEG encoding inside Append() profiled at ~17-20ms/frame
-        # on one test machine -- enough by itself to cap throughput at
-        # ~55fps there, confirmed independent of camera/exposure/buffer
-        # settings (the sensor produced frames at ~100fps in one test,
-        # measured via camera_frame_id, while append-bound delivery still
-        # held at ~50fps). Uncompressed (AVIOption) removes that cost, at
-        # the price of far larger files and segments hitting
-        # DEFAULT_MAX_BYTES/rolling over much sooner than the 900s target
-        # segment_policy.py assumes -- expected, not a bug. _use_compression
-        # lets the GUI opt back into MJPEG when the chosen fps leaves
-        # enough slack in the frame period for encoding on THIS machine.
+        part_path = part_base.with_name(part_base.name + "-0000.avi")
+        width, height = self._get_frame_dimensions()
+        # MJPEG profiled at ~21-22ms/frame through cv2.VideoWriter too (see
+        # cv2_videowriter_latency_probe.py) -- still too slow for 100fps,
+        # but a legitimate opt-in at lower frame rates (_use_compression)
+        # for much smaller files. "GREY" (uncompressed grayscale) is the
+        # fast default.
+        #
+        # isColor mirrors exactly what that probe verified actually opens
+        # on the one system tested: grayscale ("GREY", isColor=False)
+        # worked, but the grayscale attempt at a genuinely uncompressed
+        # tag ("DIB ") failed to open -- MJPG was only confirmed in color
+        # mode there, never as isColor=False, so this doesn't assume that
+        # untested combination also works. _run_append_job converts the
+        # grayscale frame to BGR before write() when this is True.
         if self._use_compression:
-            opt = PySpin.MJPGOption()
-            opt.quality = 75
+            fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+            is_color = True
         else:
-            opt = PySpin.AVIOption()
-        opt.frameRate = self.recording_fps
-        writer.Open(str(part_base), opt)
+            fourcc = cv2.VideoWriter_fourcc(*"GREY")
+            is_color = False
+        writer = cv2.VideoWriter(
+            str(part_path), fourcc, self.recording_fps, (width, height), isColor=is_color
+        )
+        if not writer.isOpened():
+            writer.release()
+            raise RuntimeError(f"cv2.VideoWriter could not open {part_path}")
         return writer
 
     def _maybe_rotate_segment(self) -> None:
@@ -953,7 +998,7 @@ class CameraController:
     def _run_closer_job(self, job: "_CloserJob") -> None:
         start = time.monotonic()
         try:
-            job.writer.Close()
+            job.writer.release()
         except Exception as exc:
             print(f"[camera] error closing segment {job.segment_index}: {exc}")
         close_duration_s = time.monotonic() - start
@@ -1017,22 +1062,41 @@ class CameraController:
                 self._append_queue.task_done()
 
     def _run_append_job(self, job: "_AppendJob") -> None:
-        """Append thread only. Append() + the bookkeeping/rotation that's
+        """Append thread only. write() + the bookkeeping/rotation that's
         contingent on it succeeding -- owns frame_counter, avi_recorder,
         and all _segment_*/_pending_writer* state from here on (see
         _append_queue's comment in __init__).
 
-        Mirrors the acquisition thread's old inline version exactly,
-        except: Release() happens here instead of at the end of the
-        acquisition loop (this thread now owns `job.image`), and the
-        capture-time values (frame_id/timestamp_us/sync_*/label_*/
+        Capture-time values (frame_id/timestamp_us/sync_*/label_*/
         captured_wall_s/captured_mono_s) come from the job instead of
         being read fresh -- they describe when the frame was captured,
-        not whenever this thread got around to it.
+        not whenever this thread got around to it. Unlike the SpinVideo
+        version of this method, there's no image to Release() here --
+        job.frame_array is a plain numpy array the acquisition thread
+        already released the native PySpin buffer for.
+
+        Caveat carried over from cv2.VideoWriter itself: write() doesn't
+        reliably raise on failure the way SpinVideo's Append() did (e.g.
+        a full disk may fail silently rather than throwing) -- the
+        try/except here still catches whatever it can, but append_failures
+        is not a complete backstop the way it was before.
         """
+        # append_ms below deliberately starts timing before the color
+        # conversion, not just write(): under MJPEG this conversion is a
+        # real, necessary part of getting the frame into the file, and the
+        # live append_ms-based compression warning (gui/main.py) needs the
+        # honest total cost to judge whether it fits the frame period.
+        #
+        # _use_compression can't change mid-recording (set_compression_enabled
+        # refuses while recording_active), so it's safe to read here without
+        # extra synchronization -- matches whichever isColor the writer now
+        # open was actually opened with (see _open_segment_writer).
         t_append_start = time.monotonic()
+        frame = job.frame_array
+        if self._use_compression:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         try:
-            self.avi_recorder.Append(job.image)
+            self.avi_recorder.write(frame)
         except Exception as exc:
             print("Error appending frame:", exc)
             with self._acquisition_stats_lock:
@@ -1040,13 +1104,11 @@ class CameraController:
             self._record_loop_timing(
                 "append_ms", (time.monotonic() - t_append_start) * 1000.0
             )
-            job.image.Release()
             return
 
         self._record_loop_timing(
             "append_ms", (time.monotonic() - t_append_start) * 1000.0
         )
-        job.image.Release()
 
         self.frame_counter += 1
         self._frames_in_segment += 1
@@ -1092,7 +1154,7 @@ class CameraController:
     def start_recording(self, session_paths: SessionPaths, fps: float = 30.0):
         """
         Request recording to start. The acquisition thread will
-        actually open SpinVideo and begin appending frames.
+        actually open the video writer and begin appending frames.
 
         Returns:
             (ok: bool, message: str)
@@ -1177,7 +1239,7 @@ class CameraController:
     def stop_recording(self):
         """
         Request recording to stop. The acquisition thread will
-        close SpinVideo and write CSV.
+        close the video writer and write CSV.
         """
         if not self.recording_active and not self.record_start_requested:
             return
@@ -1196,7 +1258,7 @@ class CameraController:
         # would silently end the loop and never resume.
         while not self._stop_event.is_set() and self.acquiring:
             # --------------------------------------------------
-            # START recording (open SpinVideo) if requested
+            # START recording (open the video writer) if requested
             # --------------------------------------------------
             if self.record_start_requested and not self.recording_active:
                 try:
@@ -1210,7 +1272,7 @@ class CameraController:
                     self.record_start_requested = False
 
             # --------------------------------------------------
-            # STOP recording (close SpinVideo + write CSV) if requested
+            # STOP recording (close the video writer + write CSV) if requested
             # --------------------------------------------------
             if self.record_stop_requested and self.recording_active:
                 # Every already-queued frame (and any rotation it triggers)
@@ -1235,7 +1297,7 @@ class CameraController:
                 # Discard any pre-armed next writer -- it will never be used.
                 if self._pending_writer is not None:
                     try:
-                        self._pending_writer.Close()
+                        self._pending_writer.release()
                     except Exception:
                         pass
                     try:
@@ -1372,10 +1434,10 @@ class CameraController:
             # --------------------------------------------------
             # Preview: store latest frame
             # --------------------------------------------------
-            # Moved ahead of the recording block below: once recording,
-            # this thread hands `image` off to the append thread and must
-            # not touch it again afterward (see _AppendJob), so every read
-            # of `image` this loop iteration needs has to happen first.
+            # arr, once built, is reused below as the append job's
+            # payload too (see _AppendJob) instead of converting twice --
+            # safe to share since nothing mutates it after this point.
+            arr = None
             try:
                 t_ndarray_start = time.monotonic()
                 arr = image.GetNDArray()
@@ -1398,18 +1460,25 @@ class CameraController:
                     self._latest_frame = arr
                     self._latest_preview_frame = preview_frame
             except Exception:
-                pass
+                arr = None
+
+            # Unlike the SpinVideo version of this loop, `image` is never
+            # handed to another thread -- release it here, unconditionally,
+            # now that every read of it (chunk data above, GetNDArray here)
+            # is done.
+            image.Release()
 
             # --------------------------------------------------
             # If recording, hand the frame off to the append thread
             # --------------------------------------------------
-            # Append() profiled at a ~fixed ~18ms/frame regardless of
-            # codec (uncompressed vs MJPEG) -- see append_ms in the
-            # diagnostics CSV -- consistent with a per-call disk sync
-            # cost rather than genuine CPU/bandwidth work. Handing it to
-            # a dedicated thread lets this thread grab the NEXT frame
-            # immediately instead of blocking on that cost every frame.
-            if self.recording_active and self.avi_recorder is not None:
+            # write() profiled at ~2ms/frame for cv2.VideoWriter's
+            # uncompressed grayscale codec vs. SpinVideo's Append() at a
+            # ~fixed ~18ms/frame regardless of codec -- see
+            # scripts/cv2_videowriter_latency_probe.py. Still handed to a
+            # dedicated thread (rather than called inline) so a slow
+            # frame (disk hiccup, MJPEG mode) can never block the next
+            # grab.
+            if arr is not None and self.recording_active and self.avi_recorder is not None:
                 now = time.time()
                 with self._sync_lock:
                     sync_this_frame = now <= self._sync_window_end
@@ -1432,7 +1501,7 @@ class CameraController:
                 # with however far behind the append thread's queue is.
                 self._append_queue.put(
                     _AppendJob(
-                        image=image,
+                        frame_array=arr,
                         frame_id=frame_id,
                         timestamp_us=timestamp_us,
                         sync_this_frame=sync_this_frame,
@@ -1444,10 +1513,6 @@ class CameraController:
                         captured_mono_s=time.perf_counter(),
                     )
                 )
-                # Ownership of `image` (including Release()) transfers to
-                # the append thread -- see _run_append_job.
-            else:
-                image.Release()
 
     # ------------------------------------------------------------------
     # Preview API for Qt

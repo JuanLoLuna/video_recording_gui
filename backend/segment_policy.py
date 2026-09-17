@@ -1,8 +1,7 @@
 """When to roll video recording to a new segment file.
 
 Naming lives in backend/recording_paths.py (SessionPaths); this module
-only decides WHEN to roll and reconciles the rare case where Spinnaker's
-own SetMaximumFileSize net fires mid-segment.
+only decides WHEN to roll.
 
 Three ceilings, defence in depth:
   - max_frames (primary): frame count, not wall clock -- over a 10-day
@@ -14,9 +13,13 @@ Three ceilings, defence in depth:
   - fault: an external signal (the acquisition watchdog's timeline break)
     forces an immediate roll regardless of frame/byte counts, so a
     wall-clock hole always lands between segments, never inside one.
-  - SpinVideo's own SetMaximumFileSize is set as a hard SDK-level net
-    below both of the above and should never fire; reconcile_part_files
-    handles it gracefully if it ever does.
+
+reconcile_part_files() remains as a generic defensive scan for
+unexpectedly-numbered part files under a segment's base path. It dates
+back to when SpinVideo's own SetMaximumFileSize was set as a hard
+SDK-level net below the above (now moot -- recording uses
+cv2.VideoWriter, which has no equivalent), but costs nothing to keep:
+normally it just confirms exactly one part file exists.
 """
 
 from __future__ import annotations
@@ -30,7 +33,6 @@ from typing import Callable, Mapping, Sequence
 
 DEFAULT_SEGMENT_SECONDS = 900.0  # 15 minutes
 DEFAULT_MAX_BYTES = 3_000_000_000  # ~2.6x headroom under the 4 GiB RIFF ceiling
-DEFAULT_SDK_MAX_FILE_SIZE_MB = 3584  # SetMaximumFileSize() argument -- the SDK-level net
 BYTES_SAMPLE_INTERVAL_FRAMES = 300
 PREPARE_LEAD_FRAMES = 60  # pre-open the next writer this many frames before the roll
 

@@ -70,10 +70,10 @@ from backend.power_keepalive import (
 SYNC_WIDTH_RECORD = 0.100  # 100 ms
 
 # Suggested default for the "Compress recordings (MJPEG)" checkbox: fps at
-# or below this defaults it ON. Chosen with ~2x margin over the ~17-20ms/
-# frame MJPEG encode cost profiled on one test machine (33.3ms period at
-# 30fps vs. that ~20ms) -- a starting suggestion, not an enforced limit,
-# since actual encode cost is hardware-dependent (see
+# or below this defaults it ON. Chosen with margin over the ~21-22ms/frame
+# MJPEG cost profiled for cv2.VideoWriter's MJPG codec on one test machine
+# (33.3ms period at 30fps vs. that ~22ms) -- a starting suggestion, not an
+# enforced limit, since actual cost is hardware-dependent (see
 # _apply_compression_default_for_fps / the live append_ms warning).
 COMPRESSION_DEFAULT_MAX_FPS = 30.0
 
@@ -346,9 +346,10 @@ class MainWindow(QWidget):
         fps_row.addSpacing(20)
 
         # --- Video compression (MJPEG vs uncompressed) ---
-        # Uncompressed is the safe fallback: MJPEG's JPEG encoding inside
-        # Append() profiled at ~17-20ms/frame on one test machine, enough
-        # by itself to cap throughput well under 100fps there. Defaults to
+        # Uncompressed is the safe fallback: MJPEG's encoding cost
+        # profiled at ~21-22ms/frame on one test machine (cv2.VideoWriter's
+        # MJPG codec), enough by itself to cap throughput well under
+        # 100fps there. Defaults to
         # checked/unchecked based on the current fps (see
         # _apply_compression_default_for_fps) -- a starting suggestion,
         # not enforced: _sample_preview_diagnostics warns live (via the
