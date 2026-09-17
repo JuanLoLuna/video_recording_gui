@@ -89,6 +89,12 @@ def probe_codec(out_dir: str, fourcc_str: str, label: str, is_color: bool) -> No
     if not writer.isOpened():
         print(f"{label:55s} -- could not open (codec unavailable on this system)")
         writer.release()
+        # cv2 can leave a 0-byte file behind even when isOpened() is
+        # False -- don't leave that sitting in the (real) output dir.
+        try:
+            os.remove(path)
+        except OSError:
+            pass
         return
 
     latencies_ms = []
