@@ -262,6 +262,15 @@ class CameraController:
         self.record_stop_requested = False     # GUI asks to stop
 
         self.avi_recorder = None
+        # MJPEG trades smaller files for an encode cost inside Append() that
+        # profiling measured at ~17-20ms/frame on one test machine -- enough
+        # to cap throughput well under 100fps there, but likely fine at
+        # lower frame rates (more slack in the frame period) or on faster
+        # hardware. Left False (uncompressed) by default since it's the
+        # only choice verified not to cap the recording rate; the GUI lets
+        # this be turned on deliberately, with a live append_ms-based
+        # warning if it turns out too slow for the chosen fps.
+        self._use_compression = False
         self.recording_fps = 30.0
         # Target acquisition frame rate (fps). Applied in start(); can be changed
         # live via set_frame_rate(). recording_fps follows it so AVI playback
@@ -730,17 +739,22 @@ class CameraController:
         # never fire first. reconcile_part_files/the closer thread handle
         # it gracefully if it ever does.
         writer.SetMaximumFileSize(DEFAULT_SDK_MAX_FILE_SIZE_MB)
-        # Uncompressed, not MJPGOption: profiling showed Append() costing
-        # ~17-20ms/frame with MJPGOption(quality=75), almost entirely CPU
-        # spent JPEG-encoding inside the SDK call -- enough by itself to cap
-        # throughput at ~55fps regardless of camera/exposure/buffer settings
-        # (confirmed: the sensor produced frames at ~100fps in one test,
+        # MJPEG's JPEG encoding inside Append() profiled at ~17-20ms/frame
+        # on one test machine -- enough by itself to cap throughput at
+        # ~55fps there, confirmed independent of camera/exposure/buffer
+        # settings (the sensor produced frames at ~100fps in one test,
         # measured via camera_frame_id, while append-bound delivery still
-        # held at ~50fps). AVIOption drops the encode step entirely.
-        # Trade-off: files are far larger (no compression), so segments will
-        # hit DEFAULT_MAX_BYTES/roll over much sooner than the 900s target
-        # duration segment_policy.py assumes -- expected, not a bug.
-        opt = PySpin.AVIOption()
+        # held at ~50fps). Uncompressed (AVIOption) removes that cost, at
+        # the price of far larger files and segments hitting
+        # DEFAULT_MAX_BYTES/rolling over much sooner than the 900s target
+        # segment_policy.py assumes -- expected, not a bug. _use_compression
+        # lets the GUI opt back into MJPEG when the chosen fps leaves
+        # enough slack in the frame period for encoding on THIS machine.
+        if self._use_compression:
+            opt = PySpin.MJPGOption()
+            opt.quality = 75
+        else:
+            opt = PySpin.AVIOption()
         opt.frameRate = self.recording_fps
         writer.Open(str(part_base), opt)
         return writer
@@ -1607,6 +1621,23 @@ class CameraController:
         if limits is None:
             return float(self.target_frame_rate)
         return limits[2]
+
+    def get_compression_enabled(self) -> bool:
+        return self._use_compression
+
+    def set_compression_enabled(self, enabled: bool) -> bool:
+        """Choose MJPEG vs uncompressed for segment writers opened from now
+        on. Takes effect at the next start_recording() or segment rotation
+        -- an already-open writer keeps whatever codec it was opened with.
+        Refuses while recording_active, same as set_frame_rate: changing
+        the currently-open segment's codec isn't possible, and silently
+        queuing the change for a future segment without the GUI's
+        knowledge would be confusing.
+        """
+        if self.recording_active:
+            return False
+        self._use_compression = bool(enabled)
+        return True
 
     def get_device_link_throughput_limit(self) -> tuple[int, int] | None:
         """Return (current, max) DeviceLinkThroughputLimit in bytes/sec, or

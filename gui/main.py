@@ -345,6 +345,28 @@ class MainWindow(QWidget):
         self.frame_rate_hint.setStyleSheet("color: #555; font-size: 11px;")
         setup_inner.addWidget(self.frame_rate_hint)
 
+        # --- Video compression (MJPEG vs uncompressed) ---
+        # Uncompressed is the safe default: MJPEG's JPEG encoding inside
+        # Append() profiled at ~17-20ms/frame on one test machine, enough
+        # by itself to cap throughput well under 100fps there. This is an
+        # opt-in for lower frame rates / faster hardware where that cost
+        # fits inside the frame period -- _sample_preview_diagnostics warns
+        # live (via the append_ms diagnostic) if it turns out too slow for
+        # whatever fps ends up chosen.
+        self.compression_checkbox = QCheckBox("Compress recordings (MJPEG)")
+        self.compression_checkbox.setEnabled(False)
+        self.compression_checkbox.toggled.connect(self._on_compression_toggled)
+        setup_inner.addWidget(self.compression_checkbox)
+
+        self.compression_hint = QLabel(
+            "Off by default: much smaller files, but the encoding cost can "
+            "cap achievable frame rate on slower hardware. Locked while "
+            "recording."
+        )
+        self.compression_hint.setWordWrap(True)
+        self.compression_hint.setStyleSheet("color: #555; font-size: 11px;")
+        setup_inner.addWidget(self.compression_hint)
+
         # --- Sync / NI-DAQ status ---
         self.sync_label = QLabel("Sync not available — no DAQ connected")
         setup_inner.addWidget(self.sync_label)
@@ -1100,11 +1122,25 @@ class MainWindow(QWidget):
         # -- refresh the slider so it doesn't show a stale, now-wrong value.
         self._sync_image_sliders_from_camera()
 
+    def _on_compression_toggled(self, checked: bool) -> None:
+        if not self.compression_checkbox.isEnabled():
+            return
+        if not self.camera.set_compression_enabled(checked):
+            # Refused (recording started between the click and here) --
+            # put the checkbox back without re-entering this handler.
+            self.compression_checkbox.blockSignals(True)
+            self.compression_checkbox.setChecked(not checked)
+            self.compression_checkbox.blockSignals(False)
+
     def _update_frame_rate_widget_enabled(self) -> None:
         """Adjustable only while previewing — locked when idle or recording."""
         if not hasattr(self, "frame_rate_spin"):
             return
         self.frame_rate_spin.setEnabled(self.state == AppState.PREVIEWING)
+        # Same lock as frame rate: changing codec only makes sense before
+        # the next segment writer opens, not mid-recording.
+        if hasattr(self, "compression_checkbox"):
+            self.compression_checkbox.setEnabled(self.state == AppState.PREVIEWING)
 
     def _update_camera_tuning_widgets_enabled(self) -> None:
         if not self._slider_meta:
@@ -1399,6 +1435,9 @@ class MainWindow(QWidget):
             self.preview_button.setText("Stop Preview")
             self.state = AppState.PREVIEWING
             self._apply_state()
+            self.compression_checkbox.blockSignals(True)
+            self.compression_checkbox.setChecked(self.camera.get_compression_enabled())
+            self.compression_checkbox.blockSignals(False)
             self._sync_auto_mode_combos_from_camera()
             self._sync_image_sliders_from_camera()
             self._sync_frame_rate_from_camera()
@@ -1644,6 +1683,22 @@ class MainWindow(QWidget):
                     f"microphone reconnected after a dropout ({audio_reconnects} time(s))",
                     now_s=now_s,
                 )
+            # MJPEG is opt-in specifically because its encode cost is
+            # hardware-dependent (see set_compression_enabled) -- flag it
+            # live from the real measured cost rather than a guessed fps
+            # threshold, since it can only be confirmed by actually
+            # recording with it.
+            append_p95 = row["append_ms_p95"]
+            if self.camera.get_compression_enabled() and append_p95 != "":
+                period_ms = 1000.0 / max(1.0, self.camera.get_acquisition_frame_rate())
+                if float(append_p95) > period_ms * 0.8:
+                    self._recording_warnings.note_issue(
+                        f"MJPEG encoding is taking ~{float(append_p95):.1f} ms/frame "
+                        f"(p95), close to or above the {period_ms:.1f} ms frame period "
+                        "at this fps -- likely dropping frames. Consider turning off "
+                        "compression for this frame rate.",
+                        now_s=now_s,
+                    )
         self._update_recording_warning_banner()
 
         # "as of HH:MM:SS" is the one thing on this label that only a live
