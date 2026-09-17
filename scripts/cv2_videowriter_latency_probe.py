@@ -62,6 +62,14 @@ CANDIDATES = [
     ("I420", "uncompressed color YUV420 (I420)", True),
     ("HFYU", "Huffyuv color (lossless)", True),
     ("FFV1", "FFV1 color (lossless)", True),
+    # The real source is mono, and today's pipeline converts to BGR
+    # before MJPEG-encoding it (color mode is the only combo verified to
+    # open here previously) -- wasteful if grayscale MJPEG works too:
+    # JPEG natively supports a single-component grayscale image, so this
+    # isn't the same "raw tag mismatch" DIB hit. If this opens, expect
+    # faster encoding (1/3 the pixel data) and smaller files (no wasted
+    # chroma planes) than the color version below.
+    ("MJPG", "MJPEG grayscale (isColor=False) -- untested combo", False),
     ("MJPG", "MJPEG color (for comparison vs SpinVideo's MJPGOption)", True),
 ]
 

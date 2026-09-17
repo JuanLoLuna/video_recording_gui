@@ -329,6 +329,10 @@ class CameraController:
         # this be turned on deliberately, with a live append_ms-based
         # warning if it turns out too slow for the chosen fps.
         self._use_compression = False
+        # cv2.VIDEOWRITER_PROP_QUALITY (0-100); matches PySpin's old
+        # MJPGOption.quality default. Only meaningful while _use_compression
+        # is True -- see _open_segment_writer.
+        self._compression_quality = 75
         self.recording_fps = 30.0
         # Target acquisition frame rate (fps). Applied in start(); can be changed
         # live via set_frame_rate(). recording_fps follows it so AVI playback
@@ -851,13 +855,38 @@ class CameraController:
         else:
             fourcc = cv2.VideoWriter_fourcc(*"GREY")
             is_color = False
-        writer = cv2.VideoWriter(
-            str(part_path), fourcc, self.recording_fps, (width, height), isColor=is_color
-        )
+        writer = self._open_cv2_writer(part_path, fourcc, width, height, is_color)
         if not writer.isOpened():
             writer.release()
             raise RuntimeError(f"cv2.VideoWriter could not open {part_path}")
         return writer
+
+    def _open_cv2_writer(self, path: Path, fourcc: int, width: int, height: int, is_color: bool):
+        """Construct the cv2.VideoWriter, applying _compression_quality via
+        the (fourcc, fps, frameSize, params) overload when compression is
+        on (quality only means anything for a lossy codec like MJPEG).
+        Falls back to the plain isColor-only constructor if that overload
+        isn't supported by this OpenCV build/backend -- quality control is
+        a nice-to-have, not something that should block recording from
+        working at all.
+        """
+        if self._use_compression:
+            try:
+                params = [
+                    cv2.VIDEOWRITER_PROP_IS_COLOR, 1 if is_color else 0,
+                    cv2.VIDEOWRITER_PROP_QUALITY, int(self._compression_quality),
+                ]
+                writer = cv2.VideoWriter(
+                    str(path), fourcc, self.recording_fps, (width, height), params
+                )
+                if writer.isOpened():
+                    return writer
+                writer.release()
+            except Exception as exc:
+                print(f"[camera] quality-aware VideoWriter construction failed, falling back: {exc}")
+        return cv2.VideoWriter(
+            str(path), fourcc, self.recording_fps, (width, height), isColor=is_color
+        )
 
     def _maybe_rotate_segment(self) -> None:
         """Append thread only. Called after each successful Append().
@@ -1823,6 +1852,20 @@ class CameraController:
         if self.recording_active:
             return False
         self._use_compression = bool(enabled)
+        return True
+
+    def get_compression_quality(self) -> int:
+        return self._compression_quality
+
+    def set_compression_quality(self, quality: int) -> bool:
+        """MJPEG quality (0-100, higher = larger/better). Same timing and
+        refusal-while-recording as set_compression_enabled -- it only
+        takes effect on the next segment writer opened, and changing the
+        currently-open one isn't possible.
+        """
+        if self.recording_active:
+            return False
+        self._compression_quality = max(0, min(100, int(quality)))
         return True
 
     def get_device_link_throughput_limit(self) -> tuple[int, int] | None:

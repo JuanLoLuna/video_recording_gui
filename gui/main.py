@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QDoubleSpinBox,
+    QSpinBox,
     QFrame,
     QMessageBox,
     QFileDialog,
@@ -381,6 +382,19 @@ class MainWindow(QWidget):
         self.compression_checkbox.setEnabled(False)
         self.compression_checkbox.toggled.connect(self._on_compression_toggled)
         fps_row.addWidget(self.compression_checkbox)
+
+        # Quality only means anything for MJPEG -- enabled alongside the
+        # checkbox, not independently of it.
+        self.compression_quality_spin = QSpinBox()
+        self.compression_quality_spin.setRange(1, 100)
+        self.compression_quality_spin.setValue(75)
+        self.compression_quality_spin.setSuffix("%")
+        self.compression_quality_spin.setEnabled(False)
+        self.compression_quality_spin.setToolTip(
+            "MJPEG quality -- higher means larger files and less compression artifacting."
+        )
+        self.compression_quality_spin.valueChanged.connect(self._on_compression_quality_changed)
+        fps_row.addWidget(self.compression_quality_spin)
         fps_row.addStretch(1)
         setup_inner.addLayout(fps_row)
 
@@ -1174,6 +1188,17 @@ class MainWindow(QWidget):
             self.compression_checkbox.blockSignals(True)
             self.compression_checkbox.setChecked(not checked)
             self.compression_checkbox.blockSignals(False)
+        self._update_compression_quality_spin_enabled()
+
+    def _on_compression_quality_changed(self, value: int) -> None:
+        if not self.compression_quality_spin.isEnabled():
+            return
+        self.camera.set_compression_quality(value)
+
+    def _update_compression_quality_spin_enabled(self) -> None:
+        self.compression_quality_spin.setEnabled(
+            self.compression_checkbox.isEnabled() and self.compression_checkbox.isChecked()
+        )
 
     def _apply_compression_default_for_fps(self, fps: float) -> None:
         """Suggest compression on/off based on fps -- a starting point
@@ -1181,15 +1206,15 @@ class MainWindow(QWidget):
         session, their choice sticks and this stops overriding it.
         """
         if self._compression_manually_set:
+            self._update_compression_quality_spin_enabled()
             return
         desired = fps <= COMPRESSION_DEFAULT_MAX_FPS
-        if self.compression_checkbox.isChecked() == desired:
-            return
-        if not self.camera.set_compression_enabled(desired):
-            return
-        self.compression_checkbox.blockSignals(True)
-        self.compression_checkbox.setChecked(desired)
-        self.compression_checkbox.blockSignals(False)
+        if self.compression_checkbox.isChecked() != desired:
+            if self.camera.set_compression_enabled(desired):
+                self.compression_checkbox.blockSignals(True)
+                self.compression_checkbox.setChecked(desired)
+                self.compression_checkbox.blockSignals(False)
+        self._update_compression_quality_spin_enabled()
 
     def _apply_exposure_auto_lock_for_fps(self, fps: float) -> None:
         """Force Exposure mode to Off and lock the dropdown at/above
@@ -1227,6 +1252,7 @@ class MainWindow(QWidget):
         # the next segment writer opens, not mid-recording.
         if hasattr(self, "compression_checkbox"):
             self.compression_checkbox.setEnabled(self.state == AppState.PREVIEWING)
+            self._update_compression_quality_spin_enabled()
 
     def _update_camera_tuning_widgets_enabled(self) -> None:
         if not self._slider_meta:
@@ -1527,6 +1553,9 @@ class MainWindow(QWidget):
             # Fresh session: let the fps-based default pick the checkbox
             # again rather than carrying over a manual choice from before.
             self._compression_manually_set = False
+            self.compression_quality_spin.blockSignals(True)
+            self.compression_quality_spin.setValue(self.camera.get_compression_quality())
+            self.compression_quality_spin.blockSignals(False)
             self._sync_auto_mode_combos_from_camera()
             self._sync_image_sliders_from_camera()
             self._sync_frame_rate_from_camera()
