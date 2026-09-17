@@ -77,6 +77,20 @@ SYNC_WIDTH_RECORD = 0.100  # 100 ms
 # _apply_compression_default_for_fps / the live append_ms warning).
 COMPRESSION_DEFAULT_MAX_FPS = 30.0
 
+# fps at or above which "Exposure mode" is force-set to Off and locked
+# (dropdown disabled) rather than left as a free choice. ExposureAuto
+# gives no guarantee of respecting the frame period -- confirmed on the
+# bench: left on Continuous, it converged to ~14.8ms, exceeding the
+# ~10ms period 100fps needs, and our own exposure-clamp
+# (_clamp_exposure_to_frame_period) can only act once ExposureTime is
+# actually writable, i.e. Off. Below this threshold there's enough
+# slack in the frame period that Auto is left as a free user choice, on
+# the same reasoning as COMPRESSION_DEFAULT_MAX_FPS (a starting default
+# there, but a hard lock here -- unlike a slow encode, which only costs
+# fps, a silently-too-long exposure is exactly the failure this app
+# spent a long investigation chasing).
+EXPOSURE_AUTO_LOCK_MIN_FPS = 30.0
+
 EXPERIMENT_LABELS = {
     "Long Term ADLs": [
         (1, "Pick up coins from purses"),
@@ -359,6 +373,10 @@ class MainWindow(QWidget):
         # to it being set programmatically by the fps-based default) --
         # from then on, _apply_compression_default_for_fps leaves it alone.
         self._compression_manually_set = False
+        # True whenever fps >= EXPOSURE_AUTO_LOCK_MIN_FPS -- unlike
+        # _compression_manually_set, there's no user override for this one:
+        # see _apply_exposure_auto_lock_for_fps.
+        self._exposure_auto_locked = False
         self.compression_checkbox = QCheckBox("Compress recordings (MJPEG)")
         self.compression_checkbox.setEnabled(False)
         self.compression_checkbox.toggled.connect(self._on_compression_toggled)
@@ -1141,6 +1159,7 @@ class MainWindow(QWidget):
         # -- refresh the slider so it doesn't show a stale, now-wrong value.
         self._sync_image_sliders_from_camera()
         self._apply_compression_default_for_fps(actual)
+        self._apply_exposure_auto_lock_for_fps(actual)
 
     def _on_compression_toggled(self, checked: bool) -> None:
         if not self.compression_checkbox.isEnabled():
@@ -1172,6 +1191,33 @@ class MainWindow(QWidget):
         self.compression_checkbox.setChecked(desired)
         self.compression_checkbox.blockSignals(False)
 
+    def _apply_exposure_auto_lock_for_fps(self, fps: float) -> None:
+        """Force Exposure mode to Off and lock the dropdown at/above
+        EXPOSURE_AUTO_LOCK_MIN_FPS -- no user override, unlike
+        _apply_compression_default_for_fps. See that constant's comment
+        for why: ExposureAuto gives no guarantee of fitting the frame
+        period, and our own exposure-clamp can't act while it's engaged.
+        """
+        self._exposure_auto_locked = fps >= EXPOSURE_AUTO_LOCK_MIN_FPS
+        auto_meta = self._auto_mode_meta.get("ExposureAuto")
+        if auto_meta is None:
+            return
+        combo = auto_meta["combo"]
+        if self._exposure_auto_locked:
+            combo.setToolTip(
+                f"Locked to Off at {fps:.0f} fps (>= {EXPOSURE_AUTO_LOCK_MIN_FPS:.0f} fps): "
+                "auto exposure isn't guaranteed to fit the frame period."
+            )
+            if combo.count() > 0 and combo.currentText() != "Off":
+                self.camera.set_enum_param("ExposureAuto", "Off")
+                combo.blockSignals(True)
+                combo.setCurrentText("Off")
+                combo.blockSignals(False)
+                self._sync_image_sliders_from_camera()
+        else:
+            combo.setToolTip("")
+        self._update_camera_tuning_widgets_enabled()
+
     def _update_frame_rate_widget_enabled(self) -> None:
         """Adjustable only while previewing — locked when idle or recording."""
         if not hasattr(self, "frame_rate_spin"):
@@ -1189,7 +1235,10 @@ class MainWindow(QWidget):
         if hasattr(self, "camera_tuning_hint"):
             self.camera_tuning_hint.setVisible(not acquiring)
         for node, meta in self._auto_mode_meta.items():
-            meta["combo"].setEnabled(acquiring and meta["combo"].count() > 0)
+            can_enable = acquiring and meta["combo"].count() > 0
+            if node == "ExposureAuto" and self._exposure_auto_locked:
+                can_enable = False
+            meta["combo"].setEnabled(can_enable)
         for node, meta in self._slider_meta.items():
             sl = meta["slider"]
             if not meta.get("supported"):
@@ -1482,6 +1531,7 @@ class MainWindow(QWidget):
             self._sync_image_sliders_from_camera()
             self._sync_frame_rate_from_camera()
             self._apply_compression_default_for_fps(self.camera.get_acquisition_frame_rate())
+            self._apply_exposure_auto_lock_for_fps(self.camera.get_acquisition_frame_rate())
 
 
         else:
