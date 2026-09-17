@@ -836,25 +836,20 @@ class CameraController:
         part_base.parent.mkdir(parents=True, exist_ok=True)
         part_path = part_base.with_name(part_base.name + "-0000.avi")
         width, height = self._get_frame_dimensions()
-        # MJPEG profiled at ~21-22ms/frame through cv2.VideoWriter too (see
-        # cv2_videowriter_latency_probe.py) -- still too slow for 100fps,
-        # but a legitimate opt-in at lower frame rates (_use_compression)
-        # for much smaller files. "GREY" (uncompressed grayscale) is the
-        # fast default.
-        #
-        # isColor mirrors exactly what that probe verified actually opens
-        # on the one system tested: grayscale ("GREY", isColor=False)
-        # worked, but the grayscale attempt at a genuinely uncompressed
-        # tag ("DIB ") failed to open -- MJPG was only confirmed in color
-        # mode there, never as isColor=False, so this doesn't assume that
-        # untested combination also works. _run_append_job converts the
-        # grayscale frame to BGR before write() when this is True.
+        # MJPEG profiled at ~14-15ms/frame through cv2.VideoWriter in
+        # grayscale (isColor=False) -- confirmed to actually open on the
+        # one system tested, and ~34% faster than color mode (~22ms):
+        # unlike the raw "DIB " tag (which failed to open in grayscale),
+        # JPEG natively supports single-component grayscale, so this
+        # isn't the same limitation. Still too slow for 100fps, but a
+        # legitimate opt-in at lower frame rates (_use_compression) for
+        # much smaller files. "GREY" (uncompressed grayscale) is the fast
+        # default.
         if self._use_compression:
             fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-            is_color = True
         else:
             fourcc = cv2.VideoWriter_fourcc(*"GREY")
-            is_color = False
+        is_color = False
         writer = self._open_cv2_writer(part_path, fourcc, width, height, is_color)
         if not writer.isOpened():
             writer.release()
@@ -1110,22 +1105,12 @@ class CameraController:
         try/except here still catches whatever it can, but append_failures
         is not a complete backstop the way it was before.
         """
-        # append_ms below deliberately starts timing before the color
-        # conversion, not just write(): under MJPEG this conversion is a
-        # real, necessary part of getting the frame into the file, and the
-        # live append_ms-based compression warning (gui/main.py) needs the
-        # honest total cost to judge whether it fits the frame period.
-        #
-        # _use_compression can't change mid-recording (set_compression_enabled
-        # refuses while recording_active), so it's safe to read here without
-        # extra synchronization -- matches whichever isColor the writer now
-        # open was actually opened with (see _open_segment_writer).
+        # No color conversion needed: both codecs are opened isColor=False
+        # (see _open_segment_writer) -- MJPEG grayscale was confirmed to
+        # actually open and profiled faster than converting to BGR first.
         t_append_start = time.monotonic()
-        frame = job.frame_array
-        if self._use_compression:
-            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         try:
-            self.avi_recorder.write(frame)
+            self.avi_recorder.write(job.frame_array)
         except Exception as exc:
             print("Error appending frame:", exc)
             with self._acquisition_stats_lock:
