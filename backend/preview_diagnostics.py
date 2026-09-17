@@ -44,6 +44,7 @@ DIAGNOSTIC_FIELDS = [
     "append_ms_p95",
     "ndarray_ms",
     "ndarray_ms_p95",
+    "append_queue_depth",
 ]
 
 
@@ -210,6 +211,10 @@ class PreviewDiagnosticsAccumulator:
             "ndarray_ms": _rounded(_mean(loop_timing.get("ndarray_ms") or [])),
             "ndarray_ms_p95": _rounded(
                 _percentile(loop_timing.get("ndarray_ms") or [], 0.95)
+            ),
+            "append_queue_depth": (
+                "" if camera_state.get("append_queue_depth") is None
+                else int(camera_state["append_queue_depth"])
             ),
         }
 

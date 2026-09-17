@@ -69,6 +69,34 @@ class _CloserJob:
     manifest_entry: SegmentManifestEntry
 
 
+@dataclass
+class _AppendJob:
+    """One frame handed from the acquisition thread to the append thread.
+
+    Ownership of `image` transfers with the job: the acquisition thread
+    must not touch it again after enqueueing (see the acquisition loop's
+    "Preview: store latest frame" section, which runs BEFORE handoff for
+    exactly this reason), and the append thread is responsible for
+    Release()ing it once Append() is done, success or failure.
+
+    sync_this_frame/sync_label/label_event/adl_id/adl_label/
+    captured_wall_s/captured_mono_s are captured at grab time, not append
+    time -- they describe when the frame was captured, and must not drift
+    with however far behind the append queue is.
+    """
+
+    image: object  # PySpin.ImagePtr
+    frame_id: int | None
+    timestamp_us: int | None
+    sync_this_frame: bool
+    sync_label: str | None
+    label_event: str | None
+    adl_id: object | None
+    adl_label: object | None
+    captured_wall_s: float
+    captured_mono_s: float
+
+
 @dataclass(frozen=True)
 class PreviewFrame:
     """An owned preview image plus timing captured along its pipeline."""
@@ -140,10 +168,15 @@ class CameraController:
       - Recording to AVI via SpinVideo (uncompressed AVIOption)
       - Logging per-recorded-frame metadata to CSV
 
-    Open() and Append() happen only on the acquisition thread. Close() is
-    the exception: it's handed off to a dedicated closer thread (see
-    _closer_queue/_closer_thread) because it can take long enough to
-    risk dropping frames if run inline.
+    Open() runs on whichever thread opens that particular segment: the
+    acquisition thread for the first segment of a session (start_recording),
+    the append thread for every one after (_maybe_rotate_segment). Append()
+    and Close() are both handed off to their own dedicated threads
+    (_append_queue/_append_thread, _closer_queue/_closer_thread) because
+    each profiled/observed as slow enough to risk dropping frames if run
+    inline -- Append() at a ~fixed ~18ms/frame regardless of codec,
+    consistent with a per-call disk sync cost rather than genuine
+    CPU/bandwidth work.
     """
 
     def __init__(self):
@@ -224,6 +257,18 @@ class CameraController:
         # whole app (daemon thread, started lazily), not per-session.
         self._closer_queue: queue.Queue = queue.Queue()
         self._closer_thread: threading.Thread | None = None
+        # Append() (+ the per-frame bookkeeping/rotation contingent on it
+        # succeeding) profiled at a ~fixed ~18ms/frame regardless of codec,
+        # consistent with a per-call disk sync cost rather than genuine
+        # CPU/bandwidth work -- moved off the acquisition thread for the
+        # same reason Close() already is. Ownership of frame_counter,
+        # avi_recorder, and all _segment_*/_pending_writer* state transfers
+        # to this thread once recording starts; the acquisition thread's
+        # STOP-recording path joins this queue before reading any of it
+        # back (see _acquisition_loop). Lives for the whole app (daemon
+        # thread, started lazily), not per-session.
+        self._append_queue: queue.Queue = queue.Queue()
+        self._append_thread: threading.Thread | None = None
 
         # Latest frame for preview
         self._latest_frame = None
@@ -682,6 +727,15 @@ class CameraController:
         deliberately does NOT touch frame_counter or the metadata writer:
         record_frame_index must stay unbroken across the break, per the
         session's one-continuous-CSV design.
+
+        frame_counter and _pending_fault_roll[_gap_s] are read/written
+        here from the acquisition thread, but owned day-to-day by the
+        append thread (see _run_append_job) -- both are simple attributes
+        (GIL-atomic) and the only consequence of a stale read is the
+        timeline-break record citing a frame_counter a queue-depth behind
+        the append thread's true progress, or the fault-roll flag being
+        noticed a few queued frames later than this exact instant. Neither
+        needs a lock to be correct.
         """
         ok, msg = self._reinitialize_camera()
         now = time.monotonic()
@@ -720,7 +774,8 @@ class CameraController:
         self._apply_watchdog_decision(reinit_decision)
 
     # ------------------------------------------------------------------
-    # Video segment rotation (acquisition thread only, while recording)
+    # Video segment rotation (append thread only, while recording -- see
+    # _run_append_job/_append_queue)
     # ------------------------------------------------------------------
 
     def _open_segment_writer(self, segment_index: int):
@@ -760,7 +815,7 @@ class CameraController:
         return writer
 
     def _maybe_rotate_segment(self) -> None:
-        """Acquisition thread only. Called after each successful Append().
+        """Append thread only. Called after each successful Append().
 
         Periodically samples the in-progress segment's on-disk size,
         pre-arms the next writer shortly before the boundary, and swaps
@@ -947,6 +1002,89 @@ class CameraController:
                 time.sleep(0.2 * (attempt + 1))
         return size
 
+    def _start_append_thread(self) -> None:
+        self._append_thread = threading.Thread(
+            target=self._append_loop, name="segment-appender", daemon=True
+        )
+        self._append_thread.start()
+
+    def _append_loop(self) -> None:
+        while True:
+            job = self._append_queue.get()
+            try:
+                self._run_append_job(job)
+            finally:
+                self._append_queue.task_done()
+
+    def _run_append_job(self, job: "_AppendJob") -> None:
+        """Append thread only. Append() + the bookkeeping/rotation that's
+        contingent on it succeeding -- owns frame_counter, avi_recorder,
+        and all _segment_*/_pending_writer* state from here on (see
+        _append_queue's comment in __init__).
+
+        Mirrors the acquisition thread's old inline version exactly,
+        except: Release() happens here instead of at the end of the
+        acquisition loop (this thread now owns `job.image`), and the
+        capture-time values (frame_id/timestamp_us/sync_*/label_*/
+        captured_wall_s/captured_mono_s) come from the job instead of
+        being read fresh -- they describe when the frame was captured,
+        not whenever this thread got around to it.
+        """
+        t_append_start = time.monotonic()
+        try:
+            self.avi_recorder.Append(job.image)
+        except Exception as exc:
+            print("Error appending frame:", exc)
+            with self._acquisition_stats_lock:
+                self._append_failures += 1
+            self._record_loop_timing(
+                "append_ms", (time.monotonic() - t_append_start) * 1000.0
+            )
+            job.image.Release()
+            return
+
+        self._record_loop_timing(
+            "append_ms", (time.monotonic() - t_append_start) * 1000.0
+        )
+        job.image.Release()
+
+        self.frame_counter += 1
+        self._frames_in_segment += 1
+        if self._frames_in_segment == 1:
+            self._segment_first_record_frame_index = self.frame_counter
+            self._segment_first_system_time = job.captured_wall_s
+
+        if self._mark_next_frame_segment_resume:
+            row_sync_label = "segment_resume"
+            self._mark_next_frame_segment_resume = False
+        else:
+            row_sync_label = resolve_sync_label(job.label_event, job.sync_label)
+
+        self._metadata_writer.submit(
+            metadata_row(
+                {
+                    "record_frame_index": self.frame_counter,
+                    "camera_frame_id": job.frame_id,
+                    "timestamp_us": job.timestamp_us,
+                    "system_time": job.captured_wall_s,
+                    "sync_pulse": job.sync_this_frame,
+                    "sync_label": row_sync_label,
+                    "adl_id": job.adl_id,
+                    "adl_label": job.adl_label,
+                    "segment": self._metadata_segment,
+                    "segment_file": self._session_paths.video_final(self._segment_index).name,
+                    "segment_frame_index": self._frames_in_segment,
+                    "monotonic_s": job.captured_mono_s,
+                    "wall_mono_skew_s": compute_wall_mono_skew_s(
+                        self._timeline_baseline,
+                        wall_s=job.captured_wall_s,
+                        mono_s=job.captured_mono_s,
+                    ),
+                }
+            )
+        )
+        self._maybe_rotate_segment()
+
     # ------------------------------------------------------------------
     # Recording control (GUI thread): only set flags
     # ------------------------------------------------------------------
@@ -998,9 +1136,11 @@ class CameraController:
             self._event_log = None
             return False, f"Cannot open segments CSV: {self._segment_manifest_writer.last_error}"
 
-        # Lives for the app's lifetime, not per-session -- start it once.
+        # Lives for the app's lifetime, not per-session -- start them once.
         if self._closer_thread is None or not self._closer_thread.is_alive():
             self._start_closer_thread()
+        if self._append_thread is None or not self._append_thread.is_alive():
+            self._start_append_thread()
 
         self._segment_tracker.reset()
         self._session_paths = session_paths
@@ -1073,6 +1213,15 @@ class CameraController:
             # STOP recording (close SpinVideo + write CSV) if requested
             # --------------------------------------------------
             if self.record_stop_requested and self.recording_active:
+                # Every already-queued frame (and any rotation it triggers)
+                # must finish appending -- updating avi_recorder/
+                # _segment_index/_frames_in_segment/etc. as it goes -- before
+                # those are read below to retire the final segment.
+                # recording_active only flips False further down, so the
+                # acquisition thread has already stopped feeding this queue
+                # by the time we get here; the wait is bounded.
+                self._append_queue.join()
+
                 if self.avi_recorder is not None:
                     self._retire_segment(
                         writer=self.avi_recorder,
@@ -1221,87 +1370,12 @@ class CameraController:
                     self._last_camera_frame_id = int(frame_id)
 
             # --------------------------------------------------
-            # If recording, append frame + log metadata
-            # --------------------------------------------------
-            if self.recording_active and self.avi_recorder is not None:
-                # Determine if this frame is within a sync window
-                now = time.time()
-                with self._sync_lock:
-                    sync_this_frame = now <= self._sync_window_end
-                    sync_label = self._sync_label if sync_this_frame else None
-                with self._label_lock:
-                    if self._pending_label_event is not None:
-                        label_event = self._pending_label_event
-                        adl_id = self._pending_adl_id
-                        adl_label = self._pending_adl_label
-                        self._pending_label_event = None
-                        self._pending_adl_id = None
-                        self._pending_adl_label = None
-                    else:
-                        label_event = None
-                        adl_id = None
-                        adl_label = None
-
-                # Append before incrementing/logging: a failed Append must
-                # not advance record_frame_index, or the CSV's frame index
-                # permanently desynchronises from the AVI's actual frame
-                # count for the rest of the (possibly multi-day) session.
-                t_append_start = time.monotonic()
-                try:
-                    self.avi_recorder.Append(image)
-                except Exception as exc:
-                    print("Error appending frame:", exc)
-                    with self._acquisition_stats_lock:
-                        self._append_failures += 1
-                    self._record_loop_timing(
-                        "append_ms", (time.monotonic() - t_append_start) * 1000.0
-                    )
-                else:
-                    self._record_loop_timing(
-                        "append_ms", (time.monotonic() - t_append_start) * 1000.0
-                    )
-                    self.frame_counter += 1
-                    self._frames_in_segment += 1
-                    if self._frames_in_segment == 1:
-                        self._segment_first_record_frame_index = self.frame_counter
-                        self._segment_first_system_time = time.time()
-
-                    if self._mark_next_frame_segment_resume:
-                        row_sync_label = "segment_resume"
-                        self._mark_next_frame_segment_resume = False
-                    else:
-                        row_sync_label = resolve_sync_label(label_event, sync_label)
-
-                    row_wall_s = time.time()
-                    row_mono_s = time.perf_counter()
-                    self._metadata_writer.submit(
-                        metadata_row(
-                            {
-                                "record_frame_index": self.frame_counter,
-                                "camera_frame_id": frame_id,
-                                "timestamp_us": timestamp_us,
-                                "system_time": row_wall_s,
-                                "sync_pulse": sync_this_frame,
-                                "sync_label": row_sync_label,
-                                "adl_id": adl_id,
-                                "adl_label": adl_label,
-                                "segment": self._metadata_segment,
-                                "segment_file": self._session_paths.video_final(self._segment_index).name,
-                                "segment_frame_index": self._frames_in_segment,
-                                "monotonic_s": row_mono_s,
-                                "wall_mono_skew_s": compute_wall_mono_skew_s(
-                                    self._timeline_baseline,
-                                    wall_s=row_wall_s,
-                                    mono_s=row_mono_s,
-                                ),
-                            }
-                        )
-                    )
-                    self._maybe_rotate_segment()
-
-            # --------------------------------------------------
             # Preview: store latest frame
             # --------------------------------------------------
+            # Moved ahead of the recording block below: once recording,
+            # this thread hands `image` off to the append thread and must
+            # not touch it again afterward (see _AppendJob), so every read
+            # of `image` this loop iteration needs has to happen first.
             try:
                 t_ndarray_start = time.monotonic()
                 arr = image.GetNDArray()
@@ -1326,7 +1400,54 @@ class CameraController:
             except Exception:
                 pass
 
-            image.Release()
+            # --------------------------------------------------
+            # If recording, hand the frame off to the append thread
+            # --------------------------------------------------
+            # Append() profiled at a ~fixed ~18ms/frame regardless of
+            # codec (uncompressed vs MJPEG) -- see append_ms in the
+            # diagnostics CSV -- consistent with a per-call disk sync
+            # cost rather than genuine CPU/bandwidth work. Handing it to
+            # a dedicated thread lets this thread grab the NEXT frame
+            # immediately instead of blocking on that cost every frame.
+            if self.recording_active and self.avi_recorder is not None:
+                now = time.time()
+                with self._sync_lock:
+                    sync_this_frame = now <= self._sync_window_end
+                    sync_label = self._sync_label if sync_this_frame else None
+                with self._label_lock:
+                    if self._pending_label_event is not None:
+                        label_event = self._pending_label_event
+                        adl_id = self._pending_adl_id
+                        adl_label = self._pending_adl_label
+                        self._pending_label_event = None
+                        self._pending_adl_id = None
+                        self._pending_adl_label = None
+                    else:
+                        label_event = None
+                        adl_id = None
+                        adl_label = None
+
+                # Captured here, not on the append thread: these describe
+                # when the frame was actually captured, and must not drift
+                # with however far behind the append thread's queue is.
+                self._append_queue.put(
+                    _AppendJob(
+                        image=image,
+                        frame_id=frame_id,
+                        timestamp_us=timestamp_us,
+                        sync_this_frame=sync_this_frame,
+                        sync_label=sync_label,
+                        label_event=label_event,
+                        adl_id=adl_id,
+                        adl_label=adl_label,
+                        captured_wall_s=time.time(),
+                        captured_mono_s=time.perf_counter(),
+                    )
+                )
+                # Ownership of `image` (including Release()) transfers to
+                # the append thread -- see _run_append_job.
+            else:
+                image.Release()
 
     # ------------------------------------------------------------------
     # Preview API for Qt
@@ -1707,6 +1828,14 @@ class CameraController:
             ),
             "acquisition_frame_rate_enable": frame_rate_enable,
             "trigger_mode": None if trigger_mode is None else trigger_mode[0],
+            # Not camera state, but sampled alongside it for convenience:
+            # direct evidence of whether the async append thread (see
+            # _append_queue/_run_append_job) is keeping pace. Near 0 means
+            # appends finish about as fast as frames arrive; a growing
+            # value means the acquisition thread is now capturing faster
+            # than Append() can drain -- proof the two are decoupled
+            # (frames queueing) rather than serialized (frames dropped).
+            "append_queue_depth": self._append_queue.qsize(),
         }
 
     def set_frame_rate(self, value: float) -> bool:
