@@ -75,8 +75,20 @@ SYNC_WIDTH_RECORD = 0.100  # 100 ms
 # MJPEG cost profiled for cv2.VideoWriter's MJPG codec on one test machine
 # (33.3ms period at 30fps vs. that ~22ms) -- a starting suggestion, not an
 # enforced limit, since actual cost is hardware-dependent (see
-# _apply_compression_default_for_fps / the live append_ms warning).
+# _apply_compression_default_for_fps / the live append_queue_depth warning).
 COMPRESSION_DEFAULT_MAX_FPS = 30.0
+
+# append_queue_depth at/above which the live compression warning fires
+# (see _sample_preview_diagnostics). Chosen over an append_ms-percentile
+# threshold after a real 30fps/MJPEG test: append_ms_p95 sat right at the
+# frame period (even briefly over it) for the whole session -- inflated
+# by OS timer-tick granularity (~15.6ms quantization observed on Windows)
+# -- while append_queue_depth stayed at 0 throughout and not one frame
+# was actually dropped. Queue depth is ground truth for whether the
+# writer is actually falling behind capture; a latency percentile is
+# only a noisy proxy for that, and a deep buffer easily absorbs
+# occasional spikes p95 would flag anyway.
+COMPRESSION_QUEUE_DEPTH_WARNING = 5
 
 # fps at or above which "Exposure mode" is force-set to Off and locked
 # (dropdown disabled) rather than left as a free choice. ExposureAuto
@@ -368,8 +380,9 @@ class MainWindow(QWidget):
         # checked/unchecked based on the current fps (see
         # _apply_compression_default_for_fps) -- a starting suggestion,
         # not enforced: _sample_preview_diagnostics warns live (via the
-        # append_ms diagnostic) if it turns out too slow for whatever fps
-        # is actually chosen, regardless of this checkbox's state.
+        # append_queue_depth diagnostic) if it turns out too slow for
+        # whatever fps is actually chosen, regardless of this checkbox's
+        # state.
         # True once the user has clicked the checkbox directly (as opposed
         # to it being set programmatically by the fps-based default) --
         # from then on, _apply_compression_default_for_fps leaves it alone.
@@ -1805,20 +1818,21 @@ class MainWindow(QWidget):
                 )
             # MJPEG is opt-in specifically because its encode cost is
             # hardware-dependent (see set_compression_enabled) -- flag it
-            # live from the real measured cost rather than a guessed fps
-            # threshold, since it can only be confirmed by actually
-            # recording with it.
-            append_p95 = row["append_ms_p95"]
-            if self.camera.get_compression_enabled() and append_p95 != "":
-                period_ms = 1000.0 / max(1.0, self.camera.get_acquisition_frame_rate())
-                if float(append_p95) > period_ms * 0.8:
-                    self._recording_warnings.note_issue(
-                        f"MJPEG encoding is taking ~{float(append_p95):.1f} ms/frame "
-                        f"(p95), close to or above the {period_ms:.1f} ms frame period "
-                        "at this fps -- likely dropping frames. Consider turning off "
-                        "compression for this frame rate.",
-                        now_s=now_s,
-                    )
+            # live from append_queue_depth (see COMPRESSION_QUEUE_DEPTH_WARNING
+            # for why that's used instead of an append_ms latency percentile).
+            queue_depth = row["append_queue_depth"]
+            if (
+                self.camera.get_compression_enabled()
+                and queue_depth != ""
+                and int(queue_depth) >= COMPRESSION_QUEUE_DEPTH_WARNING
+            ):
+                self._recording_warnings.note_issue(
+                    f"MJPEG encoding is falling behind capture (append queue depth "
+                    f"{queue_depth}) -- frames are piling up waiting to be written "
+                    "and may start dropping. Consider turning off compression for "
+                    "this frame rate.",
+                    now_s=now_s,
+                )
         self._update_recording_warning_banner()
 
         # "as of HH:MM:SS" is the one thing on this label that only a live
