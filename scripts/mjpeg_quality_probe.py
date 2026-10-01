@@ -20,18 +20,27 @@ Variants (each writes its own AVI in a temp folder, deleted afterwards):
   ffmpeg+q=N     same, then writer.set(VIDEOWRITER_PROP_QUALITY, N) after open.
                  If the file size equals plain ffmpeg's, the call is ignored.
   cv_mjpeg gray  OpenCV's built-in MJPEG encoder with the params overload and
-                 isColor=False. q=75 is what the app does today when compression is on.
+                 isColor=False. q=75 is what the app did before the fix (when compression was on).
   cv_mjpeg COLOR the same encoder fed 3-channel frames.
                  Both are slow (~0.8 s/frame on the rig) but encoded offline here, so
                  speed doesn't matter. Expect the full run to take a few minutes.
 
-USAGE (on the recording laptop; needs PySpin only for the capture step)
-    # point the camera at the real scene, lit the way you will record, then:
-    python scripts/mjpeg_quality_probe.py --serial 26134271
-    python scripts/mjpeg_quality_probe.py --serial 23227865
+USAGE (needs PySpin and the cameras only for the capture step)
+    # point the cameras at the real scene, lit the way you will record, SpinView closed, then:
+    python scripts/mjpeg_quality_probe.py                       # every camera found, one after another
+    python scripts/mjpeg_quality_probe.py --serial 26134271     # just one
 
     # re-analyse saved frames anywhere (no camera needed):
-    python scripts/mjpeg_quality_probe.py --frames-file quality_output/frames_26134271.npy
+    python scripts/mjpeg_quality_probe.py --frames-file quality_output/run_X/frames_26134271.npy
+
+Needs: numpy, opencv-python (and PySpin for capture). A few minutes per camera: OpenCV's
+built-in encoder is slow (~0.8 s/frame on the rig), and it is encoded offline.
+
+OUTPUT: everything lands in quality_output/run_<hostname>_<timestamp>/ and is also zipped to
+run_<...>.zip next to it. SEND THE ZIP. It contains results.json (environment, OpenCV build
+and backends, camera info, scene statistics, every number in the table), per-camera CSVs, the
+side-by-side PNG crops, and console.log. The raw frames (.npy, ~40 MB per camera) stay in the
+folder and are only zipped with --zip-frames; they let the analysis be re-run elsewhere.
 
 Quality depends on the scene -- sensor noise and fine texture are what JPEG
 loses first -- so use a representative one, not a blank wall.
@@ -47,12 +56,18 @@ variant measures what that round trip costs on its own.
 from __future__ import annotations
 
 import argparse
+import re
 import csv
+import json
 import os
+import platform
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
+import zipfile
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -117,6 +132,26 @@ def compare(cv2, originals, decoded) -> dict:
 # ----------------------------------------------------------------------
 # Capture (PySpin)
 # ----------------------------------------------------------------------
+def discover_serials() -> list[str]:
+    import PySpin
+    import multi_camera_probe as mcp
+
+    system = PySpin.System.GetInstance()
+    try:
+        cams = system.GetCameras()
+        try:
+            serials = []
+            for i in range(cams.GetSize()):
+                cam = cams[i]
+                serials.append(mcp._read_str(PySpin, cam.GetTLDeviceNodeMap(), "DeviceSerialNumber"))
+                del cam
+            return serials
+        finally:
+            cams.Clear()
+    finally:
+        system.ReleaseInstance()
+
+
 def capture_frames(serial, n: int, every: int, warmup: int, fps: float):
     import PySpin
     import multi_camera_probe as mcp  # reuse the app-equivalent configure()
@@ -149,7 +184,17 @@ def capture_frames(serial, n: int, every: int, warmup: int, fps: float):
             if grabbed > warmup and (grabbed - warmup - 1) % every == 0:
                 frames.append(np.array(image.GetNDArray(), copy=True))
             image.Release()
-        return np.stack(frames), info.serial
+        try:
+            lib = system.GetLibraryVersion()
+            spinnaker = f"{lib.major}.{lib.minor}.{lib.type}.{lib.build}"
+        except Exception:
+            spinnaker = None
+        cam_info = {
+            "serial": info.serial, "model": info.model, "width": info.width, "height": info.height,
+            "pixel_format": info.pixel_format, "applied_fps": info.applied_fps,
+            "link_speed": info.speed, "spinnaker": spinnaker,
+        }
+        return np.stack(frames), cam_info
     finally:
         if cam is not None:
             try:
@@ -171,13 +216,13 @@ def capture_frames(serial, n: int, every: int, warmup: int, fps: float):
 def build_variants() -> list[dict]:
     variants = [
         {"name": "control (GREY, lossless)", "kind": "ffmpeg", "fourcc": "GREY", "set_q": None},
-        {"name": "ffmpeg (plain, proposed fix)", "kind": "ffmpeg", "fourcc": "MJPG", "set_q": None},
+        {"name": "ffmpeg (plain = app now)", "kind": "ffmpeg", "fourcc": "MJPG", "set_q": None},
     ]
     variants += [{"name": f"ffmpeg + set(q={q})", "kind": "ffmpeg", "fourcc": "MJPG", "set_q": q}
                  for q in QUALITIES_FFMPEG_SET]
     # isColor=False is what the app passes today (grayscale), so the (IS_COLOR=0, QUALITY)
     # fallback lands here. The COLOR rows write 3-channel BGR frames instead.
-    variants += [{"name": f"cv_mjpeg gray q={q}" + (" (app today)" if q == 75 else ""), "kind": "cv_mjpeg",
+    variants += [{"name": f"cv_mjpeg gray q={q}" + (" (app BEFORE the fix)" if q == 75 else ""), "kind": "cv_mjpeg",
                   "fourcc": "MJPG", "q": q, "color": False} for q in QUALITIES_CV_MJPEG]
     variants += [{"name": f"cv_mjpeg COLOR q={q}", "kind": "cv_mjpeg",
                   "fourcc": "MJPG", "q": q, "color": True} for q in QUALITIES_CV_MJPEG]
@@ -313,61 +358,253 @@ def print_table(rows, fps: float) -> None:
               + (f"   {r['note']}" if r.get("note") else ""))
     print("\n  PSNR/SSIM: higher is better (PSNR inf = identical). maxerr = worst single-pixel error (0-255), "
           "averaged over frames; %>4 = share of pixels off by more than 4 levels.")
-    print("  The control row is the floor of this measurement; cv_mjpeg q=75 is what the app does today.")
+    print("  The control row is the floor of this measurement; cv_mjpeg gray q=75 is what the app did before the fix.")
+
+
+# ----------------------------------------------------------------------
+# Run bundle: environment, JSON, console log, zip
+# ----------------------------------------------------------------------
+def jsonable(o):
+    """Make results JSON-safe: numpy scalars, inf/nan, Paths."""
+    if isinstance(o, dict):
+        return {str(k): jsonable(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [jsonable(v) for v in o]
+    if isinstance(o, np.floating):
+        o = float(o)
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, float):
+        if o != o:
+            return None
+        if o in (float("inf"), float("-inf")):
+            return "inf" if o > 0 else "-inf"
+    if isinstance(o, Path):
+        return str(o)
+    return o
+
+
+def total_ram_gb():
+    try:
+        import psutil
+        return round(psutil.virtual_memory().total / 1e9, 1)
+    except Exception:
+        pass
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+
+            class MemStatus(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("sullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            status = MemStatus()
+            status.dwLength = ctypes.sizeof(MemStatus)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return round(status.ullTotalPhys / 1e9, 1)
+        except Exception:
+            pass
+    return None
+
+
+def video_io_build_info(cv2) -> list[str]:
+    """The 'Video I/O' block of cv2.getBuildInformation(): which backends this build has."""
+    lines = cv2.getBuildInformation().splitlines()
+    out, header_indent = [], None
+    for line in lines:
+        indent = len(line) - len(line.lstrip())
+        if header_indent is None:
+            if line.strip().startswith("Video I/O:"):
+                header_indent = indent
+                out.append(line.strip())
+            continue
+        if line.strip() and indent <= header_indent:
+            break
+        if line.strip():
+            out.append(line.strip())
+    return out
+
+
+def git_info() -> dict:
+    here = Path(__file__).resolve().parent
+    try:
+        commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=here, capture_output=True, text=True,
+                                timeout=10).stdout.strip() or None
+        branch = subprocess.run(["git", "branch", "--show-current"], cwd=here, capture_output=True, text=True,
+                                timeout=10).stdout.strip() or None
+        dirty = bool(subprocess.run(["git", "status", "--porcelain"], cwd=here, capture_output=True, text=True,
+                                    timeout=10).stdout.strip())
+        return {"commit": commit, "branch": branch, "dirty": dirty}
+    except Exception:
+        return {"commit": None, "branch": None, "dirty": None}
+
+
+def collect_environment(cv2) -> dict:
+    try:
+        import cv2.videoio_registry as registry
+        writer_backends = [registry.getBackendName(b) for b in registry.getWriterBackends()]
+    except Exception:
+        writer_backends = None
+    return {
+        "hostname": platform.node(),
+        "platform": platform.platform(),
+        "machine": platform.machine(),
+        "processor": platform.processor(),
+        "logical_cpus": os.cpu_count(),
+        "ram_gb": total_ram_gb(),
+        "python": sys.version.split()[0],
+        "numpy": np.__version__,
+        "opencv": cv2.__version__,
+        "opencv_writer_backends": writer_backends,
+        "opencv_video_io": video_io_build_info(cv2),
+        "git": git_info(),
+    }
+
+
+def frame_stats(frames: np.ndarray) -> dict:
+    """Scene descriptors, so a PSNR can be read in context (noise and texture drive it)."""
+    f = frames.astype(np.float32)
+    return {
+        "frames": int(len(frames)), "height": int(frames.shape[1]), "width": int(frames.shape[2]),
+        "mean_level": float(f.mean()), "std_level": float(f.std()),
+        "p1": float(np.percentile(frames, 1)), "p99": float(np.percentile(frames, 99)),
+        "pct_near_black_le5": float((frames <= 5).mean() * 100), "pct_saturated_ge250": float((frames >= 250).mean() * 100),
+        # Per-pixel std across frames: sensor noise if the scene is static, plus any motion.
+        "frame_to_frame_std": float(np.mean(np.std(f, axis=0))),
+    }
+
+
+class Tee:
+    """Mirror Python-level stdout into a log file inside the run folder."""
+
+    def __init__(self, stream, path: Path):
+        self._stream, self._file = stream, open(path, "w", encoding="utf-8")
+
+    def write(self, text):
+        self._stream.write(text)
+        self._file.write(text)
+
+    def flush(self):
+        self._stream.flush()
+        self._file.flush()
+
+    def close(self):
+        self._file.close()
+
+
+def make_zip(run_dir: Path, include_frames: bool) -> Path:
+    zip_path = run_dir.with_suffix(".zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for f in sorted(run_dir.rglob("*")):
+            if f.is_file() and (include_frames or f.suffix != ".npy"):
+                z.write(f, f.relative_to(run_dir.parent))
+    return zip_path
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--serial", help="camera to capture from (default: the only camera)")
+    ap.add_argument("--serial", nargs="+", help="cameras to capture from (default: every camera found, one after another)")
     ap.add_argument("--frames-file", help="skip capture; analyse frames saved earlier (.npy, shape N,H,W uint8)")
-    ap.add_argument("--frames", type=int, default=30, help="frames to capture (default 30)")
+    ap.add_argument("--frames", type=int, default=30, help="frames to capture per camera (default 30)")
     ap.add_argument("--every", type=int, default=5, help="keep every Nth frame, so frames differ (default 5)")
     ap.add_argument("--warmup", type=int, default=15, help="frames to discard first (default 15)")
     ap.add_argument("--fps", type=float, default=30.0)
     ap.add_argument("--max-frames", type=int, help="analyse only the first N frames (cv_mjpeg can be slow)")
     ap.add_argument("--ffmpeg-options", help="experimental: OPENCV_FFMPEG_WRITER_OPTIONS, e.g. 'qmin;2|qmax;2'")
-    ap.add_argument("--out-dir", default="quality_output")
+    ap.add_argument("--out-dir", default="quality_output", help="parent folder; each run gets its own subfolder")
+    ap.add_argument("--zip-frames", action="store_true", help="include the raw frames (.npy, ~40 MB per camera) in the zip")
     args = ap.parse_args()
 
     import cv2
 
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    if args.frames_file:
-        frames = np.load(args.frames_file)
-        label = Path(args.frames_file).stem.replace("frames_", "")
-    else:
-        frames, label = capture_frames(args.serial, args.frames, args.every, args.warmup, args.fps)
-        saved = out_dir / f"frames_{label}.npy"
-        np.save(saved, frames)
-        print(f"Saved {len(frames)} frames to {saved} (re-run with --frames-file to re-analyse)")
-    if frames.ndim != 3 or frames.dtype != np.uint8:
-        print(f"Expected (N,H,W) uint8 frames, got {frames.shape} {frames.dtype}")
-        return 2
-    if args.max_frames:
-        frames = frames[: args.max_frames]
-    print(f"\nAnalysing {len(frames)} frames of {frames.shape[2]}x{frames.shape[1]} (OpenCV {cv2.__version__})")
-
-    img_dir = out_dir / f"montages_{label}"
-    img_dir.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(img_dir / "original_frame.png"), frames[len(frames) // 2])
-    tmp = Path(tempfile.mkdtemp(prefix="mjpeg_quality_"))
+    host = re.sub(r"[^A-Za-z0-9_.-]", "_", platform.node() or "host")
+    started = datetime.now()
+    run_dir = Path(args.out_dir) / f"run_{host}_{started:%Y%m%d_%H%M%S}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    tee = Tee(sys.stdout, run_dir / "console.log")
+    sys.stdout = tee
     try:
-        rows = run_variants(cv2, frames, args.fps, tmp, img_dir, args.ffmpeg_options)
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        print(f"Run folder: {run_dir.resolve()}")
+        results = {
+            "schema": 1, "script": "mjpeg_quality_probe.py", "started": started.isoformat(timespec="seconds"),
+            "args": vars(args), "environment": collect_environment(cv2), "cameras": [], "runs": [],
+            "notes": {
+                "ffmpeg (plain = app now)": "what the app does after the MJPEG backend fix (789b05e)",
+                "cv_mjpeg gray q=75": "what the app did BEFORE the fix when compression was on",
+            },
+        }
 
-    print_table(rows, args.fps)
-    csv_path = out_dir / f"mjpeg_quality_{label}.csv"
-    keys = ["variant", "backend", "frames_compared", "frames_decoded", "kb_per_frame", "ratio_vs_raw",
-            "mb_per_s_at_fps", "encode_ms_mean", "psnr_mean", "psnr_min", "ssim_mean",
-            "max_abs_err_mean", "pct_pixels_err_gt4", "note"]
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"\nWrote {csv_path}\nSide-by-side crops (original | decoded | difference x{DIFF_GAIN}) in {img_dir}")
+        def write_results():
+            (run_dir / "results.json").write_text(json.dumps(jsonable(results), indent=2))
+
+        targets = []  # (label, frames, camera_info)
+        if args.frames_file:
+            frames = np.load(args.frames_file)
+            targets.append((Path(args.frames_file).stem.replace("frames_", ""), frames, None))
+        else:
+            try:
+                serials = args.serial or discover_serials()
+            except ImportError as exc:
+                print(f"PySpin is not available here ({exc}). Pass --frames-file to analyse saved frames instead.")
+                return 2
+            if not serials:
+                print("No cameras found. Pass --frames-file to analyse saved frames instead.")
+                return 2
+            print(f"Cameras: {serials}")
+            for serial in serials:
+                frames, cam_info = capture_frames(serial, args.frames, args.every, args.warmup, args.fps)
+                np.save(run_dir / f"frames_{cam_info['serial']}.npy", frames)
+                results["cameras"].append(cam_info)
+                targets.append((cam_info["serial"], frames, cam_info))
+                write_results()
+                time.sleep(1.0)  # let the camera release before the next one
+
+        # Analysis runs after every capture, so the cameras are free during the slow encodes.
+        for label, frames, cam_info in targets:
+            if frames.ndim != 3 or frames.dtype != np.uint8:
+                print(f"{label}: expected (N,H,W) uint8 frames, got {frames.shape} {frames.dtype}; skipping")
+                continue
+            if args.max_frames:
+                frames = frames[: args.max_frames]
+            print(f"\n=== {label}: analysing {len(frames)} frames of {frames.shape[2]}x{frames.shape[1]} "
+                  f"(OpenCV {cv2.__version__}) ===")
+            img_dir = run_dir / f"montages_{label}"
+            img_dir.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(img_dir / "original_frame.png"), frames[len(frames) // 2])
+            tmp = Path(tempfile.mkdtemp(prefix="mjpeg_quality_"))
+            try:
+                rows = run_variants(cv2, frames, args.fps, tmp, img_dir, args.ffmpeg_options)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+            print_table(rows, args.fps)
+
+            keys = ["variant", "backend", "frames_compared", "frames_decoded", "kb_per_frame", "ratio_vs_raw",
+                    "mb_per_s_at_fps", "encode_ms_mean", "psnr_mean", "psnr_min", "ssim_mean",
+                    "max_abs_err_mean", "pct_pixels_err_gt4", "note"]
+            with open(run_dir / f"mjpeg_quality_{label}.csv", "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(rows)
+            results["runs"].append({
+                "label": label, "camera": cam_info, "frame_stats": frame_stats(frames), "variants": rows,
+                "montage_dir": img_dir.name,
+                "frames_file": f"frames_{label}.npy" if not args.frames_file else args.frames_file,
+            })
+            write_results()  # after every camera, so a crash later doesn't lose what finished
+
+        results["finished"] = datetime.now().isoformat(timespec="seconds")
+        write_results()
+        print(f"\nWrote {run_dir / 'results.json'} (+ per-camera CSVs, montage PNGs, console.log)")
+    finally:
+        sys.stdout = tee._stream
+        tee.close()
+
+    zip_path = make_zip(run_dir, args.zip_frames)
+    print(f"\nSend this file (everything needed, {zip_path.stat().st_size / 1e6:.1f} MB):\n  {zip_path.resolve()}")
+    print(f"Folder with the same contents plus raw frames: {run_dir.resolve()}")
     return 0
 
 
