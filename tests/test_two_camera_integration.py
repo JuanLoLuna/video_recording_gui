@@ -11,7 +11,6 @@ test, via scripts/multi_controller_smoke.py.
 import os
 import sys
 import tempfile
-import threading
 import time
 import types
 import unittest
