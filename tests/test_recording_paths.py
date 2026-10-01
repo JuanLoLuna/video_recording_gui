@@ -7,9 +7,11 @@ from datetime import datetime
 from pathlib import Path
 
 from backend.recording_paths import (
+    CAMERA_TAG_RE,
     MAX_SEGMENT_INDEX,
     OUTPUT_DIR_ENV,
     SessionPaths,
+    camera_tag_for_serial,
     check_writable,
     resolve_output_dir,
     session_basename,
@@ -141,3 +143,100 @@ class CheckWritableTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# The downstream pipeline's current video-name pattern
+# (smart_sleeve_data_processing pipelines/audit/rules.yaml video_raw) and the
+# pattern proposed for the first two-camera ingest.
+LEGACY_VIDEO_RE = re.compile(r"^recording_\d{8}_\d{6}(?:-\d{4})?\.avi$")
+PROPOSED_VIDEO_RE = re.compile(
+    r"^recording_\d{8}_\d{6}(?:_cam[A-Za-z0-9]+)?(?:-\d{4})?\.avi$"
+)
+
+
+class CameraTagTests(unittest.TestCase):
+    STARTED = datetime(2026, 10, 1, 10, 15, 0)
+
+    def paths(self, tag=None):
+        return SessionPaths.for_session("/data", self.STARTED, camera_tag=tag)
+
+    def test_no_tag_leaves_every_name_exactly_as_before(self):
+        paths = self.paths()
+        base = "recording_20261001_101500"
+        self.assertEqual(paths.stem, base)
+        self.assertEqual(paths.video_final(0), Path("/data") / f"{base}-0000.avi")
+        self.assertEqual(paths.video_final(12), Path("/data") / f"{base}-0012.avi")
+        self.assertEqual(paths.metadata_csv, Path("/data") / f"{base}_metadata.csv")
+        self.assertEqual(paths.diagnostics_csv, Path("/data") / f"{base}_diagnostics.csv")
+        self.assertEqual(paths.segments_csv, Path("/data") / f"{base}_segments.csv")
+        self.assertEqual(paths.events_jsonl, Path("/data") / f"{base}_events.jsonl")
+        self.assertEqual(paths.wav, Path("/data") / f"{base}.wav")
+        self.assertEqual(
+            paths.video_part_base(3), Path("/data/.incomplete") / f"{base}_part0003"
+        )
+
+    def test_tag_goes_inside_the_stem_for_every_per_camera_artifact(self):
+        paths = self.paths("cam26134271")
+        stem = "recording_20261001_101500_cam26134271"
+        self.assertEqual(paths.video_final(0), Path("/data") / f"{stem}-0000.avi")
+        self.assertEqual(paths.metadata_csv, Path("/data") / f"{stem}_metadata.csv")
+        self.assertEqual(paths.diagnostics_csv, Path("/data") / f"{stem}_diagnostics.csv")
+        self.assertEqual(paths.segments_csv, Path("/data") / f"{stem}_segments.csv")
+        self.assertEqual(paths.events_jsonl, Path("/data") / f"{stem}_events.jsonl")
+        self.assertEqual(
+            paths.video_part_base(1), Path("/data/.incomplete") / f"{stem}_part0001"
+        )
+
+    def test_wav_is_never_tagged_because_the_microphone_is_shared(self):
+        self.assertEqual(self.paths("cam26134271").wav, self.paths().wav)
+
+    def test_two_cameras_never_share_any_output_path(self):
+        a, b = self.paths(), self.paths("cam26134271")
+        for index in (0, 1, 9999):
+            self.assertNotEqual(a.video_final(index), b.video_final(index))
+            self.assertNotEqual(a.video_part_base(index), b.video_part_base(index))
+        for name in ("metadata_csv", "diagnostics_csv", "segments_csv", "events_jsonl"):
+            self.assertNotEqual(getattr(a, name), getattr(b, name), name)
+
+    def test_with_camera_keeps_the_session_and_changes_only_the_names(self):
+        primary = self.paths()
+        other = primary.with_camera("cam23227865")
+        self.assertEqual(other.output_dir, primary.output_dir)
+        self.assertEqual(other.basename, primary.basename)
+        self.assertEqual(other.camera_tag, "cam23227865")
+        self.assertIsNone(other.with_camera(None).camera_tag)
+
+    def test_invalid_tags_are_rejected(self):
+        # "_" and "-" are the separators downstream matchers split on.
+        for bad in ("", "cam_1", "cam-1", "cam 1", "cam/1", "..", "cam.1"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                SessionPaths(output_dir=Path("/data"), basename="b", camera_tag=bad)
+
+    def test_camera_tag_for_serial(self):
+        self.assertEqual(camera_tag_for_serial("26134271"), "cam26134271")
+        self.assertEqual(camera_tag_for_serial(23227865), "cam23227865")
+        self.assertTrue(CAMERA_TAG_RE.match(camera_tag_for_serial("abc123")))
+        with self.assertRaises(ValueError):
+            camera_tag_for_serial("12_34")
+
+    def test_segment_index_range_still_enforced_with_a_tag(self):
+        with self.assertRaises(ValueError):
+            self.paths("cam1").video_final(MAX_SEGMENT_INDEX + 1)
+
+    def test_primary_names_still_match_the_legacy_downstream_pattern(self):
+        self.assertTrue(LEGACY_VIDEO_RE.match(self.paths().video_final(0).name))
+        self.assertTrue(PROPOSED_VIDEO_RE.match(self.paths().video_final(0).name))
+
+    def test_tagged_names_match_only_the_proposed_pattern(self):
+        # Documents the known, deliberately deferred downstream gap: until the
+        # pipeline's pattern gains "(?:_cam[A-Za-z0-9]+)?", a second camera's
+        # video is archive-only.
+        name = self.paths("cam26134271").video_final(7).name
+        self.assertIsNone(LEGACY_VIDEO_RE.match(name))
+        self.assertTrue(PROPOSED_VIDEO_RE.match(name))
+
+    def test_csv_stem_pairs_with_its_video_by_stripping_metadata(self):
+        # Downstream pairs "<stem>_metadata.csv" with "<stem>-NNNN.avi".
+        paths = self.paths("cam26134271")
+        stem = paths.metadata_csv.name[: -len("_metadata.csv")]
+        self.assertTrue(paths.video_final(0).name.startswith(stem + "-"))

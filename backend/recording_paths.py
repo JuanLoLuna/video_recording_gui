@@ -19,6 +19,7 @@ the two downstream filename contracts it must satisfy:
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +32,19 @@ OUTPUT_DIR_ENV = "SLEEVE_VIDEO_GUI_OUTPUT_DIR"
 DEFAULT_OUTPUT_DIR: str | None = None
 
 MAX_SEGMENT_INDEX = 9999  # 4-digit suffix is the downstream filename contract
+
+# A camera tag sits INSIDE the stem, before "-NNNN" / "_metadata". Alphanumeric
+# only: "_" and "-" are the separators downstream matchers split on, so a tag
+# containing either would make the stem ambiguous.
+CAMERA_TAG_RE = re.compile(r"^[A-Za-z0-9]+$")
+
+
+def camera_tag_for_serial(serial: str | int) -> str:
+    """Filename tag for a camera, e.g. 26134271 -> "cam26134271"."""
+    tag = f"cam{serial}"
+    if not CAMERA_TAG_RE.match(tag):
+        raise ValueError(f"camera serial {serial!r} cannot be used in a filename tag")
+    return tag
 
 
 def resolve_output_dir(
@@ -103,6 +117,29 @@ class SessionPaths:
 
     output_dir: Path
     basename: str
+    # None = the primary / only camera: every name is exactly as it was before
+    # multi-camera support. Set for the additional cameras of a session.
+    camera_tag: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.camera_tag is not None and not CAMERA_TAG_RE.match(self.camera_tag):
+            raise ValueError(
+                f"camera_tag {self.camera_tag!r} must be alphanumeric "
+                "('_' and '-' are filename separators)"
+            )
+
+    @property
+    def stem(self) -> str:
+        """basename plus the camera tag: the stem of every per-camera artifact."""
+        if self.camera_tag is None:
+            return self.basename
+        return f"{self.basename}_{self.camera_tag}"
+
+    def with_camera(self, camera_tag: str | None) -> "SessionPaths":
+        """Same session (output dir + basename), a different camera's names."""
+        return SessionPaths(
+            output_dir=self.output_dir, basename=self.basename, camera_tag=camera_tag
+        )
 
     @property
     def incomplete_dir(self) -> Path:
@@ -122,34 +159,42 @@ class SessionPaths:
         video_final(segment_index) after Close() succeeds.
         """
         _require_valid_segment_index(segment_index)
-        return self.incomplete_dir / f"{self.basename}_part{segment_index:04d}"
+        return self.incomplete_dir / f"{self.stem}_part{segment_index:04d}"
 
     def video_final(self, segment_index: int) -> Path:
         _require_valid_segment_index(segment_index)
-        return self.output_dir / f"{self.basename}-{segment_index:04d}.avi"
+        return self.output_dir / f"{self.stem}-{segment_index:04d}.avi"
 
     @property
     def wav(self) -> Path:
+        # One microphone per session, shared by every camera: never tagged.
         return self.output_dir / f"{self.basename}.wav"
 
     @property
     def metadata_csv(self) -> Path:
-        return self.output_dir / f"{self.basename}_metadata.csv"
+        return self.output_dir / f"{self.stem}_metadata.csv"
 
     @property
     def diagnostics_csv(self) -> Path:
-        return self.output_dir / f"{self.basename}_diagnostics.csv"
+        return self.output_dir / f"{self.stem}_diagnostics.csv"
 
     @property
     def segments_csv(self) -> Path:
-        return self.output_dir / f"{self.basename}_segments.csv"
+        return self.output_dir / f"{self.stem}_segments.csv"
 
     @property
     def events_jsonl(self) -> Path:
-        return self.output_dir / f"{self.basename}_events.jsonl"
+        return self.output_dir / f"{self.stem}_events.jsonl"
 
     @classmethod
     def for_session(
-        cls, output_dir: str | Path, started_at: datetime
+        cls,
+        output_dir: str | Path,
+        started_at: datetime,
+        camera_tag: str | None = None,
     ) -> "SessionPaths":
-        return cls(output_dir=Path(output_dir), basename=session_basename(started_at))
+        return cls(
+            output_dir=Path(output_dir),
+            basename=session_basename(started_at),
+            camera_tag=camera_tag,
+        )
