@@ -4,11 +4,13 @@ from backend.disk_guard import (
     DEFAULT_BYTES_PER_HOUR,
     DEFAULT_CRITICAL_HOURS,
     DEFAULT_WARN_HOURS,
+    PLANNED_HOURS_ENV,
     MJPEG_SIZE_FRACTION_ESTIMATE,
     DiskSample,
     StreamRate,
     assess_disk,
     estimate_bytes_per_hour,
+    resolve_planned_hours,
     sample_disk_usage,
 )
 
@@ -154,6 +156,67 @@ class RigScenarioTests(unittest.TestCase):
         verdict = self.verdict(300, [FIREFLY_30, BLACKFLY_30])  # ~1.6 h
         self.assertEqual(verdict.level, "danger")
         self.assertFalse(verdict.recording_blocked)  # still confirmable
+
+
+class FixedThresholdTests(unittest.TestCase):
+    """Concrete numbers, so the tests fail if the defaults are changed by accident."""
+
+    RATE = 100 * 1024**3  # 100 GiB per hour
+
+    def hours(self, hours):
+        return assess_disk(make_sample(hours * 100.0), bytes_per_hour=self.RATE)
+
+    def test_defaults_are_8h_warn_and_2h_critical(self):
+        self.assertEqual(DEFAULT_WARN_HOURS, 8.0)
+        self.assertEqual(DEFAULT_CRITICAL_HOURS, 2.0)
+
+    def test_boundaries(self):
+        self.assertEqual(self.hours(8.5).level, "safe")
+        self.assertEqual(self.hours(7.5).level, "warning")
+        self.assertEqual(self.hours(2.5).level, "warning")
+        self.assertEqual(self.hours(1.5).level, "danger")
+
+    def test_messages_say_estimated_not_measured_and_not_multi_day(self):
+        for hours in (7.5, 1.5, 9.0):
+            reason = self.hours(hours).reason
+            self.assertIn("estimated", reason)
+            self.assertNotIn("measured", reason)
+            self.assertNotIn("multi-day", reason)
+
+
+class PlannedHoursTests(unittest.TestCase):
+    RATE = 100 * 1024**3
+
+    def verdict(self, free_hours, planned):
+        return assess_disk(
+            make_sample(free_hours * 100.0), bytes_per_hour=self.RATE, planned_hours=planned
+        )
+
+    def test_a_long_run_that_will_not_fit_asks_even_when_far_above_warn_hours(self):
+        # 10 days planned, ~22 h of room: "safe" by the default thresholds.
+        self.assertEqual(self.verdict(22.0, None).level, "safe")
+        verdict = self.verdict(22.0, 240.0)
+        self.assertEqual(verdict.level, "warning")
+        self.assertTrue(verdict.requires_confirmation)
+        self.assertFalse(verdict.recording_blocked)
+        self.assertIn("240 h", verdict.reason)
+
+    def test_a_run_that_fits_is_not_nagged(self):
+        self.assertEqual(self.verdict(300.0, 240.0).level, "safe")
+
+    def test_critical_still_wins_over_planned(self):
+        self.assertEqual(self.verdict(1.0, 240.0).level, "danger")
+
+    def test_min_free_floor_still_blocks(self):
+        verdict = assess_disk(make_sample(1.0), bytes_per_hour=1, planned_hours=1.0)
+        self.assertTrue(verdict.recording_blocked)
+
+    def test_resolve_planned_hours(self):
+        self.assertEqual(resolve_planned_hours({PLANNED_HOURS_ENV: "240"}), 240.0)
+        self.assertEqual(resolve_planned_hours({PLANNED_HOURS_ENV: " 1.5 "}), 1.5)
+        for bad in ("", "abc", "0", "-3", "nan"):
+            self.assertIsNone(resolve_planned_hours({PLANNED_HOURS_ENV: bad}), bad)
+        self.assertIsNone(resolve_planned_hours({}))
 
 
 if __name__ == "__main__":

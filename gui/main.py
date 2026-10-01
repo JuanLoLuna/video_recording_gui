@@ -59,7 +59,7 @@ from backend.power_status import assess_power_safety, read_power_status
 from backend.power_policy import PowerPolicyState, next_power_action
 from backend.recording_warnings import RecordingWarningTracker, format_duration_s
 from backend.recording_paths import SessionPaths, resolve_output_dir
-from backend.disk_guard import assess_disk, sample_disk_usage
+from backend.disk_guard import assess_disk, resolve_planned_hours, sample_disk_usage
 from backend.power_keepalive import (
     KeepAwakeRequest,
     KeepAwakeState,
@@ -939,7 +939,7 @@ class MainWindow(QWidget):
                 )
             return True
 
-        verdict = assess_disk(sample)
+        verdict = assess_disk(sample, planned_hours=resolve_planned_hours())
         if verdict.recording_blocked:
             if not bypass_confirmation:
                 QMessageBox.warning(self, "Recording blocked by disk space", verdict.reason)

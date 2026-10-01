@@ -10,10 +10,11 @@ can't possibly fit.
 
 from __future__ import annotations
 
+import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 
 # Uncompressed 1280x1024 Mono8 (1.31 MB/frame) at the 100 fps target:
@@ -29,10 +30,30 @@ DEFAULT_BYTES_PER_HOUR = 471_900_000_000
 # about two 1-hour sessions' worth of room; warn = under a working day's worth
 # of recording. (Was 24 h / 6 h, tuned for the 10-day unattended run; a 4 TB
 # drive holds only ~22 h of two-camera uncompressed video, so 24 h warned on
-# every start.) Long unattended runs can still pass their own thresholds to
-# assess_disk().
+# every start.)
+#
+# A long unattended run must not lose its early warning to this change: set
+# PLANNED_HOURS_ENV (e.g. 240 for 10 days) and assess_disk() asks for
+# confirmation whenever the free space is projected to run out sooner than
+# that, whatever warn_hours says.
 DEFAULT_WARN_HOURS = 8.0
 DEFAULT_CRITICAL_HOURS = 2.0
+PLANNED_HOURS_ENV = "SLEEVE_VIDEO_GUI_PLANNED_HOURS"
+
+
+def resolve_planned_hours(env: Mapping[str, str] | None = None) -> float | None:
+    """Planned recording duration in hours from PLANNED_HOURS_ENV, else None.
+
+    Ignores blank, non-numeric and non-positive values (a typo should not
+    silently disable or break the disk check).
+    """
+    env_map = os.environ if env is None else env
+    raw = (env_map.get(PLANNED_HOURS_ENV) or "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
 DEFAULT_MIN_FREE_BYTES = 20 * 1024**3  # 20 GiB
 
 
@@ -115,6 +136,7 @@ def assess_disk(
     warn_hours: float = DEFAULT_WARN_HOURS,
     critical_hours: float = DEFAULT_CRITICAL_HOURS,
     min_free_bytes: int = DEFAULT_MIN_FREE_BYTES,
+    planned_hours: float | None = None,
 ) -> DiskVerdict:
     """Classify free space for recording, without touching the filesystem."""
     free_gib = sample.free_bytes / 1024**3
@@ -151,22 +173,29 @@ def assess_disk(
             hours_remaining=hours_remaining,
             reason=(
                 f"Only {free_gib:.1f} GiB free (~{hours_remaining:.1f} h at the "
-                "measured recording rate). This may not be enough for the "
+                "estimated recording rate). This may not be enough for the "
                 "planned session."
             ),
             recording_blocked=False,
             requires_confirmation=True,
         )
 
-    if hours_remaining <= warn_hours:
+    planned_short = planned_hours is not None and hours_remaining < planned_hours
+    if hours_remaining <= warn_hours or planned_short:
+        if planned_short:
+            advice = (
+                f"The planned run is {planned_hours:.0f} h, which this will not "
+                "cover. Free space or choose a larger volume."
+            )
+        else:
+            advice = "Consider freeing space before a long session."
         return DiskVerdict(
             level="warning",
             free_bytes=sample.free_bytes,
             hours_remaining=hours_remaining,
             reason=(
                 f"{free_gib:.1f} GiB free (~{hours_remaining:.1f} h at the "
-                "measured recording rate). Consider freeing space for a "
-                "multi-day session."
+                f"estimated recording rate). {advice}"
             ),
             recording_blocked=False,
             requires_confirmation=True,
@@ -176,7 +205,7 @@ def assess_disk(
         level="safe",
         free_bytes=sample.free_bytes,
         hours_remaining=hours_remaining,
-        reason=f"{free_gib:.1f} GiB free (~{hours_remaining:.1f} h at the measured rate).",
+        reason=f"{free_gib:.1f} GiB free (~{hours_remaining:.1f} h at the estimated rate).",
         recording_blocked=False,
         requires_confirmation=False,
     )
