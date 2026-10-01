@@ -28,6 +28,20 @@ tails, MB/s on the wire, and process CPU. A run PASSes when achieved fps is
 >= 99% of the rate the camera actually applied, with zero gaps, zero
 incomplete images and zero errors.
 
+WRITER STAGE (--record-dir): additionally writes each camera to an AVI through
+cv2.VideoWriter on its own writer thread, opened exactly like the app's
+_open_segment_writer (grayscale; MJPG with a quality param, or GREY for
+uncompressed). Point --record-dir at the drive you will really record to:
+
+    python scripts/multi_camera_probe.py --record-dir E:\\probe --fps 30 --seconds 120 --codec mjpg grey
+
+It then also reports write() time, writer-queue depth (the GUI warns at 5; this
+probe FAILs at 30, i.e. ~1 s of backlog), backlog left at stop, file close
+time, and the real on-disk rate and GB/hour. Recorded files are deleted after
+each run unless --keep is given -- uncompressed is ~184 GB/h for two cameras
+at 30 fps, so keep an eye on free space. Rotation is not exercised (one file
+per camera per run). Acquisition-only baselines are not repeated in this mode.
+
 Results are also written to probe_output/multi_camera_probe_<timestamp>.csv.
 """
 from __future__ import annotations
@@ -35,6 +49,8 @@ from __future__ import annotations
 import argparse
 import csv
 import sys
+import queue
+import shutil
 import threading
 import time
 from dataclasses import dataclass, field
@@ -47,6 +63,11 @@ STREAM_BUFFER_SECONDS = 5.0
 GRAB_TIMEOUT_MS = 1000
 
 PASS_FPS_FRACTION = 0.99
+# Writer backlog, in frames. 5 is the GUI's own compression-warning threshold
+# (COMPRESSION_QUEUE_DEPTH_WARNING); ~1 s of 30 fps video means the writer is
+# not keeping up and the queue (i.e. RAM) would grow for as long as it runs.
+QUEUE_WARN = 5
+QUEUE_FAIL = 30
 # "both" may lose at most this fraction of its solo fps before it's flagged.
 CONTENTION_TOLERANCE = 0.01
 
@@ -112,8 +133,28 @@ def summarize(arrivals, grab_ms, frame_ids, bytes_per_frame: int) -> dict:
     }
 
 
+def summarize_writer(write_ms, queue_depths, frames_grabbed, frames_written,
+                     write_errors, file_bytes, span_s) -> dict:
+    """Reduce one camera's writer-thread samples to the reported metrics."""
+    rate = file_bytes / span_s if span_s > 0 else 0.0
+    return {
+        "frames_written": frames_written,
+        "frames_lost_in_writer": frames_grabbed - frames_written,
+        "write_errors": write_errors,
+        "append_ms_mean": (sum(write_ms) / len(write_ms)) if write_ms else None,
+        "append_ms_p95": percentile(write_ms, 0.95),
+        "append_ms_max": max(write_ms) if write_ms else None,
+        "queue_p95": percentile(queue_depths, 0.95),
+        "queue_max": max(queue_depths) if queue_depths else 0,
+        "file_mb": file_bytes / 1e6,
+        "disk_mb_per_s": rate / 1e6,
+        "gb_per_hour": rate * 3600 / 1e9,
+    }
+
+
 def verdict(row: dict) -> tuple[bool, str]:
     reasons = []
+    notes = []
     applied = row["applied_fps"]
     if applied > 0 and row["achieved_fps"] < PASS_FPS_FRACTION * applied:
         reasons.append(f"fps {row['achieved_fps']:.2f} < 99% of {applied:.2f}")
@@ -125,7 +166,19 @@ def verdict(row: dict) -> tuple[bool, str]:
         reasons.append(f"{row['errors']} grab errors")
     if row["frames"] < 2:
         reasons.append("no frames")
-    return (not reasons, "; ".join(reasons) or "ok")
+    # Writer fields exist only on recording runs.
+    if row.get("write_errors"):
+        reasons.append(f"{row['write_errors']} write errors")
+    if row.get("frames_lost_in_writer"):
+        reasons.append(f"{row['frames_lost_in_writer']} frames never written")
+    queue_max = row.get("queue_max") or 0
+    if queue_max >= QUEUE_FAIL:
+        reasons.append(f"writer queue peaked at {queue_max} (not keeping up)")
+    elif queue_max >= QUEUE_WARN:
+        notes.append(f"warn: writer queue peaked at {queue_max}")
+    if reasons:
+        return (False, "; ".join(reasons + notes))
+    return (True, "; ".join(notes) or "ok")
 
 
 def contention_note(solo: dict | None, both: dict) -> str:
@@ -156,6 +209,12 @@ class Recorder:
     incomplete: int = 0
     errors: int = 0
     last_error: str = ""
+    # Recording runs only.
+    q: "queue.Queue | None" = None
+    write_ms: list = field(default_factory=list)
+    queue_depths: list = field(default_factory=list)
+    frames_written: int = 0
+    write_errors: int = 0
 
 
 @dataclass
@@ -320,18 +379,66 @@ def grab_loop(cam, rec: Recorder, stop: threading.Event, copy_frames: bool, np) 
             frame_id = int(image.GetChunkData().GetFrameID())
         except Exception:
             pass
-        if copy_frames:
-            np.array(image.GetNDArray(), copy=True)
+        if copy_frames or rec.q is not None:
+            arr = np.array(image.GetNDArray(), copy=True)
+            if rec.q is not None:
+                rec.queue_depths.append(rec.q.qsize())
+                rec.q.put(arr)
         image.Release()
         rec.arrivals.append(t1)
         rec.grab_ms.append((t1 - t0) * 1000.0)
         rec.frame_ids.append(frame_id)
 
 
-def run_stage(PySpin, np, system, serials, fps, seconds, copy_frames, mode) -> list[dict]:
-    """Acquire from `serials` simultaneously for `seconds`; one result row each."""
+def open_writer(cv2, path: Path, codec: str, quality: int, fps: float, width: int, height: int):
+    """cv2.VideoWriter opened the way CameraController._open_segment_writer does."""
+    if codec == "mjpg":
+        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+        params = [cv2.VIDEOWRITER_PROP_IS_COLOR, 0, cv2.VIDEOWRITER_PROP_QUALITY, int(quality)]
+        writer = cv2.VideoWriter(str(path), fourcc, fps, (width, height), params)
+        if writer.isOpened():
+            return writer
+        writer.release()
+        print(f"    note: quality={quality} not applied (backend rejected the params overload); "
+              "MJPEG will use OpenCV's default quality")
+    else:
+        fourcc = cv2.VideoWriter_fourcc(*"GREY")
+    writer = cv2.VideoWriter(str(path), fourcc, fps, (width, height), isColor=False)
+    if not writer.isOpened():
+        writer.release()
+        raise RuntimeError(f"cv2.VideoWriter could not open {path} ({codec})")
+    return writer
+
+
+def write_loop(rec: Recorder, writer) -> None:
+    """Mirrors the app's append thread: one blocking write() per queued frame."""
+    while True:
+        arr = rec.q.get()
+        try:
+            if arr is None:
+                return
+            t0 = time.perf_counter()
+            writer.write(arr)
+            rec.write_ms.append((time.perf_counter() - t0) * 1000.0)
+            rec.frames_written += 1
+        except Exception as exc:
+            rec.write_errors += 1
+            rec.last_error = f"write: {exc}"
+        finally:
+            rec.q.task_done()
+
+
+def run_stage(PySpin, np, system, serials, fps, seconds, copy_frames, mode, record=None) -> list[dict]:
+    """Acquire from `serials` simultaneously for `seconds`; one result row each.
+
+    `record` (optional): {"dir": Path, "codec": "mjpg"|"grey", "quality": int,
+    "keep": bool, "cv2": module}. When set, every camera also writes an AVI
+    through a cv2.VideoWriter on its own writer thread, like the app does.
+    """
     cam_list = system.GetCameras()
     cams, infos, recs, threads = [], [], [], []
+    writers, wthreads, paths = [], [], []
+    drain_s = close_s = 0.0
     counters_after = []
     stop = threading.Event()
     rows: list[dict] = []
@@ -342,6 +449,16 @@ def run_stage(PySpin, np, system, serials, fps, seconds, copy_frames, mode) -> l
             cams.append(cam)
             infos.append(configure(PySpin, cam, fps))
             recs.append(Recorder(serial))
+        if record:
+            for info, rec in zip(infos, recs):
+                path = record["dir"] / f"{mode}_{info.serial}_{int(fps)}fps.avi"
+                writers.append(open_writer(record["cv2"], path, record["codec"], record["quality"],
+                                           info.applied_fps, info.width, info.height))
+                paths.append(path)
+                rec.q = queue.Queue()
+                t = threading.Thread(target=write_loop, args=(rec, writers[-1]), daemon=True)
+                t.start()
+                wthreads.append(t)
         for info in infos:
             print(f"    {info.serial} {info.model}: {info.width}x{info.height} {info.pixel_format}, "
                   f"link={info.speed}, applied {info.applied_fps:.2f} fps "
@@ -377,7 +494,25 @@ def run_stage(PySpin, np, system, serials, fps, seconds, copy_frames, mode) -> l
         cpu_cores = (time.process_time() - cpu0) / max(1e-9, time.monotonic() - wall0)
         counters_after = [read_stream_counters(PySpin, c) for c in cams]
 
-        for info, rec, after in zip(infos, recs, counters_after):
+        file_sizes = [0] * len(recs)
+        if record:
+            # Backlog still queued when capture stops = how far behind the writer was.
+            t_drain = time.perf_counter()
+            for rec in recs:
+                rec.q.join()
+            drain_s = time.perf_counter() - t_drain
+            for rec in recs:
+                rec.q.put(None)
+            for t in wthreads:
+                t.join(timeout=10.0)
+            t_close = time.perf_counter()
+            for w in writers:
+                w.release()
+            close_s = time.perf_counter() - t_close
+            writers.clear()
+            file_sizes = [p.stat().st_size if p.exists() else 0 for p in paths]
+
+        for idx, (info, rec, after) in enumerate(zip(infos, recs, counters_after)):
             stats = summarize(rec.arrivals, rec.grab_ms, rec.frame_ids, info.bytes_per_frame)
             # These reset on BeginAcquisition, so the post-run value is the
             # per-run total; subtracting the pre-run read would be meaningless.
@@ -392,10 +527,24 @@ def run_stage(PySpin, np, system, serials, fps, seconds, copy_frames, mode) -> l
                 "stream_counters": ";".join(f"{k}={v}" for k, v in stream.items()),
                 **stats,
             }
+            if record:
+                span = (rec.arrivals[-1] - rec.arrivals[0]) if len(rec.arrivals) > 1 else 0.0
+                row.update(summarize_writer(
+                    rec.write_ms, rec.queue_depths, len(rec.arrivals), rec.frames_written,
+                    rec.write_errors, file_sizes[idx], span))
+                row.update({"codec": record["codec"], "drain_s": drain_s, "close_s": close_s})
             row["pass"], row["reason"] = verdict(row)
             rows.append(row)
     finally:
         stop.set()
+        for w in writers:  # only non-empty if we failed before the clean shutdown above
+            try:
+                w.release()
+            except Exception:
+                pass
+        if record and not record["keep"]:
+            for path in paths:
+                path.unlink(missing_ok=True)
         for cam in cams:
             try:
                 cam.EndAcquisition()
@@ -420,6 +569,9 @@ CSV_FIELDS = [
     "applied_fps", "fps_ceiling", "seconds", "frames", "achieved_fps", "mb_per_s",
     "frame_gaps", "incomplete", "errors", "grab_ms_p95", "grab_ms_max",
     "interval_ms_p99", "interval_ms_max", "process_cpu_cores", "stream_counters",
+    "codec", "frames_written", "frames_lost_in_writer", "write_errors", "append_ms_mean",
+    "append_ms_p95", "append_ms_max", "queue_p95", "queue_max", "file_mb", "disk_mb_per_s",
+    "gb_per_hour", "drain_s", "close_s",
     "pass", "reason", "last_error",
 ]
 
@@ -430,11 +582,11 @@ def fmt(value, spec=".2f") -> str:
 
 def print_report(all_rows: list[dict]) -> None:
     print("\n" + "=" * 100)
-    header = (f"{'fps':>4} {'mode':<5} {'serial':<9} {'achvd':>7} {'gaps':>5} {'incmp':>5} {'err':>4} "
+    header = (f"{'fps':>4} {'mode':<9} {'serial':<9} {'achvd':>7} {'gaps':>5} {'incmp':>5} {'err':>4} "
               f"{'grab95':>7} {'intv99':>7} {'intvMax':>8} {'MB/s':>6} {'cpu':>5}  result")
     print(header)
     for r in all_rows:
-        print(f"{r['target_fps']:>4.0f} {r['mode']:<5} {r['serial']:<9} {fmt(r['achieved_fps']):>7} "
+        print(f"{r['target_fps']:>4.0f} {r['mode']:<9} {r['serial']:<9} {fmt(r['achieved_fps']):>7} "
               f"{r['frame_gaps']:>5} {r['incomplete']:>5} {r['errors']:>4} "
               f"{fmt(r['grab_ms_p95'], '.1f'):>7} {fmt(r['interval_ms_p99'], '.1f'):>7} "
               f"{fmt(r['interval_ms_max'], '.1f'):>8} {r['mb_per_s']:>6.1f} {r['process_cpu_cores']:>5.2f}  "
@@ -446,6 +598,20 @@ def print_report(all_rows: list[dict]) -> None:
         solo = next((s for s in all_rows if s["mode"] == "solo"
                      and s["serial"] == r["serial"] and s["target_fps"] == r["target_fps"]), None)
         print(f"  {r['target_fps']:>4.0f} fps  {r['serial']}: {contention_note(solo, r)}")
+    rec_rows = [r for r in all_rows if r.get("codec")]
+    if rec_rows:
+        print("\nWriter stage (cv2.VideoWriter per camera, same settings as the app):")
+        print(f"{'fps':>4} {'codec':<5} {'serial':<9} {'app_mean':>8} {'app_p95':>7} {'app_max':>7} "
+              f"{'q_p95':>5} {'q_max':>5} {'written':>8} {'lost':>5} {'disk MB/s':>9} {'GB/h':>6} "
+              f"{'drain_s':>7} {'close_s':>7}")
+        for r in rec_rows:
+            print(f"{r['target_fps']:>4.0f} {r['codec']:<5} {r['serial']:<9} "
+                  f"{fmt(r['append_ms_mean'], '.1f'):>8} {fmt(r['append_ms_p95'], '.1f'):>7} "
+                  f"{fmt(r['append_ms_max'], '.1f'):>7} {fmt(r['queue_p95'], '.0f'):>5} {r['queue_max']:>5} "
+                  f"{r['frames_written']:>8} {r['frames_lost_in_writer']:>5} {r['disk_mb_per_s']:>9.1f} "
+                  f"{r['gb_per_hour']:>6.1f} {r['drain_s']:>7.2f} {r['close_s']:>7.2f}")
+        print("  app_* = write() time per frame; q_* = frames waiting in the writer queue "
+              "(GUI warns at 5); drain_s = backlog left when capture stopped.")
     for r in all_rows:
         if r["stream_counters"]:
             print(f"  [{r['mode']} {r['target_fps']:.0f} fps {r['serial']}] stream counters: {r['stream_counters']}")
@@ -459,6 +625,11 @@ def main() -> int:
     ap.add_argument("--no-solo", action="store_true", help="skip the per-camera solo baselines (no contention comparison)")
     ap.add_argument("--no-copy", action="store_true", help="skip the per-frame numpy copy (isolates USB from memcpy cost)")
     ap.add_argument("--out-dir", default="probe_output")
+    ap.add_argument("--record-dir", help="writer stage: also write AVIs to this folder (put it on the drive you will record to)")
+    ap.add_argument("--codec", nargs="+", choices=["mjpg", "grey"], default=["mjpg"],
+                    help="writer stage codecs (default: mjpg). grey = uncompressed, ~184 GB/h for two cameras at 30 fps")
+    ap.add_argument("--quality", type=int, default=75, help="MJPEG quality 0-100 (app default 75)")
+    ap.add_argument("--keep", action="store_true", help="keep the recorded AVIs (default: delete after each run)")
     args = ap.parse_args()
 
     import numpy as np
@@ -484,19 +655,35 @@ def main() -> int:
             print(f"Need at least 2 cameras for a multi-camera probe; have {serials}")
             return 2
 
+        record_dir = None
+        cv2 = None
+        if args.record_dir:
+            import cv2
+            record_dir = Path(args.record_dir) / f"probe_{datetime.now():%Y%m%d_%H%M%S}"
+            record_dir.mkdir(parents=True, exist_ok=True)
+            usage = shutil.disk_usage(record_dir)
+            print(f"Recording to {record_dir}  (free {usage.free / 1e9:.0f} GB of {usage.total / 1e9:.0f} GB)")
+
         plan = []
         for fps in args.fps:
-            for serial in ([] if args.no_solo else serials):
-                plan.append((fps, "solo", [serial]))
-            plan.append((fps, "both", list(serials)))
+            if record_dir is None:
+                for serial in ([] if args.no_solo else serials):
+                    plan.append((fps, "solo", [serial], None))
+                plan.append((fps, "both", list(serials), None))
+            else:  # writer stage: acquisition-only baselines already covered by a plain run
+                for codec in args.codec:
+                    plan.append((fps, f"rec-{codec}", list(serials), codec))
         total_s = len(plan) * (args.seconds + 3)
         print(f"Cameras: {serials}\nPlan: {len(plan)} runs x {args.seconds:.0f}s (~{total_s / 60:.0f} min)\n")
 
         all_rows: list[dict] = []
-        for n, (fps, mode, group) in enumerate(plan, 1):
+        for n, (fps, mode, group, codec) in enumerate(plan, 1):
             print(f"[{n}/{len(plan)}] {mode} @ {fps:.0f} fps: {group}")
+            record = None if codec is None else {
+                "dir": record_dir, "codec": codec, "quality": args.quality, "keep": args.keep, "cv2": cv2}
             try:
-                all_rows += run_stage(PySpin, np, system, group, fps, args.seconds, not args.no_copy, mode)
+                all_rows += run_stage(PySpin, np, system, group, fps, args.seconds,
+                                      not args.no_copy, mode, record)
             except Exception as exc:
                 print(f"    run failed: {exc.__class__.__name__}: {exc}"
                       "\n    (is SpinView or the recorder GUI still holding a camera?)")
@@ -512,7 +699,12 @@ def main() -> int:
             writer.writeheader()
             writer.writerows(all_rows)
         print(f"\nWrote {out}")
-        return 0 if all(r["pass"] for r in all_rows if r["mode"] == "both") else 1
+        if record_dir is not None and not args.keep:
+            try:
+                record_dir.rmdir()
+            except OSError:
+                pass
+        return 0 if all(r["pass"] for r in all_rows if r["mode"] != "solo") else 1
     finally:
         system.ReleaseInstance()
 
