@@ -45,6 +45,10 @@ DIAGNOSTIC_FIELDS = [
     "ndarray_ms",
     "ndarray_ms_p95",
     "append_queue_depth",
+    # GUI-thread cost of turning one frame into its on-screen tile (resize +
+    # QImage + paint), per displayed frame. Added with multi-camera previews.
+    "render_ms",
+    "render_ms_p95",
 ]
 
 
@@ -80,6 +84,7 @@ class PreviewDiagnosticsAccumulator:
         self._preview_ages_ms: list[float] = []
         self._retrieval_to_publish_ms: list[float] = []
         self._publish_to_display_ms: list[float] = []
+        self._render_ms: list[float] = []
         self._rendered_frames = 0
         self._repeated_frames = 0
         self._latest_frame_id: int | None = None
@@ -88,6 +93,10 @@ class PreviewDiagnosticsAccumulator:
 
     def note_repeated_frame(self) -> None:
         self._repeated_frames += 1
+
+    def note_render_ms(self, elapsed_ms: float) -> None:
+        """GUI-thread time spent rendering one displayed frame."""
+        self._render_ms.append(max(0.0, float(elapsed_ms)))
 
     def note_displayed_frame(
         self,
@@ -216,12 +225,15 @@ class PreviewDiagnosticsAccumulator:
                 "" if camera_state.get("append_queue_depth") is None
                 else int(camera_state["append_queue_depth"])
             ),
+            "render_ms": _rounded(_mean(self._render_ms)),
+            "render_ms_p95": _rounded(_percentile(self._render_ms, 0.95)),
         }
 
         self._interval_started_at = sampled_at
         self._preview_ages_ms.clear()
         self._retrieval_to_publish_ms.clear()
         self._publish_to_display_ms.clear()
+        self._render_ms.clear()
         self._rendered_frames = 0
         self._repeated_frames = 0
         self._previous_acquisition_stats = stats

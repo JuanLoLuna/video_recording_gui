@@ -10,6 +10,25 @@ from backend.preview_diagnostics import (
 )
 
 
+class RenderTimingTests(unittest.TestCase):
+    def test_render_ms_is_averaged_and_reset_each_interval(self):
+        accumulator = PreviewDiagnosticsAccumulator()
+        accumulator.reset({}, now=0.0)
+        for ms in (2.0, 4.0, 6.0):
+            accumulator.note_render_ms(ms)
+        row = accumulator.sample({}, now=1.0)
+        self.assertEqual(row["render_ms"], 4.0)
+        self.assertEqual(row["render_ms_p95"], 6.0)
+        self.assertEqual(set(row), set(DIAGNOSTIC_FIELDS))
+        again = accumulator.sample({}, now=2.0)
+        self.assertEqual(again["render_ms"], "")  # nothing rendered this interval
+
+    def test_render_columns_are_appended_after_the_legacy_ones(self):
+        # Additive: every reader selects columns by name.
+        self.assertEqual(DIAGNOSTIC_FIELDS[-2:], ["render_ms", "render_ms_p95"])
+        self.assertEqual(DIAGNOSTIC_FIELDS[-3], "append_queue_depth")
+
+
 class PreviewDiagnosticsAccumulatorTests(unittest.TestCase):
     def test_aggregates_pipeline_timings_and_counter_deltas(self):
         accumulator = PreviewDiagnosticsAccumulator()
