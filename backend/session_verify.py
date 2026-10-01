@@ -34,6 +34,10 @@ class CameraSessionReport:
     camera_frame_id_gaps: int = 0
     timeline_breaks: int = 0
     effective_fps: float | None = None
+    # Longest wall-clock time between two consecutive captured frames. A big
+    # value on a camera with no timeline break means its acquisition stalled.
+    max_capture_gap_s: float = 0.0
+    max_capture_gap_row: int | None = None
     median_timestamp_delta_ms: float | None = None
     header: dict | None = None
     problems: list[str] = field(default_factory=list)
@@ -230,6 +234,15 @@ def verify_camera_outputs(
 
     # ---- achieved rate from the wall clock
     times = [float(r["system_time"]) for r in rows if r.get("system_time")]
+    stamped = [
+        (float(r["system_time"]), _int(r.get("record_frame_index")))
+        for r in rows
+        if r.get("system_time")
+    ]
+    for (before, _), (after, frame_index) in zip(stamped, stamped[1:]):
+        if after - before > report.max_capture_gap_s:
+            report.max_capture_gap_s = after - before
+            report.max_capture_gap_row = frame_index  # the first frame after the pause
     if len(times) > 1 and times[-1] > times[0]:
         report.effective_fps = (len(times) - 1) / (times[-1] - times[0])
         if (

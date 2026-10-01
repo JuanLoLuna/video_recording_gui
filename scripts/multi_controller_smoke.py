@@ -43,6 +43,9 @@ def main() -> int:
     ap.add_argument("--output-dir", default="smoke_output")
     ap.add_argument("--serials", nargs="+", help="camera serials, primary first")
     ap.add_argument("--fault-serial", help="serial you will unplug/replug mid-run")
+    ap.add_argument("--fault-queue-tolerance", type=int, default=300,
+                    help="in a --fault-serial run, the append-queue peak (frames) tolerated on the cameras that were "
+                         "NOT unplugged, provided it drains back to < 5 (default 300 = 10 s at 30 fps)")
     ap.add_argument("--cleanup", action="store_true", help="delete the recorded files afterwards")
     args = ap.parse_args()
 
@@ -119,13 +122,26 @@ def run_session(args, slots, group) -> int:
     deadline = time.monotonic() + args.seconds
     next_report = time.monotonic() + 10.0
     queue_max = {s.serial: 0 for s in slots}  # sampled every 0.25 s, not only at report time
+    queue_max_at = {s.serial: 0.0 for s in slots}
+    started_mono = time.monotonic()
+    # Longest single write() and GetNextImage() per camera, from the controller's
+    # own loop timing. A ~5000 ms write() = a disk/USB stall; a small write() but
+    # a delayed queue = the writer thread was starved (e.g. the GIL).
+    append_ms_max = {s.serial: 0.0 for s in slots}
+    grab_ms_max = {s.serial: 0.0 for s in slots}
     if args.fault_serial:
         print(f"\n>>> During the run, UNPLUG camera #{args.fault_serial} for ~20-30 s, then replug it. <<<")
     try:
         while time.monotonic() < deadline:
             time.sleep(0.25)
             for s in slots:
-                queue_max[s.serial] = max(queue_max[s.serial], s.controller._append_queue.qsize())
+                depth = s.controller._append_queue.qsize()
+                if depth > queue_max[s.serial]:
+                    queue_max[s.serial] = depth
+                    queue_max_at[s.serial] = time.monotonic() - started_mono
+                timing = s.controller.get_and_reset_loop_timing_samples()
+                append_ms_max[s.serial] = max([append_ms_max[s.serial], *timing.get("append_ms", [])])
+                grab_ms_max[s.serial] = max([grab_ms_max[s.serial], *timing.get("grab_ms", [])])
             if time.monotonic() >= next_report:
                 next_report += 10.0
                 line = f"  t+{args.seconds - (deadline - time.monotonic()):4.0f}s "
@@ -173,8 +189,29 @@ def run_session(args, slots, group) -> int:
         for name in counters:
             if stats[name]:
                 problems.append(f"{name}={stats[name]}")
-        if queue_max[s.serial] >= 5:
-            problems.append(f"append queue peaked at {queue_max[s.serial]} (plan criterion: < 5)")
+        final_depth = s.controller._append_queue.qsize()
+        notes = []
+        if faulted or not args.fault_serial:
+            limit = 5 if not args.fault_serial else None
+        else:
+            limit = args.fault_queue_tolerance
+        if limit is not None and queue_max[s.serial] >= limit:
+            problems.append(
+                f"append queue peaked at {queue_max[s.serial]} "
+                f"({'plan criterion: < 5' if limit == 5 else f'tolerance {limit} during a fault run'})"
+            )
+        elif args.fault_serial and not faulted and queue_max[s.serial] >= 5:
+            notes.append(
+                f"append queue peaked at {queue_max[s.serial]} at t+{queue_max_at[s.serial]:.0f}s during the fault run "
+                f"(tolerated; drained to {final_depth})"
+            )
+        if final_depth >= 5:
+            problems.append(f"append queue still holds {final_depth} frames after stop (writer never caught up)")
+        if not faulted and report.max_capture_gap_s > 0.5:
+            problems.append(
+                f"capture stalled {report.max_capture_gap_s:.2f}s before frame {report.max_capture_gap_row} "
+                "(an untouched camera should never pause)"
+            )
         if faulted:
             if report.timeline_breaks < 1 or stats["camera_reinits"] < 1:
                 problems.append("expected a timeline break and a reinit after the unplug; saw none")
@@ -191,6 +228,11 @@ def run_session(args, slots, group) -> int:
         delta = f"{report.median_timestamp_delta_ms:.2f}" if report.median_timestamp_delta_ms else "?"
         print(f"    effective fps {fps_txt} (applied {fps_by[s.serial]:.2f}); median camera timestamp delta {delta} ms; "
               f"frame-id gaps {report.camera_frame_id_gaps}")
+        print(f"    longest write() {append_ms_max[s.serial]:.0f} ms, longest grab {grab_ms_max[s.serial]:.0f} ms, "
+              f"longest gap between captured frames {report.max_capture_gap_s * 1000:.0f} ms "
+              f"(before frame {report.max_capture_gap_row}), queue peak {queue_max[s.serial]} at t+{queue_max_at[s.serial]:.0f}s")
+        for note in notes:
+            print(f"    note: {note}")
         for problem in problems:
             print(f"    !! {problem}")
         print(f"    verify video: python scripts/verify_avi.py \"{p.video_final(0)}\" --segments \"{p.segments_csv}\"")

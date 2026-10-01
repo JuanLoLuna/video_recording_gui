@@ -185,6 +185,13 @@ class VerifyCameraOutputsTests(unittest.TestCase):
         report = self.verify(adl_label="Écrire \u2014 \u66f8\u304f")
         self.assertTrue(report.ok, report.problems)
 
+    def test_the_longest_capture_gap_is_reported(self):
+        clean = self.verify()
+        self.assertAlmostEqual(clean.max_capture_gap_s, 1 / 30.0, places=4)
+        stalled = self.verify(frames_per_segment=(3, 2), skip_indices=(3,))  # one row missing = one 2-frame gap
+        self.assertAlmostEqual(stalled.max_capture_gap_s, 2 / 30.0, places=4)
+        self.assertEqual(stalled.max_capture_gap_row, 4)
+
     def test_an_unclosed_final_segment_is_a_problem(self):
         report = self.verify(last_roll="frame_count")
         self.assertTrue(any("session_stop" in p for p in report.problems))
