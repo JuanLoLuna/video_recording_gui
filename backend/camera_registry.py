@@ -18,6 +18,14 @@ Naming rules (see backend/recording_paths.py)
     is currently plugged in: with the env var set, a camera keeps its name
     even while another one is missing. Without the env var and with a single
     camera attached, that camera is the primary (legacy names).
+
+Known hazard, surfaced rather than hidden: WITHOUT the env var, which camera
+holds the untagged names depends on who is plugged in (2 cameras -> lowest
+serial; 1 camera -> that camera). If a camera drops out, the survivor silently
+takes over the untagged names -- possibly a different sensor under the usual
+name. select_cameras() therefore reports a warning whenever several cameras are
+seen without the env var, and the controller records camera_serial in every
+events header so a swap is detectable afterwards. Set the env var to pin names.
 """
 
 from __future__ import annotations
@@ -32,6 +40,19 @@ from backend.recording_paths import camera_tag_for_serial
 CAMERA_SERIALS_ENV = "SLEEVE_VIDEO_GUI_CAMERA_SERIALS"
 
 _SPLIT_RE = re.compile(r"[,\s;]+")
+# Serials end up in file names (via the camera tag), so only the same
+# alphanumeric set recording_paths accepts is usable.
+_SERIAL_RE = re.compile(r"^[A-Za-z0-9]+$")
+
+
+def _clean_serial(raw: str) -> str:
+    """Strip whitespace and the quotes cmd.exe leaves in `set VAR="a,b"`."""
+    return str(raw).strip().strip("\"'").strip()
+
+
+def _serial_sort_key(serial: str) -> tuple[int, str]:
+    # Numeric serials of different lengths: "9999999" < "10000000".
+    return (len(serial), serial)
 
 
 @dataclass(frozen=True)
@@ -61,6 +82,7 @@ class CameraSelection:
     bound: tuple[BoundCamera, ...]
     missing: tuple[str, ...]  # configured serials that were not detected
     unused: tuple[CameraDescriptor, ...]  # detected but not configured
+    warnings: tuple[str, ...] = ()  # things the GUI should say out loud
 
     @property
     def multi_camera(self) -> bool:
@@ -73,7 +95,7 @@ def parse_serials_env(env: Mapping[str, str] | None = None) -> list[str]:
     raw = env_map.get(CAMERA_SERIALS_ENV, "")
     seen: list[str] = []
     for item in _SPLIT_RE.split(raw):
-        serial = item.strip()
+        serial = _clean_serial(item)
         if serial and serial not in seen:
             seen.append(serial)
     return seen
@@ -83,23 +105,47 @@ def select_cameras(
     discovered: Iterable[CameraDescriptor],
     configured: Sequence[str] | None = None,
 ) -> CameraSelection:
+    warnings: list[str] = []
     by_serial: dict[str, CameraDescriptor] = {}
+    unreadable = 0
     for descriptor in discovered:
-        by_serial.setdefault(str(descriptor.serial), descriptor)
+        serial = _clean_serial(descriptor.serial)
+        if not _SERIAL_RE.match(serial):
+            # e.g. "<unavailable>" from a failed TL read: cannot name files.
+            unreadable += 1
+            continue
+        by_serial.setdefault(serial, descriptor)
+    if unreadable:
+        warnings.append(
+            f"{unreadable} detected camera(s) with an unreadable serial number were ignored."
+        )
 
-    configured_serials = [str(s) for s in (configured or [])]
+    configured_serials = [_clean_serial(s) for s in (configured or []) if _clean_serial(s)]
     if configured_serials:
         ordering = configured_serials
         missing = tuple(s for s in ordering if s not in by_serial)
         unused = tuple(
-            by_serial[s] for s in sorted(by_serial) if s not in configured_serials
+            by_serial[s]
+            for s in sorted(by_serial, key=_serial_sort_key)
+            if s not in configured_serials
         )
         present = [s for s in ordering if s in by_serial]
+        if ordering[0] in missing:
+            warnings.append(
+                f"Primary camera #{ordering[0]} is missing: this session will have no "
+                "untagged (downstream-ingestible) video."
+            )
     else:
-        ordering = sorted(by_serial)
+        ordering = sorted(by_serial, key=_serial_sort_key)
         missing = ()
         unused = ()
         present = list(ordering)
+        if len(ordering) > 1:
+            warnings.append(
+                f"{len(ordering)} cameras detected but {CAMERA_SERIALS_ENV} is not set: "
+                "file names follow lowest-serial-first and will change if a camera is "
+                f"missing. Set {CAMERA_SERIALS_ENV}=" + ",".join(ordering) + " to pin them."
+            )
 
     primary_serial = ordering[0] if ordering else None
     bound = tuple(
@@ -111,7 +157,9 @@ def select_cameras(
         )
         for serial in present
     )
-    return CameraSelection(bound=bound, missing=missing, unused=unused)
+    return CameraSelection(
+        bound=bound, missing=missing, unused=unused, warnings=tuple(warnings)
+    )
 
 
 def format_camera_summary(selection: CameraSelection) -> str:
@@ -132,9 +180,12 @@ def format_camera_summary(selection: CameraSelection) -> str:
 
 
 def intersect_ranges(
-    ranges: Iterable[tuple[float, float] | None],
+    ranges: Iterable[Sequence[float] | None],
 ) -> tuple[float, float] | None:
     """The (lo, hi) range every camera supports; None if there is none.
+
+    Each range is read as (lo, hi, ...): extra elements are ignored, so a
+    controller's (min, max, current) triple can be passed straight in.
 
     None entries (a camera that could not report a range) are ignored rather
     than collapsing the answer, matching how the GUI already treats unreadable

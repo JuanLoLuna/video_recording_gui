@@ -1,3 +1,5 @@
+import contextlib
+import io
 import unittest
 
 from backend.camera_group import CameraGroup, CameraSlot
@@ -38,6 +40,11 @@ class FakeController:
         return self._start_recording
 
     def stop_recording(self):
+        # NOTE: simplification. The real CameraController.stop_recording() only
+        # sets a flag; recording_active stays True until the acquisition loop
+        # has drained and closed the final segment, and an already-accepted
+        # start is not undone by it. Tests here therefore prove ORDERING and
+        # error isolation, not that a rollback erases a started recording.
         self.log.append(f"{self.name}:stop_recording")
         self._maybe_raise("stop_recording")
         self.recording_active = False
@@ -72,17 +79,34 @@ class ConstructionTests(unittest.TestCase):
         log = []
         with self.assertRaises(ValueError):
             CameraGroup([
-                CameraSlot(FakeController("a", log), serial="1"),
-                CameraSlot(FakeController("b", log), serial="1"),
+                CameraSlot(FakeController("a", log), serial="1", tag="cam1"),
+                CameraSlot(FakeController("b", log), serial="1", tag="cam2"),
             ])
 
-    def test_first_slot_is_primary_when_none_is_marked(self):
+    def test_rejects_two_slots_that_would_write_the_same_files(self):
+        # Same tag (or two untagged slots) -> identical SessionPaths -> two
+        # controllers silently writing one metadata CSV / .avi.
         log = []
-        group = CameraGroup([
-            CameraSlot(FakeController("a", log), serial="1"),
-            CameraSlot(FakeController("b", log), serial="2"),
-        ])
-        self.assertEqual(group.primary.serial, "1")
+        for tags in (("cam1", "cam1"), (None, None)):
+            with self.assertRaises(ValueError, msg=str(tags)):
+                CameraGroup([
+                    CameraSlot(FakeController("a", log), serial="1", tag=tags[0]),
+                    CameraSlot(FakeController("b", log), serial="2", tag=tags[1]),
+                ])
+
+    def test_no_primary_is_invented_when_none_is_marked(self):
+        # With a configured primary missing, every present camera is tagged and
+        # the session has no untagged video; the group must not promote one.
+        log = []
+        a = CameraSlot(FakeController("a", log), serial="1", tag="cam1")
+        group = CameraGroup([a, CameraSlot(FakeController("b", log), serial="2", tag="cam2")])
+        self.assertIsNone(group.primary)
+        self.assertFalse(a.is_primary)  # the caller's slot is not mutated
+        self.assertEqual(group.default_slot.serial, "1")  # GUI still has somewhere to point
+
+    def test_default_slot_is_the_primary_when_there_is_one(self):
+        group, _, _ = make_group([])
+        self.assertEqual(group.default_slot.serial, "111")
 
     def test_slot_lookup_and_label(self):
         group, _, _ = make_group([])
@@ -108,6 +132,43 @@ class StartAllTests(unittest.TestCase):
         self.assertIn("No camera detected.", result.message)
         self.assertEqual(log, ["a:start", "b:start", "a:stop"])
         self.assertFalse(group.any_acquiring)
+        self.assertEqual(result.deferred, ())
+
+    def test_a_deferred_rollback_stop_is_reported(self):
+        # If rolling back camera A cannot complete its teardown, the caller
+        # must hear about it (it must not release the shared System).
+        log = []
+        group, a, b = make_group(
+            log, a={"stop": (False, "thread alive")}, b={"start": (False, "boom")}
+        )
+        result = group.start_all()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.deferred, ("111",))
+
+    def test_a_camera_that_was_already_running_is_left_alone_and_never_rolled_back(self):
+        log = []
+        group, a, b = make_group(log, b={"start": (False, "boom")})
+        a.acquiring = True  # e.g. a second Start Preview click
+        result = group.start_all()
+        self.assertFalse(result.ok)
+        self.assertEqual(log, ["b:start"])  # A not restarted, and not stopped on rollback
+        self.assertTrue(a.acquiring)
+
+    def test_best_effort_keeps_the_cameras_that_did_start(self):
+        log = []
+        group, a, b = make_group(log, b={"start": (False, "init failed")})
+        result = group.start_all(best_effort=True)
+        self.assertTrue(result.ok)
+        self.assertIn("Blackfly #222: init failed", result.message)
+        self.assertTrue(a.acquiring)
+        self.assertNotIn("a:stop", log)
+
+    def test_best_effort_with_no_camera_started_is_a_failure(self):
+        log = []
+        group, a, b = make_group(
+            log, a={"start": (False, "x")}, b={"start": (False, "y")}
+        )
+        self.assertFalse(group.start_all(best_effort=True).ok)
 
     def test_an_exception_while_starting_is_a_failure_not_a_crash(self):
         log = []
@@ -148,6 +209,7 @@ class StopAllTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("#222", result.message)
         self.assertIn("still alive", result.message)
+        self.assertEqual(result.deferred, ("222",))
 
     def test_one_camera_raising_in_stop_does_not_skip_the_other(self):
         log = []
@@ -163,12 +225,14 @@ class StopAllTests(unittest.TestCase):
         group, a, b = make_group(log, a={"raises": {"stop_recording"}})
         group.start_all()
         log.clear()
-        group.stop_recording_all()
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            group.stop_recording_all()
         self.assertEqual(log, ["a:stop_recording", "b:stop_recording"])
+        self.assertIn("stop_recording failed", printed.getvalue())
 
 
 class RecordingTests(unittest.TestCase):
-    def test_each_camera_gets_its_own_paths_and_fps(self):
+    def test_each_camera_gets_its_own_paths_and_fps_and_the_primary_starts_last(self):
         log = []
         group, a, b = make_group(log)
         group.start_all()
@@ -179,11 +243,13 @@ class RecordingTests(unittest.TestCase):
         )
         self.assertTrue(result.ok)
         self.assertEqual(
-            log, ["a:start_recording:paths-111:30.0", "b:start_recording:paths-222:29.97"]
+            log, ["b:start_recording:paths-222:29.97", "a:start_recording:paths-111:30.0"]
         )
         self.assertTrue(group.any_recording)
 
-    def test_a_refusal_rolls_back_the_cameras_already_recording(self):
+    def test_a_secondary_refusing_never_touches_the_primary(self):
+        # The primary owns the downstream-visible (untagged) file names, so a
+        # refusal elsewhere must happen before it is asked to start.
         log = []
         group, a, b = make_group(log, b={"start_recording": (False, "Cannot open metadata CSV")})
         group.start_all()
@@ -191,8 +257,41 @@ class RecordingTests(unittest.TestCase):
         result = group.start_recording_all(lambda s: "p", lambda s: 30.0)
         self.assertFalse(result.ok)
         self.assertIn("Cannot open metadata CSV", result.message)
-        self.assertEqual(log[-1], "a:stop_recording")
+        self.assertEqual(log, ["b:start_recording:p:30.0"])  # A never asked
         self.assertFalse(group.any_recording)
+
+    def test_a_primary_refusal_rolls_back_the_secondaries_already_started(self):
+        log = []
+        group, a, b = make_group(log, a={"start_recording": (False, "disk full")})
+        group.start_all()
+        log.clear()
+        result = group.start_recording_all(lambda s: "p", lambda s: 30.0)
+        self.assertFalse(result.ok)
+        self.assertEqual(
+            log,
+            ["b:start_recording:p:30.0", "a:start_recording:p:30.0", "b:stop_recording"],
+        )
+        self.assertFalse(group.any_recording)
+
+    def test_best_effort_recording_keeps_the_cameras_that_accepted(self):
+        log = []
+        group, a, b = make_group(log, b={"start_recording": (False, "no space")})
+        group.start_all()
+        result = group.start_recording_all(lambda s: "p", lambda s: 30.0, best_effort=True)
+        self.assertTrue(result.ok)
+        self.assertIn("Blackfly #222: no space", result.message)
+        self.assertTrue(a.recording_active)
+        self.assertFalse(b.recording_active)
+
+    def test_best_effort_recording_with_nobody_accepting_fails(self):
+        log = []
+        group, a, b = make_group(
+            log, a={"start_recording": (False, "x")}, b={"start_recording": (False, "y")}
+        )
+        group.start_all()
+        self.assertFalse(
+            group.start_recording_all(lambda s: "p", lambda s: 30.0, best_effort=True).ok
+        )
 
     def test_an_exception_starting_the_recording_is_a_clean_failure(self):
         log = []

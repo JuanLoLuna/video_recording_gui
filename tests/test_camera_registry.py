@@ -91,6 +91,53 @@ class SelectCamerasTests(unittest.TestCase):
         self.assertEqual(len(selection.bound), 1)
 
 
+class SelectionWarningTests(unittest.TestCase):
+    def test_several_cameras_without_the_env_var_warn_about_unstable_names(self):
+        selection = select_cameras([FIREFLY, BLACKFLY])
+        self.assertEqual(len(selection.warnings), 1)
+        self.assertIn(CAMERA_SERIALS_ENV, selection.warnings[0])
+        # The suggestion is directly pasteable.
+        self.assertIn("23227865,26134271", selection.warnings[0])
+
+    def test_one_camera_without_the_env_var_is_quiet_legacy_behaviour(self):
+        self.assertEqual(select_cameras([BLACKFLY]).warnings, ())
+
+    def test_configured_cameras_do_not_warn_about_pinning(self):
+        selection = select_cameras([FIREFLY, BLACKFLY], ["23227865", "26134271"])
+        self.assertEqual(selection.warnings, ())
+
+    def test_missing_primary_is_called_out(self):
+        selection = select_cameras([BLACKFLY], ["23227865", "26134271"])
+        self.assertEqual(len(selection.warnings), 1)
+        self.assertIn("#23227865", selection.warnings[0])
+        self.assertIn("no untagged", selection.warnings[0])
+
+    def test_a_missing_secondary_is_not_a_primary_warning(self):
+        selection = select_cameras([FIREFLY], ["23227865", "26134271"])
+        self.assertEqual(selection.warnings, ())
+        self.assertEqual(selection.missing, ("26134271",))
+
+    def test_an_unreadable_serial_is_ignored_with_a_warning_not_a_crash(self):
+        selection = select_cameras(
+            [CameraDescriptor("<unavailable>", "X"), CameraDescriptor("", "Y"), FIREFLY]
+        )
+        self.assertEqual([c.serial for c in selection.bound], ["23227865"])
+        self.assertTrue(any("unreadable" in w for w in selection.warnings))
+
+    def test_serials_sort_numerically_by_length_then_value(self):
+        short = CameraDescriptor("9999999", "S")
+        long_ = CameraDescriptor("10000000", "L")
+        selection = select_cameras([long_, short])
+        self.assertEqual([c.serial for c in selection.bound], ["9999999", "10000000"])
+
+    def test_cmd_style_quoted_and_padded_config_still_matches(self):
+        env = {CAMERA_SERIALS_ENV: ' "26134271 , 23227865" '}
+        configured = parse_serials_env(env)
+        self.assertEqual(configured, ["26134271", "23227865"])
+        selection = select_cameras([FIREFLY, BLACKFLY], configured)
+        self.assertEqual(selection.missing, ())
+
+
 class FormatSummaryTests(unittest.TestCase):
     def test_single_camera_summary(self):
         text = format_camera_summary(select_cameras([FIREFLY]))
@@ -120,6 +167,10 @@ class IntersectRangesTests(unittest.TestCase):
 
     def test_disjoint_is_none(self):
         self.assertIsNone(intersect_ranges([(1.0, 10.0), (20.0, 30.0)]))
+
+    def test_a_min_max_current_triple_is_accepted(self):
+        # get_frame_rate_limits() returns (min, max, current).
+        self.assertEqual(intersect_ranges([(1.0, 120.9, 30.0), (2.0, 170.6, 60.0)]), (2.0, 120.9))
 
     def test_unreadable_cameras_are_ignored(self):
         self.assertEqual(intersect_ranges([None, (1.0, 50.0)]), (1.0, 50.0))

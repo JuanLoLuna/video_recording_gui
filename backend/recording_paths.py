@@ -42,7 +42,7 @@ CAMERA_TAG_RE = re.compile(r"^[A-Za-z0-9]+$")
 def camera_tag_for_serial(serial: str | int) -> str:
     """Filename tag for a camera, e.g. 26134271 -> "cam26134271"."""
     tag = f"cam{serial}"
-    if not CAMERA_TAG_RE.match(tag):
+    if not str(serial) or not CAMERA_TAG_RE.match(tag):
         raise ValueError(f"camera serial {serial!r} cannot be used in a filename tag")
     return tag
 

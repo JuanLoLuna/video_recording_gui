@@ -141,8 +141,6 @@ class CheckWritableTests(unittest.TestCase):
                 locked.chmod(stat.S_IRWXU)
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 # The downstream pipeline's current video-name pattern
@@ -212,6 +210,10 @@ class CameraTagTests(unittest.TestCase):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 SessionPaths(output_dir=Path("/data"), basename="b", camera_tag=bad)
 
+    def test_empty_serial_is_rejected(self):
+        with self.assertRaises(ValueError):
+            camera_tag_for_serial("")
+
     def test_camera_tag_for_serial(self):
         self.assertEqual(camera_tag_for_serial("26134271"), "cam26134271")
         self.assertEqual(camera_tag_for_serial(23227865), "cam23227865")
@@ -240,3 +242,6 @@ class CameraTagTests(unittest.TestCase):
         paths = self.paths("cam26134271")
         stem = paths.metadata_csv.name[: -len("_metadata.csv")]
         self.assertTrue(paths.video_final(0).name.startswith(stem + "-"))
+
+if __name__ == "__main__":
+    unittest.main()
