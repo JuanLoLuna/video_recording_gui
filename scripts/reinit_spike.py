@@ -14,8 +14,8 @@ Run ON THE RIG with the recorder GUI and SpinView CLOSED:
 
     python scripts/reinit_spike.py --seconds 25
 
-Both cameras start streaming (the first discovered/serial-listed one is "A", the
-second is "B"). When the script says UNPLUG, pull camera B's USB cable. When it
+Both cameras start streaming (A and B are the two serials given with --serials,
+else the two lowest serials found; A keeps streaming, B is the one to unplug). When the script says UNPLUG, pull camera B's USB cable. When it
 says REPLUG, plug it back in (a DIFFERENT port is a stronger test). The script
 tears down only B, then keeps trying to re-find it by serial and restart it,
 while A is never touched. A's frame ids are checked for gaps the whole time.
@@ -39,6 +39,8 @@ class Stream:
         self.frames = 0
         self.gaps = 0
         self.errors = 0
+        self.frame_ids_seen = 0
+        self.max_interval_s = 0.0
         self.last_frame_at = time.perf_counter()
         self._last_id = None
         self._stop = threading.Event()
@@ -71,7 +73,13 @@ class Stream:
                 frame_id = None
             image.Release()
             self.frames += 1
-            self.last_frame_at = time.perf_counter()
+            now = time.perf_counter()
+            # A stall shows up as one very long interval even though no frame
+            # id is missing, which gap counting alone cannot see.
+            self.max_interval_s = max(self.max_interval_s, now - self.last_frame_at)
+            self.last_frame_at = now
+            if frame_id is not None:
+                self.frame_ids_seen += 1
             if frame_id is not None and self._last_id is not None and frame_id > self._last_id + 1:
                 self.gaps += frame_id - self._last_id - 1
             if frame_id is not None:
@@ -90,8 +98,17 @@ def open_camera(PySpin, system, serial, fps):
     CameraController keeps its own self.cam_list.
     """
     cam_list = system.GetCameras()
-    cam = cam_list.GetBySerial(serial)
-    cam.Init()
+    cam = None
+    try:
+        cam = cam_list.GetBySerial(serial)
+        cam.Init()
+        return cam_list, _configure_and_begin(PySpin, cam, fps)
+    except Exception:
+        teardown(cam_list, [cam] if cam is not None else [])
+        raise
+
+
+def _configure_and_begin(PySpin, cam, fps):
     nodemap = cam.GetNodeMap()
     chunk = PySpin.CBooleanPtr(nodemap.GetNode("ChunkModeActive"))
     if PySpin.IsWritable(chunk):
@@ -112,15 +129,26 @@ def open_camera(PySpin, system, serial, fps):
     if PySpin.IsWritable(rate):
         rate.SetValue(min(float(rate.GetMax()), max(float(rate.GetMin()), fps)))
     cam.BeginAcquisition()
-    return cam_list, cam
+    return cam
 
 
-def teardown(cam_list, cam):
-    for step in (lambda: cam.EndAcquisition(), lambda: cam.DeInit()):
-        try:
-            step()
-        except Exception:
-            pass
+def teardown(cam_list, cam_ref):
+    """EndAcquisition/DeInit the camera, DROP its reference, then Clear the list.
+
+    cam_ref is a one-element list so the caller's reference can be removed
+    here -- this mirrors CameraController._reinitialize_camera, which sets
+    self.cam = None before cam_list.Clear(). Clearing a list while Python still
+    holds the camera can make Spinnaker keep a stale device object alive,
+    which is exactly the condition this spike is testing.
+    """
+    if cam_ref:
+        cam = cam_ref.pop()
+        for step in (lambda: cam.EndAcquisition(), lambda: cam.DeInit()):
+            try:
+                step()
+            except Exception:
+                pass
+        del cam
     try:
         cam_list.Clear()
     except Exception:
@@ -141,12 +169,16 @@ def main() -> int:
     summary: dict[str, object] = {}
     stream_a = stream_b = None
     lists = {}
+    cams = {}
     try:
         probe = system.GetCameras()
         found = [serial_of(PySpin, probe[i]) for i in range(probe.GetSize())]
         probe.Clear()
+        if len(found) < 2:
+            print(f"Need both cameras attached; found {found}")
+            return 2
         serial_a, serial_b = args.serials or sorted(found)[:2]
-        if len(found) < 2 or serial_a not in found or serial_b not in found:
+        if serial_a not in found or serial_b not in found:
             print(f"Need both cameras attached; found {found}")
             return 2
         print(f"A (keeps streaming): {serial_a}    B (you unplug): {serial_b}\n")
@@ -154,13 +186,16 @@ def main() -> int:
         lists["a"], cam_a = open_camera(PySpin, system, serial_a, args.fps)
         lists["b"], cam_b = open_camera(PySpin, system, serial_b, args.fps)
         stream_a, stream_b = Stream("A", cam_a), Stream("B", cam_b)
+        cams = {"a": cam_a, "b": cam_b}
         stream_a.start()
         stream_b.start()
+        t_streaming = time.perf_counter()
         print(f"Both streaming for {args.seconds:.0f}s ...")
         time.sleep(args.seconds)
         print(f"  A: {stream_a.frames} frames, {stream_a.gaps} gaps | B: {stream_b.frames} frames, {stream_b.gaps} gaps")
         summary["baseline_A_gaps"] = stream_a.gaps
         summary["baseline_B_gaps"] = stream_b.gaps
+        baseline_a_rate = stream_a.frames / max(1e-9, time.perf_counter() - t_streaming)
 
         print(f"\n>>> UNPLUG camera B ({serial_b}) now. <<<")
         deadline = time.perf_counter() + args.wait
@@ -170,18 +205,19 @@ def main() -> int:
             print("B never stalled -- was it unplugged? Aborting.")
             summary["result"] = "B never stalled"
             return 1
-        t_stall = time.perf_counter()
         print(f"B stalled (no frames for 3s). A kept going: {stream_a.frames} frames, {stream_a.gaps} gaps, {stream_a.errors} errors.")
 
         # Tear down ONLY B, exactly as a camera-only reinit would.
         stream_b.stop()
-        teardown(lists.pop("b"), cam_b)
+        ref_b = [cams.pop("b")]
         cam_b = None
+        stream_b.cam = None
+        teardown(lists.pop("b"), ref_b)
         a_gaps_after_teardown = stream_a.gaps
         print("B torn down (EndAcquisition/DeInit/CameraList.Clear). A untouched.")
         summary["A_gaps_after_B_teardown"] = a_gaps_after_teardown - summary["baseline_A_gaps"]
 
-        print(f"\n>>> REPLUG camera B now (a DIFFERENT port is a stronger test). <<<")
+        print("\n>>> REPLUG camera B now (a DIFFERENT port is a stronger test). <<<")
         print("Trying to re-find B every 2s: GetCameras() first, then UpdateCameras()+GetCameras().")
         t_start = time.perf_counter()
         rediscovered = None
@@ -212,6 +248,7 @@ def main() -> int:
             print(f"B re-discovered via {rediscovered} after {t_found:.1f}s. Restarting it by serial ...")
             try:
                 lists["b"], cam_b = open_camera(PySpin, system, serial_b, args.fps)
+                cams["b"] = cam_b
                 stream_b = Stream("B", cam_b)
                 stream_b.start()
                 time.sleep(5.0)
@@ -224,26 +261,49 @@ def main() -> int:
                 print(f"  restart failed: {exc.__class__.__name__}: {exc}")
                 summary["result"] = f"re-found but restart failed: {exc}"
 
+        elapsed = time.perf_counter() - t_streaming
+        a_rate = stream_a.frames / max(1e-9, elapsed)
+        a_limit_s = max(0.25, 8.0 / args.fps)
+        a_checks = {
+            "no_frame_id_gaps": stream_a.gaps == 0,
+            "no_grab_errors": stream_a.errors == 0,
+            "frame_ids_were_readable": stream_a.frame_ids_seen > 0,
+            "rate_held_within_3pct_of_baseline": a_rate >= 0.97 * baseline_a_rate,
+            f"longest_frame_interval_under_{a_limit_s:.2f}s": stream_a.max_interval_s <= a_limit_s,
+        }
         summary["A_total_frames"] = stream_a.frames
         summary["A_total_gaps_over_whole_test"] = stream_a.gaps
         summary["A_total_errors_over_whole_test"] = stream_a.errors
+        summary["A_rate_fps (baseline)"] = f"{a_rate:.2f} ({baseline_a_rate:.2f})"
+        summary["A_longest_interval_s"] = round(stream_a.max_interval_s, 3)
+        summary["A_checks"] = ", ".join(f"{k}={'ok' if v else 'FAIL'}" for k, v in a_checks.items())
         summary["methods_tried"] = sorted(methods_tried)
-        return 0 if summary.get("result") == "RECOVERED" and stream_a.gaps == 0 else 1
+        return 0 if summary.get("result") == "RECOVERED" and all(a_checks.values()) else 1
     finally:
         for stream in (stream_a, stream_b):
             if stream is not None:
                 stream.stop()
-        print("\n===== SUMMARY =====")
-        for key, value in summary.items():
-            print(f"  {key}: {value}")
-        print("  (PASS = result RECOVERED and A_total_gaps_over_whole_test 0)")
-        # Leave native handles for process exit rather than risk a teardown
-        # race with a camera in an unknown state.
+        for key in list(cams):
+            teardown(lists.pop(key, None) or _NullList(), [cams.pop(key)])
         for cam_list in lists.values():
             try:
                 cam_list.Clear()
             except Exception:
                 pass
+        stream_a = stream_b = None
+        try:
+            system.ReleaseInstance()
+        except Exception as exc:
+            print(f"  (ReleaseInstance: {exc.__class__.__name__}: {exc})")
+        print("\n===== SUMMARY =====")
+        for key, value in summary.items():
+            print(f"  {key}: {value}")
+        print("  PASS = result RECOVERED and every A_check ok (A never lost a frame or stalled)")
+
+
+class _NullList:
+    def Clear(self):
+        pass
 
 
 if __name__ == "__main__":

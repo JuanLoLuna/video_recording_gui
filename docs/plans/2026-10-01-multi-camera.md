@@ -25,11 +25,11 @@ Target: **2 cameras at 30 fps**, ~1 h sessions, ~2 h/day. A one-camera setup mus
 ## Design
 
 - **One `CameraController` per camera**, bound by serial (`GetBySerial`); legacy no-serial path keeps `cam_list[0]` and pins the serial it finds.
-- **`SharedSystemHolder`** (`backend/spinnaker_system.py`): ref-counted owner of `PySpin.System`; controllers never call `GetInstance`/`ReleaseInstance` themselves. Fault recovery: sole owner -> today's full rebuild (validated path); shared -> rebuild only this camera's `Camera`/`CameraList`, re-find by serial, never touch the System.
+- **`SharedSystemHolder`** (`backend/spinnaker_system.py`): owner-tracked reference set (`acquire(self)` / `release(self)` / `restart_if_sole_owner(self)`) over `PySpin.System`; controllers never call `GetInstance`/`ReleaseInstance` themselves. Releasing is idempotent per owner, so a repeated `stop()` cannot free the System under another camera's deferred teardown. Never take a controller lock while holding the holder's lock. Fault recovery: sole owner -> today's full rebuild (validated path); shared -> rebuild only this camera's `Camera`/`CameraList`, re-find by serial, never touch the System.
 - **Naming in one place** (`SessionPaths.camera_tag`): tag `cam<serial>` goes *inside the stem*, before `-NNNN` / `_metadata`; the primary stays unsuffixed; the single WAV is untagged.
   `recording_20261001_101500-0000.avi` (primary) / `recording_20261001_101500_cam26134271-0000.avi` / `..._cam26134271_metadata.csv`.
   Known downstream gap (deliberately deferred): the video regexes in `smart_sleeve_data_processing` (`rules.yaml` video_raw/video_metadata, `router.py` RECORDING_RE) do not match tagged names; fix at the first two-camera ingest. The proposed pattern is `^recording_\d{8}_\d{6}(?:_cam[A-Za-z0-9]+)?(?:-\d{4})?\.avi$`.
-- **`CameraGroup`** (`backend/camera_group.py`, duck-typed, no PySpin): start/stop fan-out with rollback; stop order = `stop_recording` on all first, then `stop()` each, System released last and never after a deferred teardown.
+- **`CameraGroup`** (`backend/camera_group.py`, duck-typed, no PySpin): start/stop fan-out with rollback; stop order = `stop_recording` on all first, then `stop()` each, System released last and never after a deferred teardown. Slot tags must be unique (at most one untagged); the group never invents a primary (`primary` may be `None`; `default_slot` is where the GUI points); recording starts the **primary last**; `best_effort=True` keeps whichever cameras start (power-resume path).
 - **Disk guard**: `estimate_bytes_per_hour(streams)` from real per-camera frame sizes (~183.5 GB/h uncompressed).
 - **GUI** (`gui/main.py`): `self.camera` becomes a property for the camera selected in the tuning panel (keeps ~20 tuning call sites); start/stop/record/notify/frame-rate/exposure-lock/compression go through the group. **Exposure lock must force `ExposureAuto=Off` on every camera**, not just the selected one. Preview tiles (downscaled, `render_ms` measured), one diagnostics CSV per camera, one warning banner with `[model serial]` prefixes when N>1.
 
@@ -64,11 +64,25 @@ Pure-logic steps 1-7 are unit-tested on macOS (`unittest`, no mocking, injected 
 - **Stop/teardown**: both final segments renamed, both `segments.csv` end `session_stop`; 5 start/stop cycles without restart; app closes in < 5 s; no "teardown deferred".
 - **Power pause/resume**: both stop; resume uses one new shared stem. **Labels**: `label_start/label_end` in both metadata CSVs; Sync Pulse with no DAQ raises nothing.
 
+## Step 8 requirements carried over from the audit
+
+Verified against the real `CameraController` by an independent audit of steps 1-7. Step 8 (and 10/14) must do all of these:
+
+- **Bind by serial everywhere**: use `select_cameras(...).bound[0].serial`, never `cam_list[0]` (enumeration order changes between boots). A controller with no explicit serial resolves one through the registry and pins it.
+- **Always write camera identity**: events header gets `recording=<stem>`, `camera_serial`, `camera_model`, `session=<basename>` (camera_control.py ~1200 currently passes `session_paths.basename`). This is also how a silent primary swap is detected afterwards.
+- **Quick Stop -> Start bug (exists on main)**: `start_recording()` returns `(True, "...already starting or in progress")` while a previous recording is still closing (`recording_active and record_stop_requested`), so the GUI shows RECORDING while nothing records. Return `(False, "previous recording still closing")` or make the caller wait.
+- **Clear stale pending state in `start_recording()`**: `_pending_label_event` / sync window left over from the last session lands on the next session's first frame.
+- **Two-phase start**: `stop_recording()` only sets a flag and cannot undo an accepted start. Open every sidecar first, raise the start flag only after all cameras succeed (the group already starts the primary last as a partial mitigation).
+- **Reinit ordering**: set `self.cam = None` before `CameraList.Clear()` (validated by `scripts/reinit_spike.py`); find the camera again with `GetBySerial(self.serial)`; call `GetCameras()` and fall back to `UpdateCameras()`. Sole owner (`restart_if_sole_owner(self)`) keeps today's full rebuild; shared rebuilds only this camera.
+- **Per-camera names**: thread names (`frame-metadata-writer`, `segment-closer`, `segment-appender`, acquisition thread), `[camera]` log prefixes, "Recording requested: ..." text.
+- **Byte-ceiling rolls are never pre-armed** (`should_prepare` is frame-based): with uncompressed 30 fps every 3 GB roll opens its writer on the append thread. Check `append_queue_depth` around roll boundaries against the < 5 criterion.
+- GUI (step 10/14): per-slot `SessionPaths` via `with_camera(slot.tag)` from one `datetime.now()`; per-camera `fps_of`; per-camera diagnostics logger; `estimate_bytes_per_hour` into `assess_disk` (until then the GUI still uses the 1-camera 100 fps default rate; `SLEEVE_VIDEO_GUI_PLANNED_HOURS` already adds the long-run prompt); `broadcast()` reports `ok=True` even when a setter returns `False`, so callers must inspect `.value`; delete the unused `metadata_csv_path()` helper in `frame_metadata.py`.
+
 ## Risks (inferred, not verified from code)
 
-- **R1 (highest)**: a camera-only reinit while the other camera streams can re-discover a replugged USB3 camera via `GetCameras()`. Fallbacks: `system.UpdateCameras()`, then a coordinated restart of both cameras (costs the healthy one a gap). Worth a small rig spike before step 8.
-- R2: two simultaneous per-controller `CameraList`s / `GetCameras()` during another camera's acquisition are safe (the probe only ever had one list in use).
+- ~~R1/R2~~ **Resolved on the rig (`scripts/reinit_spike.py`, 2026-10-01):** with the Firefly streaming, the Blackfly was unplugged, torn down on its own, re-found by serial with plain `GetCameras()` (one `CameraList` per camera) and restarted; the Firefly had 0 frame gaps and 0 errors throughout. The spike's PASS criterion was strengthened afterwards (grab errors, rate and longest-interval checks, FrameIDs readable) — re-run it once with the new criterion and also with the cameras swapped (unplug the Firefly).
 - R3: PySpin `GetInstance`/`ReleaseInstance` ref-count semantics (the holder makes this moot).
+- Primary-name hazard: without `SLEEVE_VIDEO_GUI_CAMERA_SERIALS`, the untagged names follow whoever is plugged in. The registry now warns when several cameras are seen unpinned; the stable setup is to set the variable (e.g. `23227865,26134271`). If the configured primary is missing, the session has no untagged video (nothing downstream-ingestible) and the GUI must say so.
 - R4: preview cost on the i7-10510U (estimate 5-10 ms of each 33 ms tick) — measured by `render_ms`.
 - R5: which nodes the Firefly exposes (Gamma, BlackLevel, DeviceLinkThroughputLimit) — handled as N/A.
 - R6/R7: MJPEG size fraction and `main.py` compression lines will conflict with the codec fork — keep edits there to receiver renames only.

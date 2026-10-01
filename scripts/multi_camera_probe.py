@@ -30,8 +30,10 @@ incomplete images and zero errors.
 
 WRITER STAGE (--record-dir): additionally writes each camera to an AVI through
 cv2.VideoWriter on its own writer thread, opened exactly like the app's
-_open_segment_writer (grayscale; MJPG with a quality param, or GREY for
-uncompressed). Point --record-dir at the drive you will really record to:
+_open_segment_writer (grayscale; MJPG via the plain constructor, or GREY for
+uncompressed). The (IS_COLOR, QUALITY) params overload the app used to call is
+opt-in via --quality-param: it makes OpenCV 4.11's FFMPEG backend reject the
+call and fall back to a ~80x slower built-in encoder. Point --record-dir at the drive you will really record to:
 
     python scripts/multi_camera_probe.py --record-dir E:\\probe --fps 30 --seconds 120 --codec mjpg grey
 
@@ -397,7 +399,7 @@ def grab_loop(cam, rec: Recorder, stop: threading.Event, copy_frames: bool, np) 
 
 
 def open_writer(cv2, path: Path, codec: str, quality: int, fps: float, width: int, height: int,
-                use_quality_param: bool = True):
+                use_quality_param: bool = False):
     """cv2.VideoWriter opened the way CameraController._open_segment_writer does."""
     if codec == "mjpg":
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
@@ -463,7 +465,7 @@ def run_stage(PySpin, np, system, serials, fps, seconds, copy_frames, mode, reco
                 path = record["dir"] / f"{mode}_{info.serial}_{int(fps)}fps.avi"
                 writers.append(open_writer(record["cv2"], path, record["codec"], record["quality"],
                                            info.applied_fps, info.width, info.height,
-                                           use_quality_param=not record.get("no_quality_param")))
+                                           use_quality_param=bool(record.get("quality_param"))))
                 paths.append(path)
                 try:
                     backend = writers[-1].getBackendName()
@@ -520,15 +522,20 @@ def run_stage(PySpin, np, system, serials, fps, seconds, copy_frames, mode, reco
             print("    capture stopped; flushing writer queues...", flush=True)
             t_drain = time.perf_counter()
             next_print = t_drain + 2.0
-            while any(r.q.unfinished_tasks for r in recs):
-                if time.perf_counter() - t_drain > record["drain_timeout"]:
-                    drain_timed_out = True
-                    break
-                time.sleep(0.1)
-                if time.perf_counter() >= next_print:
-                    next_print += 2.0
-                    print("    draining: " + "  ".join(
-                        f"{r.serial}: {r.q.unfinished_tasks} frames left" for r in recs), flush=True)
+            try:
+                while any(r.q.unfinished_tasks for r in recs):
+                    if time.perf_counter() - t_drain > record["drain_timeout"]:
+                        drain_timed_out = True
+                        break
+                    time.sleep(0.1)
+                    if time.perf_counter() >= next_print:
+                        next_print += 2.0
+                        print("    draining: " + "  ".join(
+                            f"{r.serial}: {r.q.unfinished_tasks} frames left" for r in recs), flush=True)
+            except KeyboardInterrupt:
+                # Writers may be mid-write(): never release or delete under them.
+                print("    interrupted while draining -- leaving writers and files untouched")
+                drain_timed_out = True
             drain_s = time.perf_counter() - t_drain
             if drain_timed_out:
                 left = {r.serial: r.q.unfinished_tasks for r in recs}
@@ -668,9 +675,9 @@ def main() -> int:
     ap.add_argument("--codec", nargs="+", choices=["mjpg", "grey"], default=["mjpg"],
                     help="writer stage codecs (default: mjpg). grey = uncompressed, ~184 GB/h for two cameras at 30 fps")
     ap.add_argument("--quality", type=int, default=75, help="MJPEG quality 0-100 (app default 75)")
-    ap.add_argument("--no-quality-param", action="store_true",
-                    help="MJPG: open with the plain constructor instead of the (IS_COLOR, QUALITY) params overload "
-                         "(diagnostic: that overload can select a different OpenCV backend)")
+    ap.add_argument("--quality-param", action="store_true",
+                    help="MJPG: open with the (IS_COLOR, QUALITY) params overload, as the app used to. "
+                         "Diagnostic only: on OpenCV 4.11 this falls back to the slow CV_MJPEG backend")
     ap.add_argument("--drain-timeout", type=float, default=DRAIN_TIMEOUT_S,
                     help="seconds to wait for the writers to flush after capture stops (default %(default)s)")
     ap.add_argument("--keep", action="store_true", help="keep the recorded AVIs (default: delete after each run)")
@@ -690,7 +697,7 @@ def main() -> int:
                 del cam
         finally:
             found.Clear()
-        serials = args.serials or discovered
+        serials = list(dict.fromkeys(args.serials or discovered))  # no duplicates, order kept
         missing = [s for s in serials if s not in discovered]
         if missing:
             print(f"Serials not found: {missing}. Discovered: {discovered}")
@@ -722,11 +729,12 @@ def main() -> int:
         print(f"Cameras: {serials}\nPlan: {len(plan)} runs x {args.seconds:.0f}s (~{total_s / 60:.0f} min)\n")
 
         all_rows: list[dict] = []
+        run_failed = False
         for n, (fps, mode, group, codec) in enumerate(plan, 1):
             print(f"[{n}/{len(plan)}] {mode} @ {fps:.0f} fps: {group}")
             record = None if codec is None else {
                 "dir": record_dir, "codec": codec, "quality": args.quality, "keep": args.keep, "cv2": cv2,
-                "no_quality_param": args.no_quality_param,
+                "quality_param": args.quality_param,
                 "drain_timeout": args.drain_timeout}
             try:
                 all_rows += run_stage(PySpin, np, system, group, fps, args.seconds,
@@ -734,7 +742,8 @@ def main() -> int:
             except Exception as exc:
                 print(f"    run failed: {exc.__class__.__name__}: {exc}"
                       "\n    (is SpinView or the recorder GUI still holding a camera?)")
-                return 1
+                run_failed = True
+                break
             if any(r.get("drain_timed_out") for r in all_rows):
                 print("Stopping: a writer is still busy inside the process, further runs would be unreliable.")
                 break
@@ -754,6 +763,8 @@ def main() -> int:
                 record_dir.rmdir()
             except OSError:
                 pass
+        if run_failed or not all_rows:
+            return 1
         return 0 if all(r["pass"] for r in all_rows if r["mode"] != "solo") else 1
     finally:
         system.ReleaseInstance()
