@@ -67,6 +67,9 @@ PASS_FPS_FRACTION = 0.99
 # (COMPRESSION_QUEUE_DEPTH_WARNING); ~1 s of 30 fps video means the writer is
 # not keeping up and the queue (i.e. RAM) would grow for as long as it runs.
 QUEUE_WARN = 5
+# After capture stops, how long to wait for the writers to flush their backlog
+# before giving up (a writer slower than the cameras never catches up).
+DRAIN_TIMEOUT_S = 120.0
 QUEUE_FAIL = 30
 # "both" may lose at most this fraction of its solo fps before it's flagged.
 CONTENTION_TOLERANCE = 0.01
@@ -167,6 +170,8 @@ def verdict(row: dict) -> tuple[bool, str]:
     if row["frames"] < 2:
         reasons.append("no frames")
     # Writer fields exist only on recording runs.
+    if row.get("drain_timed_out"):
+        reasons.append("writer queue never drained (writers slower than the cameras)")
     if row.get("write_errors"):
         reasons.append(f"{row['write_errors']} write errors")
     if row.get("frames_lost_in_writer"):
@@ -439,6 +444,7 @@ def run_stage(PySpin, np, system, serials, fps, seconds, copy_frames, mode, reco
     cams, infos, recs, threads = [], [], [], []
     writers, wthreads, paths = [], [], []
     drain_s = close_s = 0.0
+    drain_timed_out = False
     counters_after = []
     stop = threading.Event()
     rows: list[dict] = []
@@ -455,6 +461,11 @@ def run_stage(PySpin, np, system, serials, fps, seconds, copy_frames, mode, reco
                 writers.append(open_writer(record["cv2"], path, record["codec"], record["quality"],
                                            info.applied_fps, info.width, info.height))
                 paths.append(path)
+                try:
+                    backend = writers[-1].getBackendName()
+                except Exception:
+                    backend = "?"
+                print(f"    {info.serial}: writer backend={backend}, codec={record['codec']}")
                 rec.q = queue.Queue()
                 t = threading.Thread(target=write_loop, args=(rec, writers[-1]), daemon=True)
                 t.start()
@@ -484,7 +495,9 @@ def run_stage(PySpin, np, system, serials, fps, seconds, copy_frames, mode, reco
                 if time.monotonic() >= next_report:
                     next_report += 10.0
                     print("    t+%3.0fs  " % (seconds - (deadline - time.monotonic()))
-                          + "  ".join(f"{r.serial}: {len(r.arrivals)} fr, {r.errors} err" for r in recs))
+                          + "  ".join(f"{r.serial}: {len(r.arrivals)} fr, {r.errors} err"
+                                      + (f", queue {r.q.qsize()}, written {r.frames_written}" if r.q else "")
+                                      for r in recs))
         except KeyboardInterrupt:
             print("    interrupted -- reporting what was captured")
 
@@ -497,19 +510,39 @@ def run_stage(PySpin, np, system, serials, fps, seconds, copy_frames, mode, reco
         file_sizes = [0] * len(recs)
         if record:
             # Backlog still queued when capture stops = how far behind the writer was.
+            # Polled (not Queue.join()) so it prints progress, honours Ctrl+C on
+            # Windows, and gives up instead of hanging forever.
+            print("    capture stopped; flushing writer queues...", flush=True)
             t_drain = time.perf_counter()
-            for rec in recs:
-                rec.q.join()
+            next_print = t_drain + 2.0
+            while any(r.q.unfinished_tasks for r in recs):
+                if time.perf_counter() - t_drain > DRAIN_TIMEOUT_S:
+                    drain_timed_out = True
+                    break
+                time.sleep(0.1)
+                if time.perf_counter() >= next_print:
+                    next_print += 2.0
+                    print("    draining: " + "  ".join(
+                        f"{r.serial}: {r.q.unfinished_tasks} frames left" for r in recs), flush=True)
             drain_s = time.perf_counter() - t_drain
-            for rec in recs:
-                rec.q.put(None)
-            for t in wthreads:
-                t.join(timeout=10.0)
-            t_close = time.perf_counter()
-            for w in writers:
-                w.release()
-            close_s = time.perf_counter() - t_close
-            writers.clear()
+            if drain_timed_out:
+                left = {r.serial: r.q.unfinished_tasks for r in recs}
+                print(f"    !! writers did not flush within {DRAIN_TIMEOUT_S:.0f}s (left: {left}); "
+                      "writers are too slow for this rate", flush=True)
+                # A writer may still be inside write(): releasing it from here
+                # would be unsafe, so leak the handles and let the caller stop.
+                writers.clear()
+            else:
+                for rec in recs:
+                    rec.q.put(None)
+                for t in wthreads:
+                    t.join(timeout=10.0)
+                print("    closing files...", flush=True)
+                t_close = time.perf_counter()
+                for w in writers:
+                    w.release()
+                close_s = time.perf_counter() - t_close
+                writers.clear()
             file_sizes = [p.stat().st_size if p.exists() else 0 for p in paths]
 
         for idx, (info, rec, after) in enumerate(zip(infos, recs, counters_after)):
@@ -532,7 +565,8 @@ def run_stage(PySpin, np, system, serials, fps, seconds, copy_frames, mode, reco
                 row.update(summarize_writer(
                     rec.write_ms, rec.queue_depths, len(rec.arrivals), rec.frames_written,
                     rec.write_errors, file_sizes[idx], span))
-                row.update({"codec": record["codec"], "drain_s": drain_s, "close_s": close_s})
+                row.update({"codec": record["codec"], "drain_s": drain_s, "close_s": close_s,
+                            "drain_timed_out": drain_timed_out})
             row["pass"], row["reason"] = verdict(row)
             rows.append(row)
     finally:
@@ -542,7 +576,7 @@ def run_stage(PySpin, np, system, serials, fps, seconds, copy_frames, mode, reco
                 w.release()
             except Exception:
                 pass
-        if record and not record["keep"]:
+        if record and not record["keep"] and not drain_timed_out:
             for path in paths:
                 path.unlink(missing_ok=True)
         for cam in cams:
@@ -571,7 +605,7 @@ CSV_FIELDS = [
     "interval_ms_p99", "interval_ms_max", "process_cpu_cores", "stream_counters",
     "codec", "frames_written", "frames_lost_in_writer", "write_errors", "append_ms_mean",
     "append_ms_p95", "append_ms_max", "queue_p95", "queue_max", "file_mb", "disk_mb_per_s",
-    "gb_per_hour", "drain_s", "close_s",
+    "gb_per_hour", "drain_s", "close_s", "drain_timed_out",
     "pass", "reason", "last_error",
 ]
 
@@ -688,6 +722,9 @@ def main() -> int:
                 print(f"    run failed: {exc.__class__.__name__}: {exc}"
                       "\n    (is SpinView or the recorder GUI still holding a camera?)")
                 return 1
+            if any(r.get("drain_timed_out") for r in all_rows):
+                print("Stopping: a writer is still busy inside the process, further runs would be unreliable.")
+                break
             time.sleep(2.0)  # let the cameras fully release between runs
 
         print_report(all_rows)
