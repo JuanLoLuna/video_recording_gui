@@ -857,31 +857,36 @@ class CameraController:
         return writer
 
     def _open_cv2_writer(self, path: Path, fourcc: int, width: int, height: int, is_color: bool):
-        """Construct the cv2.VideoWriter, applying _compression_quality via
-        the (fourcc, fps, frameSize, params) overload when compression is
-        on (quality only means anything for a lossy codec like MJPEG).
-        Falls back to the plain isColor-only constructor if that overload
-        isn't supported by this OpenCV build/backend -- quality control is
-        a nice-to-have, not something that should block recording from
-        working at all.
+        """Construct the cv2.VideoWriter with the plain isColor-only constructor.
+
+        This deliberately does NOT pass VIDEOWRITER_PROP_QUALITY /
+        VIDEOWRITER_PROP_IS_COLOR via the (fourcc, fps, frameSize, params)
+        overload. Measured on the rig (OpenCV 4.11.0, Windows): the FFMPEG
+        backend rejects that params list ("unsupported parameters in
+        VideoWriter"), and OpenCV then silently falls through to its built-in
+        CV_MJPEG backend, which took ~800ms per 1280x1024 frame (vs ~10ms on
+        FFMPEG) and let the append queue grow without bound. The plain
+        constructor stays on FFMPEG. See scripts/multi_camera_probe.py
+        (--no-quality-param) for the comparison.
+
+        Consequence: `_compression_quality` is not applied to the encoder
+        right now -- MJPEG quality is FFMPEG's default until a way to set it
+        that keeps the FFMPEG backend is found.
         """
-        if self._use_compression:
-            try:
-                params = [
-                    cv2.VIDEOWRITER_PROP_IS_COLOR, 1 if is_color else 0,
-                    cv2.VIDEOWRITER_PROP_QUALITY, int(self._compression_quality),
-                ]
-                writer = cv2.VideoWriter(
-                    str(path), fourcc, self.recording_fps, (width, height), params
-                )
-                if writer.isOpened():
-                    return writer
-                writer.release()
-            except Exception as exc:
-                print(f"[camera] quality-aware VideoWriter construction failed, falling back: {exc}")
-        return cv2.VideoWriter(
+        writer = cv2.VideoWriter(
             str(path), fourcc, self.recording_fps, (width, height), isColor=is_color
         )
+        if self._use_compression and writer.isOpened():
+            try:
+                backend = writer.getBackendName()
+            except Exception:
+                backend = "?"
+            if backend not in ("FFMPEG", "?"):
+                # Never fail the recording over this, but make it loud: any
+                # other backend has not been validated at the app's frame rate.
+                print(f"[camera] WARNING: MJPEG writer opened on backend {backend!r}, not FFMPEG "
+                      "-- write speed is unvalidated and may not keep up")
+        return writer
 
     def _maybe_rotate_segment(self) -> None:
         """Append thread only. Called after each successful Append().
