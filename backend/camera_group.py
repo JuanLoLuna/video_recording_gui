@@ -8,6 +8,10 @@ hand-written fake controllers. A controller is expected to provide:
     stop() -> (ok, message)                  ok=False means teardown deferred
     start_recording(session_paths, fps=) -> (ok, message)
     stop_recording() -> None
+    optional two-phase start, used when EVERY controller has all three:
+      prepare_recording(session_paths, fps=) -> (ok, message)
+      begin_recording() -> (ok, message)
+      abort_prepared() -> None
     notify_sync_pulse_window(width_s=, label=)
     notify_label_event(label, adl_id, adl_label)
     .acquiring, .recording_active            plain booleans
@@ -22,14 +26,15 @@ Ordering rules this class owns:
     nothing half-running. best_effort=True (the unattended power-resume path)
     instead keeps whichever cameras did start. A camera that was ALREADY
     running when the call began is left alone and never rolled back.
-  - Recording starts the PRIMARY camera LAST. stop_recording() only sets a flag
-    on the real controller (it cannot undo an accepted start: the acquisition
-    thread still opens and closes segment 0), so a rolled-back start leaves a
-    short session's files behind. Starting the primary last means a refusal by
-    any other camera happens before the primary -- the only camera whose
-    untagged names are visible to the downstream pipeline -- is touched.
-    A true two-phase start (open every sidecar, then raise the flags) is a
-    CameraController change and belongs to plan step 8.
+  - Recording is TWO-PHASE when the controllers support it: every camera first
+    prepares (opens its sidecars), and only if all of them succeeded does any
+    camera begin. A refusal anywhere aborts the prepared cameras and nothing
+    was recorded -- a true undo. stop_recording() cannot do that on the real
+    controller (it only sets a flag; the acquisition thread still opens and
+    closes segment 0), which is why the single-phase fallback, used only for
+    controllers without prepare/begin/abort, starts the PRIMARY camera LAST: a
+    refusal elsewhere then happens before the camera whose untagged names are
+    visible to the downstream pipeline has been touched.
   - A fan-out call (sync pulse, label event, a settings broadcast) never lets
     one camera's exception stop the others from receiving it.
 """
@@ -216,16 +221,81 @@ class CameraGroup:
     ) -> GroupResult:
         """Ask every camera to start recording.
 
-        All-or-nothing by default (a refusal stops the cameras this call
-        started). best_effort=True keeps whichever cameras accepted, for an
-        unattended resume that should record with what is present; the result
-        is ok if at least one camera is recording, and its message names the
-        ones that were not.
+        All-or-nothing by default. best_effort=True keeps whichever cameras
+        accepted, for an unattended resume that should record with what is
+        present; the result is ok if at least one camera is recording, and its
+        message names the ones that were not.
         """
+        order = self._recording_start_order()
+        two_phase = all(
+            hasattr(slot.controller, name)
+            for slot in order
+            for name in ("prepare_recording", "begin_recording", "abort_prepared")
+        )
+        if two_phase:
+            return self._start_recording_two_phase(order, paths_for, fps_of, best_effort)
+        return self._start_recording_single_phase(order, paths_for, fps_of, best_effort)
+
+    def _start_recording_two_phase(self, order, paths_for, fps_of, best_effort) -> GroupResult:
+        prepared: list[CameraSlot] = []
+        outcomes: list[SlotOutcome] = []
+        failures: list[str] = []
+        for slot in order:
+            try:
+                ok, message = slot.controller.prepare_recording(
+                    paths_for(slot), fps=fps_of(slot)
+                )
+            except Exception as exc:
+                ok, message = False, f"{exc.__class__.__name__}: {exc}"
+            outcomes.append(SlotOutcome(slot.serial, bool(ok), str(message)))
+            if ok:
+                prepared.append(slot)
+                continue
+            failures.append(f"{slot.label}: {message}")
+            if not best_effort:
+                self._abort_all(prepared)
+                return GroupResult(False, failures[0], tuple(outcomes))
+        if not prepared:
+            return GroupResult(False, "; ".join(failures), tuple(outcomes))
+
+        begun: list[CameraSlot] = []
+        for slot in prepared:
+            try:
+                ok, message = slot.controller.begin_recording()
+            except Exception as exc:
+                ok, message = False, f"{exc.__class__.__name__}: {exc}"
+            if ok:
+                begun.append(slot)
+                continue
+            failures.append(f"{slot.label}: {message}")
+            if not best_effort:
+                # Extremely unlikely (begin only raises a flag), but never
+                # leave half a session running.
+                for done in begun:
+                    try:
+                        done.controller.stop_recording()
+                    except Exception:
+                        pass
+                self._abort_all([s for s in prepared if s not in begun])
+                return GroupResult(False, failures[-1], tuple(outcomes))
+        if not begun:
+            return GroupResult(False, "; ".join(failures), tuple(outcomes))
+        message = "; ".join(failures) if failures else self._join(outcomes)
+        return GroupResult(True, message, tuple(outcomes))
+
+    @staticmethod
+    def _abort_all(slots: Sequence[CameraSlot]) -> None:
+        for slot in reversed(list(slots)):
+            try:
+                slot.controller.abort_prepared()
+            except Exception:
+                pass
+
+    def _start_recording_single_phase(self, order, paths_for, fps_of, best_effort) -> GroupResult:
         started: list[CameraSlot] = []
         outcomes: list[SlotOutcome] = []
         failures: list[str] = []
-        for slot in self._recording_start_order():
+        for slot in order:
             try:
                 ok, message = slot.controller.start_recording(
                     paths_for(slot), fps=fps_of(slot)

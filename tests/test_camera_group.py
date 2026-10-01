@@ -58,6 +58,45 @@ class FakeController:
         self._maybe_raise("notify_label_event")
 
 
+class TwoPhaseController(FakeController):
+    """Adds the prepare / begin / abort API the real CameraController has."""
+
+    def __init__(self, name, log, *, prepare=(True, "prepared"), begin=(True, "go"), **kw):
+        super().__init__(name, log, **kw)
+        self._prepare = prepare
+        self._begin = begin
+        self.prepared = False
+
+    def prepare_recording(self, session_paths, fps=30.0):
+        self.log.append(f"{self.name}:prepare:{session_paths}:{fps}")
+        self._maybe_raise("prepare_recording")
+        self.prepared = self._prepare[0]
+        return self._prepare
+
+    def begin_recording(self):
+        self.log.append(f"{self.name}:begin")
+        self._maybe_raise("begin_recording")
+        if self._begin[0]:
+            self.recording_active = True
+            self.prepared = False
+        return self._begin
+
+    def abort_prepared(self):
+        self.log.append(f"{self.name}:abort")
+        self.prepared = False
+
+
+def make_two_phase_group(log, **overrides):
+    a = TwoPhaseController("a", log, **overrides.get("a", {}))
+    b = TwoPhaseController("b", log, **overrides.get("b", {}))
+    return CameraGroup(
+        [
+            CameraSlot(a, serial="111", model="Firefly", tag=None, is_primary=True),
+            CameraSlot(b, serial="222", model="Blackfly", tag="cam222"),
+        ]
+    ), a, b
+
+
 def make_group(log, **overrides):
     """Two cameras: 'a' (primary) and 'b'. overrides = {"a": {...}, "b": {...}}."""
     a = FakeController("a", log, **overrides.get("a", {}))
@@ -299,6 +338,108 @@ class RecordingTests(unittest.TestCase):
         group.start_all()
         result = group.start_recording_all(lambda s: "p", lambda s: 30.0)
         self.assertFalse(result.ok)
+
+
+class TwoPhaseRecordingTests(unittest.TestCase):
+    def go(self, group, **kw):
+        return group.start_recording_all(
+            lambda s: f"p{s.serial}", lambda s: 30.0, **kw
+        )
+
+    def test_every_camera_prepares_before_any_camera_begins(self):
+        log = []
+        group, a, b = make_two_phase_group(log)
+        group.start_all()
+        log.clear()
+        result = self.go(group)
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            log,
+            [
+                "b:prepare:p222:30.0", "a:prepare:p111:30.0",  # primary prepares last
+                "b:begin", "a:begin",
+            ],
+        )
+        self.assertTrue(group.any_recording)
+
+    def test_a_refusal_in_prepare_is_a_true_undo_nothing_ever_began(self):
+        log = []
+        group, a, b = make_two_phase_group(log, a={"prepare": (False, "Cannot open metadata CSV")})
+        group.start_all()
+        log.clear()
+        result = self.go(group)
+        self.assertFalse(result.ok)
+        self.assertIn("Cannot open metadata CSV", result.message)
+        self.assertNotIn("b:begin", log)
+        self.assertNotIn("a:begin", log)
+        self.assertIn("b:abort", log)  # the camera that had prepared is cleaned up
+        self.assertFalse(group.any_recording)
+        self.assertFalse(b.prepared)
+
+    def test_an_exception_in_prepare_aborts_the_others(self):
+        log = []
+        group, a, b = make_two_phase_group(log, b={"raises": {"prepare_recording"}})
+        group.start_all()
+        log.clear()
+        result = self.go(group)
+        self.assertFalse(result.ok)
+        self.assertEqual(log[-1], "b:prepare:p222:30.0")  # b failed first; a never asked
+        self.assertNotIn("a:prepare:p111:30.0", log)
+        self.assertFalse(group.any_recording)
+
+    def test_best_effort_begins_only_the_cameras_that_prepared(self):
+        log = []
+        group, a, b = make_two_phase_group(log, b={"prepare": (False, "no space")})
+        group.start_all()
+        log.clear()
+        result = self.go(group, best_effort=True)
+        self.assertTrue(result.ok)
+        self.assertIn("Blackfly #222: no space", result.message)
+        self.assertIn("a:begin", log)
+        self.assertNotIn("b:begin", log)
+        self.assertTrue(a.recording_active)
+        self.assertFalse(b.recording_active)
+
+    def test_best_effort_with_nobody_prepared_fails(self):
+        log = []
+        group, a, b = make_two_phase_group(
+            log, a={"prepare": (False, "x")}, b={"prepare": (False, "y")}
+        )
+        group.start_all()
+        self.assertFalse(self.go(group, best_effort=True).ok)
+
+    def test_a_begin_failure_stops_the_cameras_already_begun(self):
+        log = []
+        group, a, b = make_two_phase_group(log, a={"begin": (False, "boom")})
+        group.start_all()
+        log.clear()
+        result = self.go(group)
+        self.assertFalse(result.ok)
+        self.assertIn("b:stop_recording", log)  # b had already begun
+        self.assertFalse(group.any_recording)
+
+    def test_controllers_without_the_two_phase_api_fall_back_to_single_phase(self):
+        log = []
+        group, a, b = make_group(log)  # plain FakeController
+        group.start_all()
+        log.clear()
+        self.assertTrue(self.go(group).ok)
+        self.assertEqual(
+            log, ["b:start_recording:p222:30.0", "a:start_recording:p111:30.0"]
+        )
+
+    def test_a_mixed_group_also_falls_back_rather_than_half_using_two_phase(self):
+        log = []
+        a = TwoPhaseController("a", log)
+        b = FakeController("b", log)
+        group = CameraGroup([
+            CameraSlot(a, serial="111", tag=None, is_primary=True),
+            CameraSlot(b, serial="222", tag="cam222"),
+        ])
+        group.start_all()
+        log.clear()
+        self.assertTrue(self.go(group).ok)
+        self.assertNotIn("a:prepare:p111:30.0", log)
 
 
 class FanOutTests(unittest.TestCase):

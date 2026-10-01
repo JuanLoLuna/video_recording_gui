@@ -11,6 +11,10 @@ import numpy as np
 import PySpin
 
 from backend.async_csv_writer import AsyncCsvWriter
+from backend.camera_registry import CameraDescriptor
+from backend.disk_guard import StreamRate
+from backend.preview_scaling import fit_size
+from backend.spinnaker_system import SharedSystemHolder, default_holder
 from backend.frame_metadata import METADATA_FIELDS, metadata_row, resolve_sync_label
 from backend.acquisition_watchdog import AcquisitionWatchdog, watchdog_config_for_frame_rate
 from backend.timeline_break import (
@@ -114,6 +118,48 @@ class PreviewFrame:
     published_at: float
 
 
+def _read_tl_string(nodemap, node_name: str) -> str:
+    node = PySpin.CStringPtr(nodemap.GetNode(node_name))
+    if PySpin.IsReadable(node):
+        return node.GetValue()
+    return "<unavailable>"
+
+
+def enumerate_cameras(holder: SharedSystemHolder | None = None) -> list[CameraDescriptor]:
+    """Every Spinnaker camera currently visible, as plain descriptors.
+
+    Takes its own short-lived reference on the shared System, so it is safe to
+    call while other controllers are streaming (validated on the rig:
+    GetCameras() during another camera's acquisition does not disturb it).
+    Raises if the Spinnaker System itself cannot be created.
+    """
+    holder = holder or default_holder()
+    owner = object()
+    system = holder.acquire(owner)
+    try:
+        cam_list = system.GetCameras()
+        try:
+            found: list[CameraDescriptor] = []
+            for index in range(cam_list.GetSize()):
+                cam = cam_list[index]
+                try:
+                    nodemap = cam.GetTLDeviceNodeMap()
+                    found.append(
+                        CameraDescriptor(
+                            serial=_read_tl_string(nodemap, "DeviceSerialNumber"),
+                            model=_read_tl_string(nodemap, "DeviceModelName"),
+                            vendor=_read_tl_string(nodemap, "DeviceVendorName"),
+                        )
+                    )
+                finally:
+                    cam = None
+            return found
+        finally:
+            cam_list.Clear()
+    finally:
+        holder.release(owner)
+
+
 def detect_first_camera():
     """
     Use Spinnaker (PySpin) to detect the first connected camera.
@@ -125,44 +171,14 @@ def detect_first_camera():
     - found = False -> no camera / error, message has a short explanation
     """
     try:
-        system = PySpin.System.GetInstance()
+        cameras = enumerate_cameras()
     except Exception as exc:
         return False, f"Error: could not create Spinnaker system ({exc})"
-
-    cam_list = system.GetCameras()
-    num_cams = cam_list.GetSize()
-
-    if num_cams == 0:
-        cam_list.Clear()
-        system.ReleaseInstance()
+    if not cameras:
         return False, "No cameras detected."
+    first = cameras[0]
+    return True, f"Camera: {first.vendor} {first.model} (S/N: {first.serial})"
 
-    cam = cam_list[0]
-
-    try:
-        nodemap_tldevice = cam.GetTLDeviceNodeMap()
-
-        def get_str(node_name: str) -> str:
-            node = PySpin.CStringPtr(nodemap_tldevice.GetNode(node_name))
-            if PySpin.IsReadable(node):
-                return node.GetValue()
-            return "<unavailable>"
-
-        vendor = get_str("DeviceVendorName")
-        model = get_str("DeviceModelName")
-        serial = get_str("DeviceSerialNumber")
-
-        msg = f"Camera: {vendor} {model} (S/N: {serial})"
-        return True, msg
-
-    except Exception as exc:
-        return False, f"Error reading camera info: {exc}"
-
-    finally:
-        # Make sure we clean up even if something goes wrong
-        cam = None
-        cam_list.Clear()
-        system.ReleaseInstance()
 
 class CameraController:
     """
@@ -192,7 +208,21 @@ class CameraController:
     hiccup, or MJPEG mode) still can't block the next grab.
     """
 
-    def __init__(self):
+    def __init__(self, *, serial=None, tag=None, system_holder=None):
+        # Identity. `serial` pins this controller to one physical camera
+        # (GetBySerial) -- enumeration order is not stable, so with several
+        # cameras nothing may ever rely on cam_list[0]. With serial=None the
+        # legacy single-camera behaviour is kept (first camera found), and the
+        # serial it finds is pinned for the rest of this controller's life so
+        # a fault recovery re-finds the SAME camera.
+        self.requested_serial = str(serial) if serial else None
+        self.serial = self.requested_serial
+        self.model = ""
+        self.tag = tag
+        # The Spinnaker System is shared by every controller in the process;
+        # controllers never call GetInstance/ReleaseInstance themselves.
+        self._holder = system_holder or default_holder()
+
         # Spinnaker objects
         self.system = None
         self.cam_list = None
@@ -318,6 +348,8 @@ class CameraController:
         self.recording_active = False          # true while the video writer is open
         self.record_start_requested = False    # GUI asks to start
         self.record_stop_requested = False     # GUI asks to stop
+        # SessionPaths handed to prepare_recording() and not yet begun/aborted.
+        self._prepared = None
 
         self.avi_recorder = None
         # MJPEG trades smaller files for an encode cost inside Append() that
@@ -352,7 +384,8 @@ class CameraController:
             flush_every_rows=300,
             flush_every_seconds=5.0,
             drop_when_full=False,
-            thread_name="frame-metadata-writer",
+            thread_name="frame-metadata-writer"
+            + (f"-{self.requested_serial or self.tag}" if (self.requested_serial or self.tag) else ""),
         )
         self.frame_counter = 0
 
@@ -367,6 +400,50 @@ class CameraController:
         self._pending_adl_label = None
 
     # ------------------------------------------------------------------
+    # Identity helpers
+    # ------------------------------------------------------------------
+    @property
+    def _log_prefix(self) -> str:
+        return f"[camera {self.serial}]" if self.serial else "[camera]"
+
+    @property
+    def _thread_suffix(self) -> str:
+        return f"-{self.serial}" if self.serial else ""
+
+    def _pick_camera(self, cam_list):
+        """The camera this controller is bound to, or None if it isn't present.
+
+        Pinned/requested serial -> GetBySerial; otherwise (legacy single
+        camera, first start only) the first camera in the list.
+        """
+        want = self.serial
+        if not want:
+            return cam_list[0] if cam_list.GetSize() > 0 else None
+        try:
+            cam = cam_list.GetBySerial(want)
+        except Exception:
+            return None
+        try:
+            if not cam.IsValid():
+                return None
+        except Exception:
+            pass
+        return cam
+
+    def _pin_identity(self) -> None:
+        """Record the serial/model of the camera just Init()'d."""
+        try:
+            nodemap = self.cam.GetTLDeviceNodeMap()
+            serial = _read_tl_string(nodemap, "DeviceSerialNumber")
+            model = _read_tl_string(nodemap, "DeviceModelName")
+        except Exception:
+            return
+        if serial != "<unavailable>" and not self.serial:
+            self.serial = serial
+        if model != "<unavailable>":
+            self.model = model
+
+    # ------------------------------------------------------------------
     # Camera start/stop
     # ------------------------------------------------------------------
     def start(self):
@@ -378,7 +455,7 @@ class CameraController:
             return True, "Preview already running."
 
         try:
-            self.system = PySpin.System.GetInstance()
+            self.system = self._holder.acquire(self)
             self.cam_list = self.system.GetCameras()
             num_cams = self.cam_list.GetSize()
 
@@ -386,8 +463,14 @@ class CameraController:
                 self._cleanup_system()
                 return False, "No cameras detected."
 
-            self.cam = self.cam_list[0]
+            self.cam = self._pick_camera(self.cam_list)
+            if self.cam is None:
+                self.cam_list.Clear()
+                self.cam_list = None
+                self._cleanup_system()
+                return False, f"Camera {self.serial} not found."
             self.cam.Init()
+            self._pin_identity()
             self._configure_camera_nodes()
 
             self.cam.BeginAcquisition()
@@ -402,6 +485,7 @@ class CameraController:
 
             self._acq_thread = threading.Thread(
                 target=self._acquisition_loop,
+                name=f"acquisition{self._thread_suffix}",
                 daemon=True,
             )
             self._acq_thread.start()
@@ -473,7 +557,7 @@ class CameraController:
         # finish, rather than reporting a clean stop that didn't happen.
         decision = assess_teardown_readiness(acquisition_thread_alive=thread_alive)
         if not decision.safe_to_release:
-            print(f"[camera] teardown deferred: {decision.reason}")
+            print(f"{self._log_prefix} teardown deferred: {decision.reason}")
             return False, decision.reason
 
         # DeInit camera
@@ -498,12 +582,11 @@ class CameraController:
         return True, ""
 
     def _cleanup_system(self):
-        if self.system is not None:
-            try:
-                self.system.ReleaseInstance()
-            except Exception:
-                pass
-            self.system = None
+        # Releases THIS controller's reference only; the System itself is
+        # released when the last controller lets go (and never while another
+        # camera's deferred teardown still holds its reference). Idempotent.
+        self._holder.release(self)
+        self.system = None
 
     def _enable_chunk_data(self):
         """
@@ -515,18 +598,18 @@ class CameraController:
         # 1) Turn on chunk mode
         chunk_mode_active = PySpin.CBooleanPtr(nodemap.GetNode("ChunkModeActive"))
         if not PySpin.IsWritable(chunk_mode_active):
-            print("ChunkModeActive not writable; skipping chunk setup.")
+            print(f"{self._log_prefix} ChunkModeActive not writable; skipping chunk setup.")
             return
 
         chunk_mode_active.SetValue(True)
-        print("Chunk mode activated.")
+        print(f"{self._log_prefix} Chunk mode activated.")
 
         # 2) Enable specific chunks if they exist
         chunk_selector = PySpin.CEnumerationPtr(nodemap.GetNode("ChunkSelector"))
         chunk_enable = PySpin.CBooleanPtr(nodemap.GetNode("ChunkEnable"))
 
         if not (PySpin.IsReadable(chunk_selector) and PySpin.IsWritable(chunk_selector)):
-            print("ChunkSelector not usable; skipping chunk setup.")
+            print(f"{self._log_prefix} ChunkSelector not usable; skipping chunk setup.")
             return
 
         for name in ["Timestamp", "FrameID"]:
@@ -540,7 +623,7 @@ class CameraController:
                     chunk_enable.SetValue(True)
             except Exception as exc:
                 # This chunk name might simply not exist on this model
-                print(f"Could not enable chunk '{name}': {exc}")
+                print(f"{self._log_prefix} Could not enable chunk '{name}': {exc}")
                 continue
 
     def _configure_camera_nodes(self) -> None:
@@ -617,12 +700,12 @@ class CameraController:
                 new_value = max(lo, safe_max_us)
                 node.SetValue(new_value)
                 print(
-                    f"[camera] clamped ExposureTime {current_us:.0f}us -> "
+                    f"{self._log_prefix} clamped ExposureTime {current_us:.0f}us -> "
                     f"{new_value:.0f}us to fit {fps:.1f} fps "
                     f"({period_us:.0f}us period)"
                 )
         except Exception as exc:
-            print(f"[camera] could not clamp exposure to frame period: {exc}")
+            print(f"{self._log_prefix} could not clamp exposure to frame period: {exc}")
 
     def _configure_stream_buffers(self, frame_rate_node=None) -> None:
         """Deepen the transport-layer buffer pool (see STREAM_BUFFER_SECONDS_TARGET).
@@ -655,12 +738,12 @@ class CameraController:
                 count.SetValue(target)
                 applied = int(count.GetValue()) if PySpin.IsReadable(count) else target
                 print(
-                    f"[camera] stream buffer count: applied={applied} "
+                    f"{self._log_prefix} stream buffer count: applied={applied} "
                     f"requested={requested} max={buffer_max} "
                     f"(sized for {max_fps:.1f} fps x {STREAM_BUFFER_SECONDS_TARGET:.0f}s)"
                 )
         except Exception as exc:
-            print(f"[camera] could not configure stream buffer count: {exc}")
+            print(f"{self._log_prefix} could not configure stream buffer count: {exc}")
 
     def _reinitialize_camera(self) -> tuple[bool, str]:
         """Best-effort full camera reinit after a fault. Acquisition thread only.
@@ -696,19 +779,36 @@ class CameraController:
                     except Exception:
                         pass
                     self.cam_list = None
-                if self.system is not None:
-                    try:
-                        self.system.ReleaseInstance()
-                    except Exception:
-                        pass
-                    self.system = None
+                self.system = None
 
                 try:
-                    self.system = PySpin.System.GetInstance()
+                    if not self._holder.holds(self):
+                        self.system = self._holder.acquire(self)
+                    elif self._holder.restart_if_sole_owner(self):
+                        # Nobody else is streaming: the full System ->
+                        # CameraList -> Camera rebuild that passed the real
+                        # unplug/replug tests in the phase 1 and 3 reports.
+                        self.system = self._holder.system
+                    else:
+                        # Another camera is streaming off this System: never
+                        # touch it. Rebuild only this camera's own handles
+                        # (validated on the rig by scripts/reinit_spike.py).
+                        self.system = self._holder.system or self._holder.acquire(self)
                     self.cam_list = self.system.GetCameras()
                     if self.cam_list.GetSize() == 0:
                         return False, "No camera detected during reinit."
-                    self.cam = self.cam_list[0]
+                    self.cam = self._pick_camera(self.cam_list)
+                    if self.cam is None and self.serial:
+                        # The bus may not have refreshed yet: ask once, retry.
+                        try:
+                            self.system.UpdateCameras()
+                            self.cam_list.Clear()
+                            self.cam_list = self.system.GetCameras()
+                            self.cam = self._pick_camera(self.cam_list)
+                        except Exception:
+                            self.cam = None
+                    if self.cam is None:
+                        return False, f"Camera {self.serial} not present during reinit."
                     self.cam.Init()
                     self._configure_camera_nodes()
                     self.cam.BeginAcquisition()
@@ -757,9 +857,9 @@ class CameraController:
         ok, msg = self._reinitialize_camera()
         now = time.monotonic()
         if not ok:
-            print(f"[camera] reinit failed: {msg}")
+            print(f"{self._log_prefix} reinit failed: {msg}")
         else:
-            print(f"[camera] reinit succeeded ({decision.reason})")
+            print(f"{self._log_prefix} reinit succeeded ({decision.reason})")
             if self._event_log is not None:
                 gap_s = decision.stalled_for_s if decision.stalled_for_s else None
                 frames_lost = (
@@ -779,7 +879,7 @@ class CameraController:
                 try:
                     self._event_log.write(timeline_break_record(brk))
                 except Exception as exc:
-                    print("Error writing timeline break:", exc)
+                    print(f"{self._log_prefix} Error writing timeline break:", exc)
                 if self.recording_active:
                     # Force the NEXT successful append to roll into a
                     # fresh segment (see should_roll(fault=True) and
@@ -884,7 +984,7 @@ class CameraController:
             if backend not in ("FFMPEG", "?"):
                 # Never fail the recording over this, but make it loud: any
                 # other backend has not been validated at the app's frame rate.
-                print(f"[camera] WARNING: MJPEG writer opened on backend {backend!r}, not FFMPEG "
+                print(f"{self._log_prefix} WARNING: MJPEG writer opened on backend {backend!r}, not FFMPEG "
                       "-- write speed is unvalidated and may not keep up")
         return writer
 
@@ -914,7 +1014,7 @@ class CameraController:
                 self._pending_writer_segment_index = next_index
                 self._prepared_next_segment = True
             except Exception as exc:
-                print(f"[camera] could not pre-arm next segment: {exc}")
+                print(f"{self._log_prefix} could not pre-arm next segment: {exc}")
 
         decision = should_roll(
             frames_in_segment=self._frames_in_segment,
@@ -939,7 +1039,7 @@ class CameraController:
             try:
                 new_writer = self._open_segment_writer(new_index)
             except Exception as exc:
-                print(f"[camera] could not open segment {new_index}: {exc}")
+                print(f"{self._log_prefix} could not open segment {new_index}: {exc}")
                 # Keep recording into the current (oversized) segment
                 # rather than losing the writer entirely.
                 return
@@ -1012,7 +1112,7 @@ class CameraController:
 
     def _start_closer_thread(self) -> None:
         self._closer_thread = threading.Thread(
-            target=self._closer_loop, name="segment-closer", daemon=True
+            target=self._closer_loop, name=f"segment-closer{self._thread_suffix}", daemon=True
         )
         self._closer_thread.start()
 
@@ -1029,14 +1129,14 @@ class CameraController:
         try:
             job.writer.release()
         except Exception as exc:
-            print(f"[camera] error closing segment {job.segment_index}: {exc}")
+            print(f"{self._log_prefix} error closing segment {job.segment_index}: {exc}")
         close_duration_s = time.monotonic() - start
 
         part_files = reconcile_part_files(job.part_base)
         total_bytes = 0
         if not part_files:
             print(
-                f"[camera] segment {job.segment_index}: no part file found "
+                f"{self._log_prefix} segment {job.segment_index}: no part file found "
                 "after close (recording may be incomplete)"
             )
         else:
@@ -1048,7 +1148,7 @@ class CameraController:
                 # unmistakable prefix rather than trying to claim another
                 # slot in the live segment_index sequence, which risks a
                 # race against the acquisition thread's own counter.
-                print(f"[camera] WARNING: unexpected extra part file for segment {job.segment_index}: {extra}")
+                print(f"{self._log_prefix} WARNING: unexpected extra part file for segment {job.segment_index}: {extra}")
                 total_bytes += self._safe_rename(extra, extra.with_name("UNEXPECTED_" + extra.name))
 
         entry = dataclass_replace(
@@ -1071,14 +1171,14 @@ class CameraController:
                 return size
             except OSError as exc:
                 if attempt == 4:
-                    print(f"[camera] error finalizing {source} -> {destination}: {exc}")
+                    print(f"{self._log_prefix} error finalizing {source} -> {destination}: {exc}")
                     return size
                 time.sleep(0.2 * (attempt + 1))
         return size
 
     def _start_append_thread(self) -> None:
         self._append_thread = threading.Thread(
-            target=self._append_loop, name="segment-appender", daemon=True
+            target=self._append_loop, name=f"segment-appender{self._thread_suffix}", daemon=True
         )
         self._append_thread.start()
 
@@ -1117,7 +1217,7 @@ class CameraController:
         try:
             self.avi_recorder.write(job.frame_array)
         except Exception as exc:
-            print("Error appending frame:", exc)
+            print(f"{self._log_prefix} Error appending frame:", exc)
             with self._acquisition_stats_lock:
                 self._append_failures += 1
             self._record_loop_timing(
@@ -1175,14 +1275,40 @@ class CameraController:
         Request recording to start. The acquisition thread will
         actually open the video writer and begin appending frames.
 
+        Equivalent to prepare_recording() followed by begin_recording(); the
+        two-phase form exists so a group of cameras can open every sidecar
+        first and only then let any of them start (see CameraGroup).
+
         Returns:
             (ok: bool, message: str)
+        """
+        ok, message = self.prepare_recording(session_paths, fps=fps)
+        if not ok or self._prepared is None:
+            return ok, message  # a refusal, or "already in progress"
+        return self.begin_recording()
+
+    def prepare_recording(self, session_paths: SessionPaths, fps: float = 30.0):
+        """Phase 1 of a start: open the sidecars and reset per-session state.
+
+        Nothing is recorded yet -- the acquisition thread only starts writing
+        video after begin_recording() raises the start flag. A failure here
+        leaves the controller exactly as it was, so a refusal costs nothing.
+        Pair with begin_recording() (go) or abort_prepared() (cancel).
         """
         if not self.acquiring or self.cam is None:
             return False, "Cannot record: camera is not acquiring."
 
+        if self.recording_active and self.record_stop_requested:
+            # The previous recording is still draining/closing its last
+            # segment (can take seconds for a ~3 GB file). Reporting success
+            # here used to leave the GUI "recording" while nothing was.
+            return False, "Previous recording is still closing; try again in a moment."
+
         if self.recording_active or self.record_start_requested:
             return True, "Recording already starting or in progress."
+
+        if self._prepared is not None:
+            return False, "A recording is already prepared; begin or abort it first."
 
         # Open the metadata CSV synchronously, on the calling (GUI) thread,
         # so a bad output path fails the start immediately instead of
@@ -1197,7 +1323,13 @@ class CameraController:
                 session_header_record(
                     mono_ns=int(time.monotonic() * 1e9),
                     wall_ns=int(time.time() * 1e9),
-                    recording_basename=session_paths.basename,
+                    # The per-camera stem (basename + camera tag), so a tagged
+                    # camera's header names ITS files; `session` is the shared
+                    # basename and camera_serial/model say which camera this is.
+                    recording_basename=session_paths.stem,
+                    camera_serial=self.serial,
+                    camera_model=self.model or None,
+                    session=session_paths.basename,
                 )
             )
         except Exception as exc:
@@ -1215,6 +1347,7 @@ class CameraController:
             self._metadata_writer.stop()
             self._event_log.close()
             self._event_log = None
+            self._remove_unused_sidecars(session_paths)
             return False, f"Cannot open segments CSV: {self._segment_manifest_writer.last_error}"
 
         # Lives for the app's lifetime, not per-session -- start them once.
@@ -1244,16 +1377,79 @@ class CameraController:
             session_start_mono_s=time.perf_counter(),
         )
 
+        # A label or sync window left over from before this session (or from
+        # a previous one) must not be stamped on this session's first frame.
+        with self._sync_lock:
+            self._sync_window_end = 0.0
+            self._sync_label = None
+        with self._label_lock:
+            self._pending_label_event = None
+            self._pending_adl_id = None
+            self._pending_adl_label = None
+
         self.recording_fps = fps
-        self.record_start_requested = True
-        self.record_stop_requested = False
         # Reset recording frame counter
         self.frame_counter = 0
         with self._acquisition_stats_lock:
             self._append_failures = 0
             self._camera_reinits = 0
 
-        return True, f"Recording requested: {session_paths.basename}"
+        self._prepared = session_paths
+        return True, f"Recording prepared: {session_paths.stem}"
+
+    def begin_recording(self):
+        """Phase 2 of a start: let the acquisition thread open the writer."""
+        if self._prepared is None:
+            if self.recording_active or self.record_start_requested:
+                return True, "Recording already starting or in progress."
+            return False, "Nothing prepared to record."
+        session_paths = self._prepared
+        self._prepared = None
+        self.record_start_requested = True
+        self.record_stop_requested = False
+        return True, f"Recording requested: {session_paths.stem}"
+
+    @staticmethod
+    def _remove_unused_sidecars(session_paths: SessionPaths) -> None:
+        """Delete sidecars opened for a session that never recorded a frame.
+
+        They hold only a header. Leaving them would make an immediate retry
+        with the same session name fail on the events log, which refuses to
+        overwrite an existing file, and would leave a stray, empty session
+        behind for the downstream pipeline to trip over.
+        """
+        for path in (
+            session_paths.metadata_csv,
+            session_paths.segments_csv,
+            session_paths.events_jsonl,
+        ):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def abort_prepared(self) -> None:
+        """Cancel a prepare_recording() that will not be followed by begin."""
+        if self._prepared is None:
+            return
+        session_paths = self._prepared
+        self._prepared = None
+        for step in (
+            self._metadata_writer.stop,
+            self._segment_manifest_writer.stop,
+        ):
+            try:
+                step()
+            except Exception:
+                pass
+        if self._event_log is not None:
+            try:
+                self._event_log.close()
+            except Exception:
+                pass
+            self._event_log = None
+        self._session_paths = None
+        self._remove_unused_sidecars(session_paths)
 
     def stop_recording(self):
         """
@@ -1284,7 +1480,7 @@ class CameraController:
                     self.avi_recorder = self._open_segment_writer(0)
                     self.recording_active = True
                 except Exception as exc:
-                    print("Error starting recording:", exc)
+                    print(f"{self._log_prefix} Error starting recording:", exc)
                     self.avi_recorder = None
                     self.recording_active = False
                 finally:
@@ -1345,12 +1541,12 @@ class CameraController:
                 self._metadata_writer.stop()
                 writer_error = self._metadata_writer.last_error
                 if writer_error:
-                    print("Error writing metadata CSV:", writer_error)
+                    print(f"{self._log_prefix} Error writing metadata CSV:", writer_error)
 
                 self._segment_manifest_writer.stop()
                 manifest_error = self._segment_manifest_writer.last_error
                 if manifest_error:
-                    print("Error writing segments CSV:", manifest_error)
+                    print(f"{self._log_prefix} Error writing segments CSV:", manifest_error)
 
                 if self._event_log is not None:
                     try:
@@ -1365,11 +1561,11 @@ class CameraController:
                             )
                         )
                     except Exception as exc:
-                        print("Error writing session stop record:", exc)
+                        print(f"{self._log_prefix} Error writing session stop record:", exc)
                     try:
                         self._event_log.close()
                     except Exception as exc:
-                        print("Error closing events log:", exc)
+                        print(f"{self._log_prefix} Error closing events log:", exc)
                     self._event_log = None
 
                 # Reset recording state
@@ -1550,22 +1746,40 @@ class CameraController:
     def get_latest_preview_frame(
         self,
         after_sequence: int | None = None,
+        max_size: tuple[int, int] | None = None,
     ) -> PreviewFrame | None:
-        """Return a new owned preview frame, or ``None`` if it is unchanged."""
+        """Return a new owned preview frame, or ``None`` if it is unchanged.
+
+        With max_size=(w, h) the image is downscaled to fit (aspect kept, never
+        upscaled) BEFORE it reaches the GUI thread. Only a reference is taken
+        under the lock -- the acquisition loop never mutates a published array
+        (see the "Preview: store latest frame" note there) -- so the lock is
+        held for microseconds instead of a full-frame copy.
+        """
         with self._frame_lock:
             latest = self._latest_preview_frame
             if latest is None or (
                 after_sequence is not None and latest.sequence == after_sequence
             ):
                 return None
-            return PreviewFrame(
-                image=latest.image.copy(),
-                sequence=latest.sequence,
-                frame_id=latest.frame_id,
-                camera_timestamp=latest.camera_timestamp,
-                retrieved_at=latest.retrieved_at,
-                published_at=latest.published_at,
-            )
+        image = latest.image
+        if max_size is not None:
+            height, width = image.shape[:2]
+            target_w, target_h = fit_size(width, height, max_size[0], max_size[1])
+            if (target_w, target_h) != (width, height):
+                image = cv2.resize(image, (target_w, target_h), interpolation=cv2.INTER_AREA)
+            else:
+                image = image.copy()
+        else:
+            image = image.copy()
+        return PreviewFrame(
+            image=image,
+            sequence=latest.sequence,
+            frame_id=latest.frame_id,
+            camera_timestamp=latest.camera_timestamp,
+            retrieved_at=latest.retrieved_at,
+            published_at=latest.published_at,
+        )
 
     def _reset_acquisition_stats(self) -> None:
         with self._acquisition_stats_lock:
@@ -1699,7 +1913,7 @@ class CameraController:
                     ir.SetValue(min(hi, max(lo, iv)))
                     return True
             except Exception as exc:
-                print(f"[camera] set_image_param {param_name}: {exc}")
+                print(f"{self._log_prefix} set_image_param {param_name}: {exc}")
         return False
 
     def get_bool_param(self, param_name: str) -> bool | None:
@@ -1783,7 +1997,7 @@ class CameraController:
                 node.SetIntValue(entry.GetValue())
                 return True
             except Exception as exc:
-                print(f"[camera] set_enum_param {param_name}={entry_name}: {exc}")
+                print(f"{self._log_prefix} set_enum_param {param_name}={entry_name}: {exc}")
         return False
 
     # ------------------------------------------------------------------
@@ -1819,6 +2033,34 @@ class CameraController:
             except Exception:
                 return None
         return None
+
+    def get_stream_rate(self) -> StreamRate | None:
+        """What this camera will write per hour: frame geometry, rate, codec.
+
+        None until the camera is acquiring (or while it is mid-recovery), so a
+        caller falls back to a default estimate rather than guessing.
+        """
+        if self.cam is None or not self.acquiring or self._recovering.is_set():
+            return None
+        with self._camera_lock:
+            if self.cam is None:
+                return None
+            try:
+                nodemap = self.cam.GetNodeMap()
+                width = int(PySpin.CIntegerPtr(nodemap.GetNode("Width")).GetValue())
+                height = int(PySpin.CIntegerPtr(nodemap.GetNode("Height")).GetValue())
+                fmt_node = PySpin.CEnumerationPtr(nodemap.GetNode("PixelFormat"))
+                symbolic = fmt_node.GetCurrentEntry().GetSymbolic() if PySpin.IsReadable(fmt_node) else ""
+            except Exception:
+                return None
+        bytes_per_pixel = 2 if "16" in symbolic else 1
+        return StreamRate(
+            width=width,
+            height=height,
+            bytes_per_pixel=bytes_per_pixel,
+            fps=float(self.target_frame_rate),
+            compressed=bool(self._use_compression),
+        )
 
     def get_acquisition_frame_rate(self) -> float:
         """Current acquisition fps, or the last-known target if unreadable."""
@@ -1962,7 +2204,7 @@ class CameraController:
                     self._clamp_exposure_to_frame_period(actual)
                     return True
             except Exception as exc:
-                print(f"[camera] set_frame_rate: {exc}")
+                print(f"{self._log_prefix} set_frame_rate: {exc}")
         return False
 
     # ------------------------------------------------------------------
