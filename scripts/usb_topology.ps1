@@ -55,7 +55,10 @@ foreach ($cam in $cams) {
     [pscustomobject]@{
         Camera     = $cam.FriendlyName
         InstanceId = $cam.InstanceId
+        # Several controllers share one friendly name, so the PCI instance id
+        # is what actually tells you whether two cameras share a controller.
         Controller = if ($ctrl) { $ctrl.Name } else { "<not found>" }
+        ControllerId = if ($ctrl) { $ctrl.InstanceId } else { "<not found>" }
         ViaHubs    = $hubs
     } | Format-List
 }
