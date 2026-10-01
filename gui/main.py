@@ -1,6 +1,7 @@
 import atexit
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 # Allow direct script execution via `python gui/main.py` by exposing the repo root.
@@ -23,7 +24,6 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QProgressBar,
     QScrollArea,
-    QSizePolicy,
     QSlider,
     QDoubleSpinBox,
     QSpinBox,
@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
 )
 from PySide6.QtCore import QTimer, Qt, QUrl
-from PySide6.QtGui import QDesktopServices, QImage, QPixmap
+from PySide6.QtGui import QDesktopServices
 from enum import Enum, auto
 from datetime import datetime
 
@@ -42,7 +42,14 @@ from backend.audio_control import (
     list_audio_input_devices,
     list_audio_output_devices,
 )
-from backend.camera_control import detect_first_camera, CameraController
+from backend.camera_control import CameraController, enumerate_cameras
+from backend.camera_group import CameraGroup, CameraSlot
+from backend.camera_registry import (
+    format_camera_summary,
+    intersect_ranges,
+    parse_serials_env,
+    select_cameras,
+)
 from backend.ni_control import (
     NIDaqDO,
     DOLine,
@@ -59,7 +66,12 @@ from backend.power_status import assess_power_safety, read_power_status
 from backend.power_policy import PowerPolicyState, next_power_action
 from backend.recording_warnings import RecordingWarningTracker, format_duration_s
 from backend.recording_paths import SessionPaths, resolve_output_dir
-from backend.disk_guard import assess_disk, resolve_planned_hours, sample_disk_usage
+from backend.disk_guard import (
+    assess_disk,
+    estimate_bytes_per_hour,
+    resolve_planned_hours,
+    sample_disk_usage,
+)
 from backend.power_keepalive import (
     KeepAwakeRequest,
     KeepAwakeState,
@@ -67,6 +79,8 @@ from backend.power_keepalive import (
     assess_keepalive,
     release_keep_awake,
 )
+
+from gui.camera_preview import CameraPreviewTile, frame_to_qimage
 
 SYNC_WIDTH_RECORD = 0.100  # 100 ms
 
@@ -104,6 +118,13 @@ COMPRESSION_QUEUE_DEPTH_WARNING = 5
 # spent a long investigation chasing).
 EXPOSURE_AUTO_LOCK_MIN_FPS = 30.0
 
+# A writer backlog of this many frames, held for this long, means the disk or
+# encoder is not keeping up. Deliberately NOT a momentary threshold: a USB
+# device plugged into the shared dock stalled the SSD for ~5 s on the rig
+# (queue peaked at 150, drained by itself, nothing lost).
+WRITER_BACKLOG_FRAMES = 30
+WRITER_BACKLOG_SECONDS = 10.0
+
 EXPERIMENT_LABELS = {
     "Long Term ADLs": [
         (1, "Pick up coins from purses"),
@@ -130,6 +151,17 @@ EXPERIMENT_LABELS = {
         (104, "Control"),
     ],
 }
+
+@dataclass
+class _SlotRuntime:
+    """GUI-side state for one camera: its tile, diagnostics accumulator and CSV logger."""
+
+    tile: CameraPreviewTile
+    diagnostics: PreviewDiagnosticsAccumulator
+    logger: AsyncDiagnosticsCsvLogger
+    last_seq: int | None = None
+    backlog_since: float | None = None
+
 
 class AppState(Enum):
     IDLE = auto()
@@ -258,6 +290,17 @@ class MainWindow(QWidget):
             "QPushButton { text-align: left; padding: 6px 8px; }"
         )
         self.camera_tuning_toggle.clicked.connect(self._on_camera_tuning_toggle)
+        # Which camera the controls below act on (shown only with several cameras).
+        self.tuning_camera_row = QWidget()
+        tuning_camera_layout = QHBoxLayout(self.tuning_camera_row)
+        tuning_camera_layout.setContentsMargins(0, 0, 0, 0)
+        tuning_camera_layout.addWidget(QLabel("Adjust camera"))
+        self.tuning_camera_combo = QComboBox()
+        tuning_camera_layout.addWidget(self.tuning_camera_combo, stretch=1)
+        self.tuning_camera_combo.currentIndexChanged.connect(self._on_tuning_camera_changed)
+        self.tuning_camera_row.setVisible(False)
+        setup_inner.addWidget(self.tuning_camera_row)
+
         setup_inner.addWidget(self.camera_tuning_toggle)
 
         self.camera_tuning_panel = QWidget()
@@ -559,12 +602,13 @@ class MainWindow(QWidget):
         self.mic_level_timer.timeout.connect(self._update_mic_level_bar)
         self.mic_level_timer.start(50)
 
-        # --- Image preview (stretches between setup and session bar) ---
-        self.image_label = QLabel("No video")
-        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setMinimumSize(480, 320)
-        self.image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        layout.addWidget(self.image_label, stretch=1)
+        # --- Image preview: one tile per detected camera (stretches between
+        # setup and session bar). Before Detect there is a single empty tile. ---
+        self.preview_area = QWidget()
+        self.preview_layout = QHBoxLayout(self.preview_area)
+        self.preview_layout.setContentsMargins(0, 0, 0, 0)
+        self.preview_layout.addWidget(CameraPreviewTile())
+        layout.addWidget(self.preview_area, stretch=1)
 
         self.preview_health_label = QLabel("Preview pipeline: waiting for preview")
         self.preview_health_label.setStyleSheet("color: #555; font-size: 11px;")
@@ -614,15 +658,17 @@ class MainWindow(QWidget):
 
         layout.addWidget(self.session_bar)
 
-        # --- Camera controller + timer ---
-        self.camera = CameraController()
+        # --- Cameras: Detect builds one CameraController per camera, grouped. ---
+        # Inert until then; it only keeps accessors like self.camera safe to
+        # call before any camera has been detected.
+        self._placeholder_camera = CameraController()
+        self.cameras: CameraGroup | None = None
+        self._slot_rt: dict[str, _SlotRuntime] = {}
+        self._tuning_serial: str | None = None
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_frame)
         self.preview_running = False
-        self._last_displayed_preview_sequence = None
 
-        self._preview_diagnostics = PreviewDiagnosticsAccumulator()
-        self._preview_diagnostics_logger = AsyncDiagnosticsCsvLogger()
         self._recording_warnings = RecordingWarningTracker()
 
         # Output folder: None means "let resolve_output_dir() pick" (env
@@ -918,6 +964,11 @@ class MainWindow(QWidget):
         self.output_dir_label.setText(shown)
         self.output_dir_label.setToolTip(shown)
 
+    def _estimated_bytes_per_hour(self) -> int:
+        """Sum of every camera's real frame size x fps (default rate if none is readable)."""
+        rates = [r for r in (s.controller.get_stream_rate() for s in self._slots()) if r is not None]
+        return estimate_bytes_per_hour(rates)
+
     def _confirm_disk_safe_to_record(
         self, output_dir, *, bypass_confirmation: bool = False
     ) -> bool:
@@ -939,7 +990,11 @@ class MainWindow(QWidget):
                 )
             return True
 
-        verdict = assess_disk(sample, planned_hours=resolve_planned_hours())
+        verdict = assess_disk(
+            sample,
+            bytes_per_hour=self._estimated_bytes_per_hour(),
+            planned_hours=resolve_planned_hours(),
+        )
         if verdict.recording_blocked:
             if not bypass_confirmation:
                 QMessageBox.warning(self, "Recording blocked by disk space", verdict.reason)
@@ -1125,24 +1180,33 @@ class MainWindow(QWidget):
             combo.blockSignals(False)
 
     def _sync_frame_rate_from_camera(self) -> None:
-        """Read the camera's frame-rate range/current and fill the spin box."""
+        """Read the cameras' frame-rate range/current and fill the spin box.
+
+        With several cameras the range is what ALL of them support, so one
+        value is always valid everywhere.
+        """
         spin = self.frame_rate_spin
-        limits = self.camera.get_frame_rate_limits()
-        if limits is None:
+        controllers = [slot.controller for slot in self._slots()] or [self.camera]
+        all_limits = [controller.get_frame_rate_limits() for controller in controllers]
+        shared = intersect_ranges(all_limits)
+        if shared is None:
             spin.blockSignals(True)
             spin.setEnabled(False)
             spin.blockSignals(False)
             self.frame_rate_hint.setText("Frame rate not adjustable on this camera.")
             return
-        mn, mx, cur = limits
+        mn, mx = shared
+        own = self.camera.get_frame_rate_limits()
+        cur = min(mx, max(mn, own[2] if own is not None else mn))
         spin.blockSignals(True)
         spin.setRange(mn, mx)
         spin.setValue(cur)
         spin.blockSignals(False)
         self._update_frame_rate_widget_enabled()
         self.frame_rate_hint.setStyleSheet("color: #555; font-size: 11px;")
+        who = "Cameras support" if len(controllers) > 1 else "Camera supports"
         self.frame_rate_hint.setText(
-            f"Camera supports {mn:.1f}–{mx:.1f} fps. Current rate: {cur:.1f} fps "
+            f"{who} {mn:.1f}–{mx:.1f} fps. Current rate: {cur:.1f} fps "
             f"(also sets AVI playback speed)."
         )
 
@@ -1170,17 +1234,30 @@ class MainWindow(QWidget):
     def _on_frame_rate_changed(self, value: float) -> None:
         if not self.frame_rate_spin.isEnabled():
             return
-        if not self.camera.set_frame_rate(float(value)):
-            return
+        if self.cameras is not None:
+            results = self.cameras.broadcast("set_frame_rate", float(value))
+            rejected = [r.slot.label for r in results if not (r.ok and r.value)]
+            if len(rejected) == len(results):
+                return
+        else:
+            rejected = [] if self.camera.set_frame_rate(float(value)) else ["camera"]
+            if rejected:
+                return
         actual = self.camera.get_acquisition_frame_rate()
         # Camera may snap to a nearby achievable rate; reflect what it accepted.
         if abs(actual - float(value)) > 0.05:
             self.frame_rate_spin.blockSignals(True)
             self.frame_rate_spin.setValue(actual)
             self.frame_rate_spin.blockSignals(False)
-        self.frame_rate_hint.setText(
-            f"Frame rate set to {actual:.1f} fps (also sets AVI playback speed)."
-        )
+        message = f"Frame rate set to {actual:.1f} fps (also sets AVI playback speed)."
+        if self._is_multi_camera():
+            message = "Frame rate set: " + ", ".join(
+                f"{slot.label} {slot.controller.get_acquisition_frame_rate():.1f} fps"
+                for slot in self._slots()
+            ) + " (also sets AVI playback speed)."
+        if rejected:
+            message += " NOT applied to: " + ", ".join(rejected) + "."
+        self.frame_rate_hint.setText(message)
         # The backend may have just clamped ExposureTime to fit the new
         # frame period (see CameraController._clamp_exposure_to_frame_period)
         # -- refresh the slider so it doesn't show a stale, now-wrong value.
@@ -1195,7 +1272,7 @@ class MainWindow(QWidget):
         # always go through blockSignals(). From here on the user's choice
         # sticks; the fps-based default stops touching this checkbox.
         self._compression_manually_set = True
-        if not self.camera.set_compression_enabled(checked):
+        if not self._call_on_all_cameras("set_compression_enabled", checked):
             # Refused (recording started between the click and here) --
             # put the checkbox back without re-entering this handler.
             self.compression_checkbox.blockSignals(True)
@@ -1206,7 +1283,7 @@ class MainWindow(QWidget):
     def _on_compression_quality_changed(self, value: int) -> None:
         if not self.compression_quality_spin.isEnabled():
             return
-        self.camera.set_compression_quality(value)
+        self._call_on_all_cameras("set_compression_quality", value)
 
     def _update_compression_quality_spin_enabled(self) -> None:
         self.compression_quality_spin.setEnabled(
@@ -1223,7 +1300,7 @@ class MainWindow(QWidget):
             return
         desired = fps <= COMPRESSION_DEFAULT_MAX_FPS
         if self.compression_checkbox.isChecked() != desired:
-            if self.camera.set_compression_enabled(desired):
+            if self._call_on_all_cameras("set_compression_enabled", desired):
                 self.compression_checkbox.blockSignals(True)
                 self.compression_checkbox.setChecked(desired)
                 self.compression_checkbox.blockSignals(False)
@@ -1247,7 +1324,10 @@ class MainWindow(QWidget):
                 "auto exposure isn't guaranteed to fit the frame period."
             )
             if combo.count() > 0 and combo.currentText() != "Off":
-                self.camera.set_enum_param("ExposureAuto", "Off")
+                # EVERY camera, not just the one the controls point at: a camera
+                # left on auto exposure at >= 30 fps is exactly the failure this
+                # lock exists to prevent.
+                self._call_on_all_cameras("set_enum_param", "ExposureAuto", "Off")
                 combo.blockSignals(True)
                 combo.setCurrentText("Off")
                 combo.blockSignals(False)
@@ -1436,12 +1516,137 @@ class MainWindow(QWidget):
             if v > 0:
                 self.audio_level_bar.setValue(max(0, v - 14))
 
+    # ------------------------------------------------------------------
+    # Cameras: detection, grouping, per-camera GUI state
+    # ------------------------------------------------------------------
+    @property
+    def camera(self) -> CameraController:
+        """The camera the tuning controls act on (the primary until another is picked)."""
+        if self.cameras is not None:
+            slot = self.cameras.slot_for_serial(self._tuning_serial) or self.cameras.default_slot
+            return slot.controller
+        return self._placeholder_camera
+
+    def _slots(self) -> list[CameraSlot]:
+        return self.cameras.slots if self.cameras is not None else []
+
+    def _is_multi_camera(self) -> bool:
+        return len(self._slots()) > 1
+
+    def _call_on_all_cameras(self, method_name: str, *args) -> bool:
+        """Call controller.<method_name>(*args) on every camera; True only if all accepted."""
+        if self.cameras is None:
+            return bool(getattr(self._placeholder_camera, method_name)(*args))
+        results = self.cameras.broadcast(method_name, *args)
+        return all(r.ok and bool(r.value) for r in results)
+
+    def _clear_camera_group(self) -> None:
+        self.cameras = None
+        self._slot_rt = {}
+        self._tuning_serial = None
+        self.tuning_camera_row.setVisible(False)
+        self._rebuild_preview_tiles()
+
+    def _install_camera_group(self, selection) -> None:
+        slots = [
+            CameraSlot(
+                CameraController(serial=cam.serial, tag=cam.tag),
+                serial=cam.serial,
+                model=cam.model,
+                tag=cam.tag,
+                is_primary=cam.is_primary,
+            )
+            for cam in selection.bound
+        ]
+        self.cameras = CameraGroup(slots)
+        self._tuning_serial = self.cameras.default_slot.serial
+        self._rebuild_preview_tiles()
+        self.tuning_camera_combo.blockSignals(True)
+        self.tuning_camera_combo.clear()
+        for slot in slots:
+            self.tuning_camera_combo.addItem(slot.label, slot.serial)
+        self.tuning_camera_combo.setCurrentIndex(
+            max(0, self.tuning_camera_combo.findData(self._tuning_serial))
+        )
+        self.tuning_camera_combo.blockSignals(False)
+        self.tuning_camera_row.setVisible(len(slots) > 1)
+
+    def _rebuild_preview_tiles(self) -> None:
+        """One tile (and one diagnostics accumulator + logger) per camera."""
+        while self.preview_layout.count():
+            widget = self.preview_layout.takeAt(0).widget()
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        slots = self._slots()
+        if not slots:
+            self.preview_layout.addWidget(CameraPreviewTile())
+            return
+        multi = len(slots) > 1
+        self._slot_rt = {}
+        for slot in slots:
+            tile = CameraPreviewTile(min_size=(320, 240) if multi else (480, 320))
+            tile.set_caption(slot.label)
+            tile.set_caption_visible(multi)
+            self.preview_layout.addWidget(tile)
+            self._slot_rt[slot.serial] = _SlotRuntime(
+                tile=tile,
+                diagnostics=PreviewDiagnosticsAccumulator(),
+                logger=AsyncDiagnosticsCsvLogger(),
+            )
+
+    def _on_tuning_camera_changed(self, index: int) -> None:
+        serial = self.tuning_camera_combo.itemData(index)
+        if serial is None or serial == self._tuning_serial:
+            return
+        self._tuning_serial = serial
+        if self.preview_running:
+            self._sync_auto_mode_combos_from_camera()
+            self._sync_image_sliders_from_camera()
+
+    def _reset_all_diagnostics(self) -> None:
+        for slot in self._slots():
+            rt = self._slot_rt[slot.serial]
+            rt.diagnostics.reset(slot.controller.get_acquisition_stats())
+            rt.backlog_since = None
+
+    def _apply_camera_selection(self, discovered, selection) -> tuple[bool, str]:
+        """(found, status message) for a Detect click; installs the camera group on success."""
+        if not selection.bound:
+            self._clear_camera_group()
+            return False, format_camera_summary(selection)
+        if selection.missing:
+            # A configured camera is absent: a manual start is refused rather than
+            # quietly recording with fewer cameras than asked for. (An unattended
+            # power-resume records with whatever is present; it never passes here.)
+            self._clear_camera_group()
+            return False, (
+                format_camera_summary(selection)
+                + " Check the connection or SLEEVE_VIDEO_GUI_CAMERA_SERIALS."
+            )
+        self._install_camera_group(selection)
+        if len(selection.bound) == 1:
+            cam = selection.bound[0]
+            vendor = next((d.vendor for d in discovered if d.serial == cam.serial), "")
+            message = f"Camera: {vendor} {cam.model} (S/N: {cam.serial})"
+        else:
+            message = format_camera_summary(selection)
+        if selection.warnings:
+            message += "\n" + "\n".join(f"Warning: {w}" for w in selection.warnings)
+        return True, message
+
     def on_detect_clicked(self):
         if self.state not in (AppState.IDLE, AppState.CAMERA_DETECTED):
             return
 
         self.status_label.setText("Detecting camera...")
-        found, message = detect_first_camera()
+        try:
+            discovered = enumerate_cameras()
+            selection = select_cameras(discovered, parse_serials_env())
+        except Exception as exc:
+            found, message = False, f"Error: could not list cameras ({exc})"
+        else:
+            found, message = self._apply_camera_selection(discovered, selection)
         self.status_label.setText(message)
 
         if found:
@@ -1537,7 +1742,7 @@ class MainWindow(QWidget):
                 self.pulse_manager.request_pulse(width_s=width, label=label)
 
             # logging window
-            self.camera.notify_sync_pulse_window(width_s=width, label=label)
+            self.cameras.notify_sync_pulse_window(width_s=width, label=label)
 
             self.sync_label.setText(f"Sync pulse sent ({label}, {width * 1000:.0f} ms).")
         except Exception as e:
@@ -1545,9 +1750,12 @@ class MainWindow(QWidget):
 
     def on_preview_clicked(self):
         if not self.preview_running:
-            ok, msg = self.camera.start()
-            self.status_label.setText(msg)
-            if not ok:
+            if self.cameras is None:
+                self.status_label.setText("Detect a camera first.")
+                return
+            result = self.cameras.start_all()
+            self.status_label.setText(result.message)
+            if not result.ok:
                 return
 
             # This controls PREVIEW redraw rate, NOT camera fps. Redrawing faster
@@ -1557,8 +1765,9 @@ class MainWindow(QWidget):
             self.timer.start(33)
             self.preview_diagnostics_timer.start(1000)
             self.preview_running = True
-            self._last_displayed_preview_sequence = None
-            self._preview_diagnostics.reset(self.camera.get_acquisition_stats())
+            for rt in self._slot_rt.values():
+                rt.last_seq = None
+            self._reset_all_diagnostics()
             self.preview_health_label.setText("Preview pipeline: measuring…")
             self.preview_button.setText("Stop Preview")
             self.state = AppState.PREVIEWING
@@ -1583,12 +1792,13 @@ class MainWindow(QWidget):
             self.timer.stop()
             self.preview_diagnostics_timer.stop()
             self._stop_preview_diagnostics_logging()
-            ok, msg = self.camera.stop()
-            if not ok:
-                print(f"[camera] stop() deferred cleanup: {msg}")
+            result = self.cameras.stop_all()
+            if not result.ok:
+                print(f"[camera] stop() deferred cleanup: {result.message}")
             self.preview_running = False
-            self.image_label.setPixmap(QPixmap())
-            self.image_label.setText("No video")
+            for rt in self._slot_rt.values():
+                rt.tile.clear()
+                rt.last_seq = None
             self.preview_health_label.setText("Preview pipeline: waiting for preview")
             self.status_label.setText("Preview stopped.")
             self.frame_rate_hint.setText(
@@ -1626,13 +1836,20 @@ class MainWindow(QWidget):
         # SessionPaths is the single place deriving every session
         # artifact name (video segments, wav, metadata, diagnostics,
         # segments manifest, events) from one stem, so they can't
-        # drift out of sync with each other.
+        # drift out of sync with each other. Every camera shares the
+        # session's timestamp; each camera's files carry its own tag.
         output_dir = resolve_output_dir(explicit=self._configured_output_dir)
         if not self._confirm_disk_safe_to_record(
             output_dir, bypass_confirmation=bypass_confirmation
         ):
             return False
-        session_paths = SessionPaths.for_session(output_dir, datetime.now())
+        started_at = datetime.now()
+        paths_by_serial = {
+            slot.serial: SessionPaths.for_session(output_dir, started_at, camera_tag=slot.tag)
+            for slot in self._slots()
+        }
+        # The WAV is shared by all cameras and never tagged.
+        session_paths = paths_by_serial[self.cameras.default_slot.serial]
 
         self._keepalive_state = apply_keep_awake(self._keepalive_request)
 
@@ -1641,19 +1858,31 @@ class MainWindow(QWidget):
         self.status_label.setText("Starting recording…")
         QApplication.processEvents()
 
-        # Use the camera's real acquisition rate so AVI playback speed matches.
-        fps = self.camera.get_acquisition_frame_rate() or 30.0
-        ok, msg = self.camera.start_recording(session_paths, fps=fps)
-        self.status_label.setText(msg)
+        # Use each camera's real acquisition rate so AVI playback speed matches.
+        # An unattended power-resume records with whichever cameras still accept
+        # (best_effort); a manual start is all-or-nothing.
+        result = self.cameras.start_recording_all(
+            lambda slot: paths_by_serial[slot.serial],
+            lambda slot: slot.controller.get_acquisition_frame_rate() or 30.0,
+            best_effort=bypass_confirmation,
+        )
+        self.status_label.setText(result.message)
         QApplication.processEvents()
 
-        if not ok:
+        if not result.ok:
             self._apply_state()
             return False
 
         self._recording_warnings.reset(now_s=time.monotonic())
+        skipped = [o.serial for o in result.outcomes if not o.ok]
+        if skipped:
+            self._recording_warnings.note_issue(
+                "recording WITHOUT camera(s) " + ", ".join(f"#{serial}" for serial in skipped)
+                + " (they did not start)",
+                now_s=time.monotonic(),
+            )
         self._update_recording_warning_banner()
-        self._start_preview_diagnostics_logging(session_paths.diagnostics_csv)
+        self._start_preview_diagnostics_logging(paths_by_serial)
 
         self._stop_mic_preview()
         # Parallel WAV sharing the same session stem as the video segments.
@@ -1698,7 +1927,7 @@ class MainWindow(QWidget):
         # 2) tell the camera to mark frames in this window only
         # if we actually sent a hardware pulse
         if self.pulse_manager is not None and sys.platform.startswith("win"):
-            self.camera.notify_sync_pulse_window(
+            self.cameras.notify_sync_pulse_window(
                 width_s=SYNC_WIDTH_RECORD,
                 label="record_start",
             )
@@ -1721,7 +1950,7 @@ class MainWindow(QWidget):
             except Exception as exc:
                 print("Error stopping audio recording:", exc)
             self._session_audio = None
-        self.camera.stop_recording()
+        self.cameras.stop_recording_all()
         self._stop_preview_diagnostics_logging()
         self.status_label.setText(status_message)
         self.audio_label.setText(
@@ -1730,18 +1959,20 @@ class MainWindow(QWidget):
         self.state = AppState.PREVIEWING
         self._apply_state()
 
-    def _start_preview_diagnostics_logging(self, diagnostics_path) -> None:
-        """Start a sidecar diagnostics CSV for this recording session."""
-        self._preview_diagnostics.reset(self.camera.get_acquisition_stats())
-        self._preview_diagnostics_logger.start(diagnostics_path)
+    def _start_preview_diagnostics_logging(self, paths_by_serial) -> None:
+        """Start a sidecar diagnostics CSV per camera for this recording session."""
+        self._reset_all_diagnostics()
+        for serial, rt in self._slot_rt.items():
+            rt.logger.start(paths_by_serial[serial].diagnostics_csv)
 
     def _stop_preview_diagnostics_logging(self) -> None:
-        """Flush the current interval and finish the diagnostics sidecar."""
-        if self._preview_diagnostics_logger.is_running:
+        """Flush the current interval and finish every camera's diagnostics sidecar."""
+        if any(rt.logger.is_running for rt in self._slot_rt.values()):
             self._sample_preview_diagnostics()
-        self._preview_diagnostics_logger.stop()
+        for rt in self._slot_rt.values():
+            rt.logger.stop()
         if self.preview_running:
-            self._preview_diagnostics.reset(self.camera.get_acquisition_stats())
+            self._reset_all_diagnostics()
 
     def _update_recording_warning_banner(self) -> None:
         """Reflect RecordingWarningTracker state in the dismissible banner.
@@ -1772,67 +2003,128 @@ class MainWindow(QWidget):
         self._update_recording_warning_banner()
 
     def _sample_preview_diagnostics(self) -> None:
-        """Update GUI health once per second and queue a CSV row if recording."""
-        stats = dict(self.camera.get_acquisition_stats())
+        """Update GUI health once per second and queue a CSV row per camera if recording."""
+        slots = self._slots()
+        if not slots:
+            return
+        multi = len(slots) > 1
+        audio_stats: dict[str, int] = {}
         if self._session_audio is not None:
             audio_health = self._session_audio.health_snapshot()
-            stats["audio_xruns"] = audio_health.total_xruns
-            stats["audio_reconnects"] = audio_health.reconnects
-            stats["audio_silence_frames_inserted"] = audio_health.silence_frames_inserted
-        camera_state = self.camera.get_diagnostics_camera_state()
-        loop_timing = self.camera.get_and_reset_loop_timing_samples()
-        row = self._preview_diagnostics.sample(
-            stats, camera_state=camera_state, loop_timing=loop_timing
-        )
-        if self._preview_diagnostics_logger.is_running:
-            self._preview_diagnostics_logger.submit(row)
-        self._update_frame_rate_ceiling_hint(camera_state.get("frame_rate_ceiling_fps"))
+            audio_stats = {
+                "audio_xruns": audio_health.total_xruns,
+                "audio_reconnects": audio_health.reconnects,
+                "audio_silence_frames_inserted": audio_health.silence_frames_inserted,
+            }
 
-        age_value = row["preview_age_ms"]
-        interval_s = float(row["interval_s"])
-        rendered_fps = float(row["rendered_fps"])
-        frame_gaps = int(row["camera_frame_gaps"])
-        incomplete = int(row["incomplete_images"])
-        errors = int(row["acquisition_errors"])
-        append_failures = int(row["append_failures"])
-        camera_reinits = int(row["camera_reinits"])
-        audio_reconnects = int(row["audio_reconnects"])
+        samples = []  # (slot, runtime, row, camera_state)
+        for slot in slots:
+            rt = self._slot_rt[slot.serial]
+            stats = dict(slot.controller.get_acquisition_stats())
+            stats.update(audio_stats)
+            camera_state = slot.controller.get_diagnostics_camera_state()
+            loop_timing = slot.controller.get_and_reset_loop_timing_samples()
+            row = rt.diagnostics.sample(
+                stats, camera_state=camera_state, loop_timing=loop_timing
+            )
+            if rt.logger.is_running:
+                rt.logger.submit(row)
+            samples.append((slot, rt, row, camera_state))
 
-        if self.state == AppState.RECORDING:
-            now_s = time.monotonic()
-            if frame_gaps or incomplete or errors or append_failures:
-                self._recording_warnings.note_issue(
-                    f"{frame_gaps} frame gap(s), {incomplete} incomplete image(s), "
-                    f"{errors} acquisition error(s), {append_failures} append failure(s)",
-                    now_s=now_s,
+        ceilings = [
+            float(cs["frame_rate_ceiling_fps"])
+            for _, _, _, cs in samples
+            if cs.get("frame_rate_ceiling_fps") not in (None, "")
+        ]
+        self._update_frame_rate_ceiling_hint(min(ceilings) if ceilings else None)
+
+        now_s = time.monotonic()
+        recording = self.state == AppState.RECORDING
+        warn_parts: list[str] = []
+        segments: list[str] = []
+        worst_color = "#2e7d32"
+        interval_s = 0.0
+        audio_reconnects = 0
+
+        for slot, rt, row, _camera_state in samples:
+            prefix = f"{slot.label}: " if multi else ""
+            tag = f"[{slot.label}] " if multi else ""
+            age_value = row["preview_age_ms"]
+            interval_s = max(interval_s, float(row["interval_s"]))
+            rendered_fps = float(row["rendered_fps"])
+            frame_gaps = int(row["camera_frame_gaps"])
+            incomplete = int(row["incomplete_images"])
+            errors = int(row["acquisition_errors"])
+            append_failures = int(row["append_failures"])
+            camera_reinits = int(row["camera_reinits"])
+            audio_reconnects = max(audio_reconnects, int(row["audio_reconnects"]))
+
+            if recording:
+                if frame_gaps or incomplete or errors or append_failures:
+                    self._recording_warnings.note_issue(
+                        f"{tag}{frame_gaps} frame gap(s), {incomplete} incomplete image(s), "
+                        f"{errors} acquisition error(s), {append_failures} append failure(s)",
+                        now_s=now_s,
+                    )
+                if camera_reinits:
+                    self._recording_warnings.note_issue(
+                        f"{tag}camera reconnected after a fault ({camera_reinits} reinit(s))",
+                        now_s=now_s,
+                    )
+                # MJPEG is opt-in specifically because its encode cost is
+                # hardware-dependent (see set_compression_enabled) -- flag it
+                # live from append_queue_depth (see COMPRESSION_QUEUE_DEPTH_WARNING
+                # for why that's used instead of an append_ms latency percentile).
+                queue_depth = row["append_queue_depth"]
+                if (
+                    slot.controller.get_compression_enabled()
+                    and queue_depth != ""
+                    and int(queue_depth) >= COMPRESSION_QUEUE_DEPTH_WARNING
+                ):
+                    self._recording_warnings.note_issue(
+                        f"{tag}MJPEG encoding is falling behind capture (append queue depth "
+                        f"{queue_depth}) -- frames are piling up waiting to be written "
+                        "and may start dropping. Consider turning off compression for "
+                        "this frame rate.",
+                        now_s=now_s,
+                    )
+                # Any codec: a backlog that STAYS high means the disk or encoder
+                # is not keeping up. A brief spike that drains (a USB event on the
+                # shared dock stalled the SSD for ~5 s on the rig) is not flagged.
+                if queue_depth != "" and int(queue_depth) >= WRITER_BACKLOG_FRAMES:
+                    if rt.backlog_since is None:
+                        rt.backlog_since = now_s
+                    elif now_s - rt.backlog_since >= WRITER_BACKLOG_SECONDS:
+                        self._recording_warnings.note_issue(
+                            f"{tag}{queue_depth} frames have been waiting to be written for "
+                            f"over {WRITER_BACKLOG_SECONDS:.0f} s -- the disk or encoder is "
+                            "not keeping up.",
+                            now_s=now_s,
+                        )
+                else:
+                    rt.backlog_since = None
+
+            if age_value == "":
+                segments.append(f"{prefix}no new frame ({rendered_fps:.1f} displayed fps)")
+                color = "#b71c1c"
+            else:
+                age_ms = float(age_value)
+                segments.append(f"{prefix}{age_ms:.0f} ms, {rendered_fps:.1f} displayed fps")
+                color = "#2e7d32" if age_ms <= 250.0 else "#e65100"
+            if multi:
+                rt.tile.set_caption(f"{slot.label} — {segments[-1]}", color)
+            if color == "#b71c1c" or (color == "#e65100" and worst_color == "#2e7d32"):
+                worst_color = color
+            if frame_gaps or incomplete or errors:
+                warn_parts.append(
+                    f"{prefix}{frame_gaps} gap(s), {incomplete} incomplete, {errors} error(s)"
                 )
-            if camera_reinits:
-                self._recording_warnings.note_issue(
-                    f"camera reconnected after a fault ({camera_reinits} reinit(s))",
-                    now_s=now_s,
-                )
-            if audio_reconnects:
-                self._recording_warnings.note_issue(
-                    f"microphone reconnected after a dropout ({audio_reconnects} time(s))",
-                    now_s=now_s,
-                )
-            # MJPEG is opt-in specifically because its encode cost is
-            # hardware-dependent (see set_compression_enabled) -- flag it
-            # live from append_queue_depth (see COMPRESSION_QUEUE_DEPTH_WARNING
-            # for why that's used instead of an append_ms latency percentile).
-            queue_depth = row["append_queue_depth"]
-            if (
-                self.camera.get_compression_enabled()
-                and queue_depth != ""
-                and int(queue_depth) >= COMPRESSION_QUEUE_DEPTH_WARNING
-            ):
-                self._recording_warnings.note_issue(
-                    f"MJPEG encoding is falling behind capture (append queue depth "
-                    f"{queue_depth}) -- frames are piling up waiting to be written "
-                    "and may start dropping. Consider turning off compression for "
-                    "this frame rate.",
-                    now_s=now_s,
-                )
+
+        if recording and audio_reconnects:
+            self._recording_warnings.note_issue(
+                f"microphone reconnected after a dropout ({audio_reconnects} time(s))",
+                now_s=now_s,
+            )
         self._update_recording_warning_banner()
 
         # "as of HH:MM:SS" is the one thing on this label that only a live
@@ -1841,18 +2133,10 @@ class MainWindow(QWidget):
         # its last (possibly healthy-looking) reading forever with no way
         # to tell a frozen GUI from a genuinely quiet recording.
         as_of = datetime.now().strftime("%H:%M:%S")
-        if age_value == "":
-            text = f"as of {as_of} — Preview pipeline: no new frame ({rendered_fps:.1f} displayed fps)"
-            color = "#b71c1c"
-        else:
-            age_ms = float(age_value)
-            text = (
-                f"as of {as_of} — Preview pipeline: {age_ms:.0f} ms, "
-                f"{rendered_fps:.1f} displayed fps"
-            )
-            color = "#2e7d32" if age_ms <= 250.0 else "#e65100"
+        text = f"as of {as_of} — Preview pipeline: " + " | ".join(segments)
+        color = worst_color
 
-        if self.state == AppState.RECORDING:
+        if recording:
             warning_state = self._recording_warnings.summarize(now_s=time.monotonic())
             if warning_state.healthy_for_s is not None:
                 text = f"Healthy for {format_duration_s(warning_state.healthy_for_s)} — {text}"
@@ -1868,14 +2152,13 @@ class MainWindow(QWidget):
         if interval_s > 1.5:
             text += f" — GUI stalled about {(interval_s - 1.0):.1f} s"
             color = "#b71c1c"
-        if frame_gaps or incomplete or errors:
-            text += (
-                f" — camera warnings: {frame_gaps} gap(s), "
-                f"{incomplete} incomplete, {errors} error(s)"
-            )
+        if warn_parts:
+            text += " — camera warnings: " + "; ".join(warn_parts)
             color = "#b71c1c"
 
-        logger_error = self._preview_diagnostics_logger.last_error
+        logger_error = next(
+            (rt.logger.last_error for rt in self._slot_rt.values() if rt.logger.last_error), None
+        )
         if logger_error:
             text += f" — diagnostics log error: {logger_error}"
             color = "#b71c1c"
@@ -1885,52 +2168,32 @@ class MainWindow(QWidget):
         )
 
     def update_frame(self):
-        preview_frame = self.camera.get_latest_preview_frame(
-            after_sequence=self._last_displayed_preview_sequence
-        )
-        if preview_frame is None:
-            if self._last_displayed_preview_sequence is not None:
-                self._preview_diagnostics.note_repeated_frame()
-            return
+        for slot in self._slots():
+            rt = self._slot_rt[slot.serial]
+            started = time.perf_counter()
+            preview_frame = slot.controller.get_latest_preview_frame(
+                after_sequence=rt.last_seq, max_size=rt.tile.target_size()
+            )
+            if preview_frame is None:
+                if rt.last_seq is not None:
+                    rt.diagnostics.note_repeated_frame()
+                continue
 
-        frame = preview_frame.image
-
-        # Handle grayscale vs color
-        if frame.ndim == 2:
-            height, width = frame.shape
-            bytes_per_line = width
-            qimg = QImage(
-                frame.data, width, height, bytes_per_line, QImage.Format.Format_Grayscale8
-            ).copy()
-        else:
-            height, width, channels = frame.shape
-            if channels == 3:
-                bytes_per_line = 3 * width
-                qimg = QImage(
-                    frame.data,
-                    width,
-                    height,
-                    bytes_per_line,
-                    QImage.Format.Format_RGB888,
-                ).rgbSwapped().copy()
-            else:
-                # Fallback: just bail if format is unexpected
-                return
-
-        pixmap = QPixmap.fromImage(qimg)
-        self.image_label.setPixmap(pixmap.scaled(
-            self.image_label.size(), Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        ))
-        displayed_at = time.monotonic()
-        self._last_displayed_preview_sequence = preview_frame.sequence
-        self._preview_diagnostics.note_displayed_frame(
-            frame_id=preview_frame.frame_id,
-            sequence=preview_frame.sequence,
-            retrieved_at=preview_frame.retrieved_at,
-            published_at=preview_frame.published_at,
-            displayed_at=displayed_at,
-        )
+            qimg = frame_to_qimage(preview_frame.image)
+            if qimg is None:
+                # Unexpected pixel layout: skip the frame rather than break the timer.
+                continue
+            rt.tile.show_image(qimg)
+            displayed_at = time.monotonic()
+            rt.last_seq = preview_frame.sequence
+            rt.diagnostics.note_displayed_frame(
+                frame_id=preview_frame.frame_id,
+                sequence=preview_frame.sequence,
+                retrieved_at=preview_frame.retrieved_at,
+                published_at=preview_frame.published_at,
+                displayed_at=displayed_at,
+            )
+            rt.diagnostics.note_render_ms((time.perf_counter() - started) * 1000.0)
 
     def keyPressEvent(self, event):
         if event.isAutoRepeat():
@@ -1947,7 +2210,7 @@ class MainWindow(QWidget):
 
         adl_id = self.adl_dropdown.currentData()
         adl_label = self.adl_dropdown.currentText() if adl_id is not None else None
-        self.camera.notify_label_event(label_event, adl_id, adl_label)
+        self.cameras.notify_label_event(label_event, adl_id, adl_label)
         self._append_label_marker_activity(label_event, adl_id, adl_label)
         pair_completed = self._record_label_pair_event(label_event, adl_id)
         pair_message = " Completed pair." if pair_completed else ""
@@ -1971,7 +2234,8 @@ class MainWindow(QWidget):
                     except Exception as exc:
                         print("Error stopping audio on close:", exc)
                     self._session_audio = None
-                self.camera.stop_recording()
+                if self.cameras is not None:
+                    self.cameras.stop_recording_all()
         except Exception as e:
             print("Error stopping recording on close:", e)
         try:
@@ -1982,9 +2246,10 @@ class MainWindow(QWidget):
         except Exception as e:
             print("Error stopping timer on close:", e)
         try:
-            ok, msg = self.camera.stop()
-            if not ok:
-                print(f"[camera] stop() deferred cleanup on close: {msg}")
+            if self.cameras is not None:
+                result = self.cameras.stop_all()
+                if not result.ok:
+                    print(f"[camera] stop() deferred cleanup on close: {result.message}")
         except Exception as e:
             print("Error stopping camera on close:", e)
 

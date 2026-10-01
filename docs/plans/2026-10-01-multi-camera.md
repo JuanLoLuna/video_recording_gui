@@ -46,11 +46,7 @@ Pure-logic steps 1-7 are unit-tested on macOS (`unittest`, no mocking, injected 
 7. Preview scaling helper + `render_ms` diagnostics columns
 8. ✅ `CameraController`: holder, serial binding, reinit by serial, two-phase recording, accessors (`serial`, `model`, `get_stream_rate()`), tagged thread names, preview `max_size` — done and unit/integration-tested on macOS against fake cameras; **rig: single-camera regression still to run**
 9. ✅ `scripts/multi_controller_smoke.py` + `backend/session_verify.py` — two real controllers headless (`tests/test_two_camera_integration.py` runs the same flow against fake cameras on macOS) — **rig: 2 x 10 min, then unplug test**
-10. GUI with the group at N=1 — **rig: single-camera GUI regression**
-11. Detection/binding for N cameras + preview tiles — **rig**
-12. Per-camera diagnostics, warnings, health captions, generic backlog warning (`append_queue_depth >= 30`) — **rig**
-13. Tuning camera selector + frame-rate intersection — **rig**
-14. Two-camera recording: per-camera `SessionPaths` from one shared `datetime.now()`, disk estimate wired in, missing-camera policy — **rig: full checklist**
+10-14. ✅ GUI (written together, tested headless): `gui/main.py` builds a `CameraGroup` at Detect through the registry (`enumerate_cameras` + `select_cameras`); start/stop/record/sync/label/frame-rate/compression/exposure-lock all fan out; `self.camera` is a property for the camera the tuning panel points at (selector shown only with several cameras); per-camera preview tiles (`gui/camera_preview.py`, downscaled before reaching the GUI thread), per-camera diagnostics accumulator + CSV (`render_ms` included), per-camera captions and `[model #serial]` banner prefixes, a sustained-backlog warning, per-slot `SessionPaths` from one timestamp, disk estimate from real frame sizes, manual start refused when a configured camera is missing, power-resume records best-effort. `tests/test_gui_cameras.py` drives the real `MainWindow` (Qt offscreen) against fake cameras. **Rig: single-camera GUI regression, then the full two-camera checklist below.**
 15. Validation report in `docs/reports/` (downstream changes deferred)
 
 ## Rig validation checklist (step 14)

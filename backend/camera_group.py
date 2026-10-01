@@ -354,4 +354,5 @@ class CameraGroup:
 
     @staticmethod
     def _join(outcomes: Iterable[SlotOutcome]) -> str:
-        return "; ".join(o.message for o in outcomes if o.message)
+        # Identical messages (every camera says "Preview started.") collapse to one.
+        return "; ".join(dict.fromkeys(o.message for o in outcomes if o.message))

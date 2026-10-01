@@ -9,156 +9,19 @@ machine with real PySpin installed (the rig) -- there the real cameras are the
 test, via scripts/multi_controller_smoke.py.
 """
 import os
-import sys
 import tempfile
 import time
-import types
 import unittest
 from datetime import datetime
 
-import numpy as np
-
-try:
-    import PySpin
-except ImportError:
-    PySpin = types.ModuleType("PySpin")
-    sys.modules["PySpin"] = PySpin
-
-REAL_PYSPIN = hasattr(PySpin, "System")
-
-if not REAL_PYSPIN:
-    # Just enough of PySpin's pointer helpers for the code paths used here.
-    PySpin.CStringPtr = PySpin.CIntegerPtr = PySpin.CFloatPtr = lambda node: node
-    PySpin.CBooleanPtr = PySpin.CEnumerationPtr = lambda node: node
-    PySpin.IsReadable = lambda node: node is not None
-    PySpin.IsWritable = lambda node: node is not None
-
+REAL_PYSPIN = __import__("fake_spinnaker").install_pyspin_stub()
 
 from backend.camera_control import CameraController, enumerate_cameras  # noqa: E402
 from backend.camera_group import CameraGroup, CameraSlot  # noqa: E402
 from backend.recording_paths import SessionPaths  # noqa: E402
 from backend.session_verify import verify_camera_outputs  # noqa: E402
 from backend.spinnaker_system import SharedSystemHolder  # noqa: E402
-
-FPS = 30.0
-
-
-class Node:
-    def __init__(self, value):
-        self.value = value
-
-    def GetValue(self):
-        return self.value
-
-
-class NodeMap:
-    def __init__(self, **values):
-        self.values = values
-
-    def GetNode(self, name):
-        return Node(self.values[name]) if name in self.values else None
-
-
-class FakeImage:
-    def __init__(self, frame_id, height, width):
-        self.frame_id = frame_id
-        self.height, self.width = height, width
-
-    def IsIncomplete(self):
-        return False
-
-    def GetChunkData(self):
-        outer = self
-
-        class Chunk:
-            def GetFrameID(self):
-                return outer.frame_id
-
-            def GetTimestamp(self):
-                return outer.frame_id * 33_333
-
-        return Chunk()
-
-    def GetNDArray(self):
-        return np.full((self.height, self.width), self.frame_id % 251, dtype=np.uint8)
-
-    def Release(self):
-        pass
-
-
-class FakeCamera:
-    def __init__(self, serial, model, width, height):
-        self.serial, self.model, self.width, self.height = serial, model, width, height
-        self.streaming = False
-        self._next_at = 0.0
-        self._frame_id = 0
-
-    def IsValid(self):
-        return True
-
-    def Init(self):
-        pass
-
-    def DeInit(self):
-        pass
-
-    def GetNodeMap(self):
-        return NodeMap(Width=self.width, Height=self.height)
-
-    def GetTLDeviceNodeMap(self):
-        return NodeMap(DeviceSerialNumber=self.serial, DeviceModelName=self.model,
-                       DeviceVendorName="FAKE")
-
-    def BeginAcquisition(self):
-        self.streaming = True
-        self._next_at = time.monotonic()
-
-    def EndAcquisition(self):
-        self.streaming = False
-
-    def GetNextImage(self, timeout_ms):
-        if not self.streaming:
-            raise RuntimeError("not acquiring")
-        self._next_at += 1.0 / FPS
-        delay = self._next_at - time.monotonic()
-        if delay > 0:
-            time.sleep(delay)
-        self._frame_id += 1
-        return FakeImage(self._frame_id, self.height, self.width)
-
-
-class FakeCamList:
-    def __init__(self, cameras):
-        self.cameras = cameras
-
-    def GetSize(self):
-        return len(self.cameras)
-
-    def __getitem__(self, i):
-        return self.cameras[i]
-
-    def GetBySerial(self, serial):
-        for cam in self.cameras:
-            if cam.serial == serial:
-                return cam
-        raise RuntimeError("not found")
-
-    def Clear(self):
-        pass
-
-
-class FakeSystem:
-    def __init__(self, cameras):
-        self.cameras = cameras
-
-    def GetCameras(self):
-        return FakeCamList(self.cameras)
-
-    def UpdateCameras(self):
-        pass
-
-    def ReleaseInstance(self):
-        pass
+from fake_spinnaker import FPS, FakeCamera, FakeSystem  # noqa: E402
 
 
 class BrokenTLCamera(FakeCamera):
