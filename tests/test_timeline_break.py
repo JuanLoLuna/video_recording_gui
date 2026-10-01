@@ -75,6 +75,26 @@ class SessionBookendRecordTests(unittest.TestCase):
         self.assertEqual(record["segment"], 0)
         self.assertEqual(record["recording"], "recording_20260101_000000")
 
+    def test_header_without_camera_fields_is_exactly_the_legacy_shape(self):
+        record = session_header_record(mono_ns=1, wall_ns=2, recording_basename="r")
+        self.assertEqual(
+            set(record), {"rec", "segment", "mono_ns", "wall_ns", "recording"}
+        )
+
+    def test_header_carries_camera_identity_when_given(self):
+        record = session_header_record(
+            mono_ns=1,
+            wall_ns=2,
+            recording_basename="recording_20261001_101500_cam26134271",
+            camera_serial="26134271",
+            camera_model="Blackfly S BFS-U3-13Y3M",
+            session="recording_20261001_101500",
+        )
+        self.assertEqual(record["camera_serial"], "26134271")
+        self.assertEqual(record["camera_model"], "Blackfly S BFS-U3-13Y3M")
+        self.assertEqual(record["session"], "recording_20261001_101500")
+        self.assertEqual(record["recording"], "recording_20261001_101500_cam26134271")
+
     def test_stop_record_shape(self):
         record = session_stop_record(mono_ns=1, wall_ns=2, total_segments=3, camera_reinits=1)
         self.assertEqual(record["rec"], "stop")

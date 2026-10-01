@@ -63,7 +63,13 @@ def timeline_break_record(brk: TimelineBreak) -> dict[str, object]:
 
 
 def session_header_record(
-    *, mono_ns: int, wall_ns: int, recording_basename: str
+    *,
+    mono_ns: int,
+    wall_ns: int,
+    recording_basename: str,
+    camera_serial: str | None = None,
+    camera_model: str | None = None,
+    session: str | None = None,
 ) -> dict[str, object]:
     """First record in a session's events sidecar.
 
@@ -71,14 +77,27 @@ def session_header_record(
     silently empty -- an events.jsonl with only a header and a stop
     record is the expected, correct shape for a clean session; one with
     nothing at all previously looked identical to "logging is broken".
+
+    With several cameras each has its own events file, so the optional
+    camera_serial / camera_model say which one this is, and `session` is the
+    session basename shared by all of them (recording_basename is then the
+    per-camera stem). All three keys are omitted when not given, so a
+    one-camera header is byte-for-byte what it always was.
     """
-    return {
+    record: dict[str, object] = {
         "rec": "header",
         "segment": 0,
         "mono_ns": mono_ns,
         "wall_ns": wall_ns,
         "recording": recording_basename,
     }
+    if camera_serial is not None:
+        record["camera_serial"] = camera_serial
+    if camera_model is not None:
+        record["camera_model"] = camera_model
+    if session is not None:
+        record["session"] = session
+    return record
 
 
 def session_stop_record(
