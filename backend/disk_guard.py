@@ -13,7 +13,7 @@ from __future__ import annotations
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 
 # Uncompressed 1280x1024 Mono8 (1.31 MB/frame) at the 100 fps target:
@@ -25,9 +25,53 @@ from typing import Callable
 # now be off by ~70x -- badly overestimating how much recording time a
 # given amount of free space actually buys.
 DEFAULT_BYTES_PER_HOUR = 471_900_000_000
-DEFAULT_WARN_HOURS = 24.0
-DEFAULT_CRITICAL_HOURS = 6.0
+# Sized for the study's actual use: ~1 h sessions, ~2 h/day. Critical = less than
+# about two 1-hour sessions' worth of room; warn = under a working day's worth
+# of recording. (Was 24 h / 6 h, tuned for the 10-day unattended run; a 4 TB
+# drive holds only ~22 h of two-camera uncompressed video, so 24 h warned on
+# every start.) Long unattended runs can still pass their own thresholds to
+# assess_disk().
+DEFAULT_WARN_HOURS = 8.0
+DEFAULT_CRITICAL_HOURS = 2.0
 DEFAULT_MIN_FREE_BYTES = 20 * 1024**3  # 20 GiB
+
+
+# MJPEG output relative to the raw frame size. Measured on the rig at ~0.07
+# (Blackfly 2.9 MB/s of 39.3 MB/s; Firefly 0.7 of 11.7); rounded up for margin.
+# This depends on the encoder's quality setting, which is being reworked
+# separately -- revisit when that lands.
+MJPEG_SIZE_FRACTION_ESTIMATE = 0.10
+
+
+@dataclass(frozen=True)
+class StreamRate:
+    """What one camera writes to disk: its frame geometry, rate and codec."""
+
+    width: int
+    height: int
+    bytes_per_pixel: int
+    fps: float
+    compressed: bool = False
+
+
+def estimate_bytes_per_hour(
+    streams: Iterable[StreamRate],
+    *,
+    mjpeg_fraction: float = MJPEG_SIZE_FRACTION_ESTIMATE,
+) -> int:
+    """Total bytes/hour for every camera that will record.
+
+    Uses each camera's real frame size, so two different sensors are summed
+    correctly instead of assuming one 1280x1024 camera at 100 fps. With no
+    streams (camera not yet read) falls back to DEFAULT_BYTES_PER_HOUR.
+    """
+    total = 0.0
+    seen = False
+    for stream in streams:
+        seen = True
+        rate = stream.width * stream.height * stream.bytes_per_pixel * stream.fps * 3600.0
+        total += rate * (mjpeg_fraction if stream.compressed else 1.0)
+    return int(round(total)) if seen else DEFAULT_BYTES_PER_HOUR
 
 
 @dataclass(frozen=True)

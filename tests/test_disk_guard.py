@@ -2,8 +2,13 @@ import unittest
 
 from backend.disk_guard import (
     DEFAULT_BYTES_PER_HOUR,
+    DEFAULT_CRITICAL_HOURS,
+    DEFAULT_WARN_HOURS,
+    MJPEG_SIZE_FRACTION_ESTIMATE,
     DiskSample,
+    StreamRate,
     assess_disk,
+    estimate_bytes_per_hour,
     sample_disk_usage,
 )
 
@@ -30,9 +35,10 @@ class AssessDiskTests(unittest.TestCase):
         self.assertFalse(verdict.requires_confirmation)
 
     def test_below_warn_hours_is_a_warning(self):
-        # ~24h at the default rate is ~147 GiB; pick something just under it.
-        hours_20 = DEFAULT_BYTES_PER_HOUR * 20 / 1024**3
-        verdict = assess_disk(make_sample(hours_20))
+        # Between the critical and warn thresholds, whatever they are set to.
+        between = (DEFAULT_CRITICAL_HOURS + DEFAULT_WARN_HOURS) / 2
+        hours_between = DEFAULT_BYTES_PER_HOUR * between / 1024**3
+        verdict = assess_disk(make_sample(hours_between))
         self.assertEqual(verdict.level, "warning")
         self.assertFalse(verdict.recording_blocked)
         self.assertTrue(verdict.requires_confirmation)
@@ -41,8 +47,8 @@ class AssessDiskTests(unittest.TestCase):
         # A rate-based projection is a judgment call, not a fact about the
         # disk right now (bytes_per_hour is an estimate) -- confirmable,
         # not a hard block. Only the absolute min_free_bytes floor blocks.
-        hours_3 = DEFAULT_BYTES_PER_HOUR * 3 / 1024**3
-        verdict = assess_disk(make_sample(hours_3))
+        hours_1 = DEFAULT_BYTES_PER_HOUR * (DEFAULT_CRITICAL_HOURS / 2) / 1024**3
+        verdict = assess_disk(make_sample(hours_1))
         self.assertEqual(verdict.level, "danger")
         self.assertFalse(verdict.recording_blocked)
         self.assertTrue(verdict.requires_confirmation)
@@ -80,6 +86,74 @@ class AssessDiskTests(unittest.TestCase):
         sample = sample_disk_usage("/fake/path", at_s=5.0, disk_usage=lambda p: FakeUsage())
         self.assertEqual(sample.free_bytes, 1000 * 1024**3)
         self.assertEqual(sample.at_s, 5.0)
+
+
+# The two cameras on the rig: Firefly 720x540 and Blackfly S 1280x1024, Mono8, 30 fps.
+FIREFLY_30 = StreamRate(720, 540, 1, 30.0)
+BLACKFLY_30 = StreamRate(1280, 1024, 1, 30.0)
+
+
+class EstimateBytesPerHourTests(unittest.TestCase):
+    def test_single_uncompressed_camera_matches_hand_computation(self):
+        self.assertEqual(estimate_bytes_per_hour([FIREFLY_30]), 720 * 540 * 30 * 3600)
+        self.assertEqual(estimate_bytes_per_hour([BLACKFLY_30]), 141_557_760_000)
+
+    def test_two_different_sensors_are_summed(self):
+        # The probe measured ~184 GB/h for this pair.
+        total = estimate_bytes_per_hour([FIREFLY_30, BLACKFLY_30])
+        self.assertEqual(total, 41_990_400_000 + 141_557_760_000)
+        self.assertAlmostEqual(total / 1e9, 183.5, delta=0.1)
+
+    def test_compressed_streams_use_the_mjpeg_fraction(self):
+        raw = estimate_bytes_per_hour([BLACKFLY_30])
+        compressed = estimate_bytes_per_hour([StreamRate(1280, 1024, 1, 30.0, compressed=True)])
+        self.assertAlmostEqual(compressed, raw * MJPEG_SIZE_FRACTION_ESTIMATE, delta=1)
+
+    def test_mixed_codecs_per_camera(self):
+        total = estimate_bytes_per_hour(
+            [FIREFLY_30, StreamRate(1280, 1024, 1, 30.0, compressed=True)],
+            mjpeg_fraction=0.5,
+        )
+        self.assertEqual(total, 41_990_400_000 + 70_778_880_000)
+
+    def test_rate_scales_with_fps(self):
+        double = estimate_bytes_per_hour([StreamRate(1280, 1024, 1, 60.0)])
+        self.assertEqual(double, 2 * 141_557_760_000)
+
+    def test_no_streams_falls_back_to_the_default(self):
+        self.assertEqual(estimate_bytes_per_hour([]), DEFAULT_BYTES_PER_HOUR)
+
+
+class RigScenarioTests(unittest.TestCase):
+    """The thresholds against the drives this study actually uses."""
+
+    def verdict(self, free_gb, streams):
+        rate = estimate_bytes_per_hour(streams)
+        return assess_disk(make_sample(free_gb * 1e9 / 1024**3), bytes_per_hour=rate)
+
+    def test_4tb_drive_is_safe_for_two_uncompressed_cameras(self):
+        # ~21.8 h of video: used to warn on every start under the 24 h threshold.
+        verdict = self.verdict(4000, [FIREFLY_30, BLACKFLY_30])
+        self.assertEqual(verdict.level, "safe")
+        self.assertFalse(verdict.requires_confirmation)
+
+    def test_internal_drive_with_700gb_asks_for_confirmation_when_uncompressed(self):
+        verdict = self.verdict(700, [FIREFLY_30, BLACKFLY_30])  # ~3.8 h
+        self.assertEqual(verdict.level, "warning")
+        self.assertTrue(verdict.requires_confirmation)
+        self.assertFalse(verdict.recording_blocked)
+
+    def test_internal_drive_is_safe_with_mjpeg(self):
+        streams = [
+            StreamRate(720, 540, 1, 30.0, compressed=True),
+            StreamRate(1280, 1024, 1, 30.0, compressed=True),
+        ]
+        self.assertEqual(self.verdict(700, streams).level, "safe")
+
+    def test_less_than_two_sessions_of_room_is_danger(self):
+        verdict = self.verdict(300, [FIREFLY_30, BLACKFLY_30])  # ~1.6 h
+        self.assertEqual(verdict.level, "danger")
+        self.assertFalse(verdict.recording_blocked)  # still confirmable
 
 
 if __name__ == "__main__":
