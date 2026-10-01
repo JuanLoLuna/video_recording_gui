@@ -268,6 +268,7 @@ class CameraGroup:
                 begun.append(slot)
                 continue
             failures.append(f"{slot.label}: {message}")
+            outcomes.append(SlotOutcome(slot.serial, False, f"begin failed: {message}"))
             if not best_effort:
                 # Extremely unlikely (begin only raises a flag), but never
                 # leave half a session running.

@@ -24,6 +24,15 @@ def write_session(
     skip_ids=(),
     break_after_row=None,
     header_recording=None,
+    real_layout=False,
+    break_record_index=True,
+    break_record_offset=0,
+    adl_label='',
+    no_fids=False,
+    truncate_events=False,
+    manifest_hole=False,
+    bad_join=False,
+    stray_segment_file=False,
 ):
     directory = Path(directory)
     rows, index, seg_rows = [], 0, []
@@ -35,42 +44,53 @@ def write_session(
             frame_id += 1
             if index in skip_ids:
                 frame_id += 1  # the camera produced a frame we never received
-            segment = 1 if (break_after_row is not None and index > break_after_row) else 0
+            flip_after = break_after_row + (1 if real_layout else 0) if break_after_row is not None else None
+            segment = 1 if (flip_after is not None and index > flip_after) else 0
             if break_after_row is not None and index == break_after_row + 1:
-                frame_id = 1  # reinit resets the camera's own counter
+                # A reinit either resets the camera's own counter, or (a stall
+                # without a power cycle) leaves it counting past the lost frames.
+                frame_id = frame_id + 5 if real_layout else 1
             if index in skip_indices:
                 continue
             rows.append({
                 "record_frame_index": index,
-                "camera_frame_id": frame_id,
+                "camera_frame_id": "" if no_fids else frame_id,
                 "timestamp_us": int(index * 1_000_000 / fps),
                 "system_time": 1000.0 + index / fps,
-                "sync_pulse": False, "sync_label": "", "adl_id": "", "adl_label": "",
-                "segment": segment, "segment_file": f"{stem}-{seg_no:04d}.avi",
+                "sync_pulse": False, "sync_label": "", "adl_id": "", "adl_label": adl_label,
+                "segment": segment,
+                "segment_file": "other-0000.avi" if (stray_segment_file and index == 2) else f"{stem}-{seg_no:04d}.avi",
                 "segment_frame_index": index - first + 1,
                 "monotonic_s": index / fps, "wall_mono_skew_s": 0.0,
             })
         seg_rows.append({
-            "segment_index": seg_no, "segment_file": f"{stem}-{seg_no:04d}.avi",
-            "first_record_frame_index": first, "last_record_frame_index": index,
+            "segment_index": 5 if (manifest_hole and seg_no == 1) else seg_no,
+            "segment_file": f"{stem}-{seg_no:04d}.avi",
+            "first_record_frame_index": first + (1 if (bad_join and seg_no == 1) else 0),
+            "last_record_frame_index": index,
             "frame_count": count, "bytes": 1,
             "roll_reason": last_roll if seg_no == len(frames_per_segment) - 1 else "frame_count",
         })
-    with open(directory / "m.csv", "w", newline="") as f:
+    with open(directory / "m.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=METADATA_FIELDS)
         w.writeheader()
         w.writerows(rows)
-    with open(directory / "s.csv", "w", newline="") as f:
+    with open(directory / "s.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS, extrasaction="ignore")
         w.writeheader()
         w.writerows(seg_rows)
     records = [{"rec": "header", "recording": header_recording or stem, "camera_serial": serial}]
     if break_after_row is not None:
-        records.append({"rec": "timeline_break", "cause": "camera_reinit"})
+        brk = {"rec": "timeline_break", "cause": "camera_reinit"}
+        if break_record_index:
+            brk["record_frame_index"] = break_after_row + break_record_offset
+        records.append(brk)
     if not drop_stop:
         records.append({"rec": "stop", "total_segments": len(frames_per_segment)})
-    with open(directory / "e.jsonl", "w") as f:
+    with open(directory / "e.jsonl", "w", encoding="utf-8") as f:
         f.write("\n".join(json.dumps(r) for r in records) + "\n")
+        if truncate_events:
+            f.write('{"rec": "sto')
     return directory / "m.csv", directory / "s.csv", directory / "e.jsonl"
 
 
@@ -114,6 +134,55 @@ class VerifyCameraOutputsTests(unittest.TestCase):
         report = self.verify(break_after_row=2)
         self.assertEqual(report.camera_frame_id_gaps, 0)
         self.assertEqual(report.timeline_breaks, 1)
+        self.assertTrue(report.ok, report.problems)
+
+    def test_the_real_fault_layout_is_not_a_false_failure(self):
+        # The reconnect frame is appended to the OLD segment (segment column
+        # flips one row later) and the camera's counter may keep counting past
+        # the lost frames instead of resetting.
+        report = self.verify(frames_per_segment=(4, 4), break_after_row=2, real_layout=True)
+        self.assertEqual(report.camera_frame_id_gaps, 0)
+        self.assertTrue(report.ok, report.problems)
+
+    def test_a_forward_jump_without_any_timeline_break_is_still_a_loss(self):
+        report = self.verify(frames_per_segment=(4, 4), break_after_row=2, real_layout=True,
+                             break_record_index=False)
+        self.assertGreater(report.camera_frame_id_gaps, 0)
+
+    def test_a_break_explains_one_discontinuity_not_every_later_loss(self):
+        report = self.verify(frames_per_segment=(4, 6), break_after_row=2, real_layout=True,
+                             skip_ids=(8,))
+        self.assertEqual(report.camera_frame_id_gaps, 1)  # only the loss at row 8
+
+    def test_a_recorded_index_a_little_behind_the_true_break_still_matches(self):
+        # The controller records its frame counter when it handled the fault,
+        # which can lag the append thread.
+        report = self.verify(frames_per_segment=(6, 4), break_after_row=4, real_layout=True,
+                             break_record_offset=-2)
+        self.assertTrue(report.ok, report.problems)
+
+    def test_missing_frame_ids_are_flagged_not_silently_passed(self):
+        report = self.verify(no_fids=True)
+        self.assertTrue(any("no camera_frame_id" in p for p in report.problems))
+
+    def test_a_truncated_events_line_is_a_problem_not_an_exception(self):
+        report = self.verify(truncate_events=True)
+        self.assertTrue(any("unparsable" in p for p in report.problems))
+
+    def test_a_hole_in_segment_indices_is_flagged(self):
+        self.assertTrue(any("segment_index" in p for p in self.verify(manifest_hole=True).problems))
+
+    def test_segment_ranges_must_join(self):
+        self.assertTrue(any("do not join" in p for p in self.verify(bad_join=True).problems))
+
+    def test_metadata_naming_a_segment_the_manifest_lacks_is_flagged(self):
+        report = self.verify(stray_segment_file=True)
+        self.assertTrue(any("missing from the manifest" in p for p in report.problems))
+
+    def test_non_ascii_labels_are_read_as_utf8(self):
+        # The writer emits utf-8; reading with a locale default (cp1252 on
+        # Windows) would mis-decode or raise on a label like this one.
+        report = self.verify(adl_label="Écrire \u2014 \u66f8\u304f")
         self.assertTrue(report.ok, report.problems)
 
     def test_an_unclosed_final_segment_is_a_problem(self):

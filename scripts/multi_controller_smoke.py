@@ -52,15 +52,17 @@ def main() -> int:
     from backend.camera_control import CameraController, enumerate_cameras
     from backend.camera_group import CameraGroup, CameraSlot
     from backend.camera_registry import format_camera_summary, parse_serials_env, select_cameras
-    from backend.disk_guard import assess_disk, estimate_bytes_per_hour, sample_disk_usage
-    from backend.recording_paths import SessionPaths, resolve_output_dir
-    from backend.session_verify import verify_camera_outputs
 
     selection = select_cameras(enumerate_cameras(), args.serials or parse_serials_env())
     print(format_camera_summary(selection))
     for warning in selection.warnings:
         print(f"  WARNING: {warning}")
     if not selection.bound:
+        return 2
+    if selection.missing:
+        # Plan decision 5: a manual start with a configured camera missing is
+        # refused. A "PASS" with fewer cameras than asked for would be a lie.
+        print(f"Configured camera(s) not found: {', '.join(selection.missing)} -- refusing to run.")
         return 2
     if args.fault_serial and args.fault_serial not in [c.serial for c in selection.bound]:
         print(f"--fault-serial {args.fault_serial} is not one of the bound cameras")
@@ -74,10 +76,22 @@ def main() -> int:
         slots.append(CameraSlot(controller, serial=cam.serial, model=cam.model, tag=cam.tag, is_primary=cam.is_primary))
     group = CameraGroup(slots)
 
+    try:
+        return run_session(args, slots, group)
+    finally:
+        # Ctrl+C or an exception anywhere must not leave cameras streaming.
+        # stop_all() is safe to repeat (per-owner Spinnaker references).
+        group.stop_all()
+
+
+def run_session(args, slots, group) -> int:
+    from backend.disk_guard import assess_disk, estimate_bytes_per_hour, sample_disk_usage
+    from backend.recording_paths import SessionPaths, resolve_output_dir
+    from backend.session_verify import verify_camera_outputs
+
     result = group.start_all()
     print(f"start_all: ok={result.ok} {result.message}")
     if not result.ok:
-        group.stop_all()
         return 1
 
     fps_by = {s.serial: (s.controller.get_acquisition_frame_rate() or args.fps) for s in slots}
@@ -94,7 +108,6 @@ def main() -> int:
     result = group.start_recording_all(lambda s: paths[s.serial], lambda s: fps_by[s.serial])
     print(f"start_recording_all: ok={result.ok} {result.message}")
     if not result.ok:
-        group.stop_all()
         return 1
 
     cpu0, wall0 = time.process_time(), time.monotonic()
@@ -105,11 +118,14 @@ def main() -> int:
         proc = None
     deadline = time.monotonic() + args.seconds
     next_report = time.monotonic() + 10.0
+    queue_max = {s.serial: 0 for s in slots}  # sampled every 0.25 s, not only at report time
     if args.fault_serial:
         print(f"\n>>> During the run, UNPLUG camera #{args.fault_serial} for ~20-30 s, then replug it. <<<")
     try:
         while time.monotonic() < deadline:
             time.sleep(0.25)
+            for s in slots:
+                queue_max[s.serial] = max(queue_max[s.serial], s.controller._append_queue.qsize())
             if time.monotonic() >= next_report:
                 next_report += 10.0
                 line = f"  t+{args.seconds - (deadline - time.monotonic()):4.0f}s "
@@ -117,7 +133,7 @@ def main() -> int:
                     st = s.controller.get_acquisition_stats()
                     line += (f"| #{s.serial}: rec={s.controller.frame_counter} gaps={st['camera_frame_gaps']} "
                              f"err={st['acquisition_errors']} reinit={st['camera_reinits']} "
-                             f"q={s.controller._append_queue.qsize()} ")
+                             f"q={s.controller._append_queue.qsize()}(max {queue_max[s.serial]}) ")
                 if proc is not None:
                     line += f"| rss={proc.memory_info().rss / 1e6:.0f}MB"
                 print(line, flush=True)
@@ -140,16 +156,25 @@ def main() -> int:
         )
         stats = final_stats[s.serial]
         problems = list(report.problems)
-        leftovers = list(p.incomplete_dir.glob(f"{p.stem}_part*")) if p.incomplete_dir.exists() else []
+        leftovers = (
+            [f for f in p.incomplete_dir.iterdir() if f.name.startswith(p.stem + "_part") or f.name.startswith("UNEXPECTED")]
+            if p.incomplete_dir.exists() else []
+        )
         if leftovers:
             problems.append(f".incomplete/ still holds {len(leftovers)} file(s)")
         for index in range(report.segment_count):
             if not p.video_final(index).exists():
                 problems.append(f"missing segment file {p.video_final(index).name}")
-        for name in ("append_failures", "incomplete_images", "acquisition_errors"):
+        faulted = s.serial == args.fault_serial
+        # An unplug makes every GetNextImage raise, so the faulted camera's
+        # grab errors are expected; the others must be clean.
+        counters = ("append_failures",) if faulted else (
+            "append_failures", "incomplete_images", "acquisition_errors")
+        for name in counters:
             if stats[name]:
                 problems.append(f"{name}={stats[name]}")
-        faulted = s.serial == args.fault_serial
+        if queue_max[s.serial] >= 5:
+            problems.append(f"append queue peaked at {queue_max[s.serial]} (plan criterion: < 5)")
         if faulted:
             if report.timeline_breaks < 1 or stats["camera_reinits"] < 1:
                 problems.append("expected a timeline break and a reinit after the unplug; saw none")

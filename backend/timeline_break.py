@@ -81,8 +81,9 @@ def session_header_record(
     With several cameras each has its own events file, so the optional
     camera_serial / camera_model say which one this is, and `session` is the
     session basename shared by all of them (recording_basename is then the
-    per-camera stem). All three keys are omitted when not given, so a
-    one-camera header is byte-for-byte what it always was.
+    per-camera stem). All three keys are omitted when not given. The
+    controller passes `session` always and camera_serial/camera_model when
+    they can be read, so a real header now carries those additive keys.
     """
     record: dict[str, object] = {
         "rec": "header",

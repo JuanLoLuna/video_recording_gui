@@ -151,6 +151,10 @@ def enumerate_cameras(holder: SharedSystemHolder | None = None) -> list[CameraDe
                             vendor=_read_tl_string(nodemap, "DeviceVendorName"),
                         )
                     )
+                except Exception:
+                    # Still listed, so the user can see something is wrong
+                    # with it; select_cameras() ignores unreadable serials.
+                    found.append(CameraDescriptor(serial="<unavailable>"))
                 finally:
                     cam = None
             return found
@@ -173,7 +177,7 @@ def detect_first_camera():
     try:
         cameras = enumerate_cameras()
     except Exception as exc:
-        return False, f"Error: could not create Spinnaker system ({exc})"
+        return False, f"Error: could not list cameras ({exc})"
     if not cameras:
         return False, "No cameras detected."
     first = cameras[0]
@@ -350,6 +354,9 @@ class CameraController:
         self.record_stop_requested = False     # GUI asks to stop
         # SessionPaths handed to prepare_recording() and not yet begun/aborted.
         self._prepared = None
+        # Why the last ACCEPTED start failed asynchronously (segment 0 would not
+        # open); None when it did not. Cleared by every prepare_recording().
+        self.last_start_error: str | None = None
 
         self.avi_recorder = None
         # MJPEG trades smaller files for an encode cost inside Append() that
@@ -424,10 +431,10 @@ class CameraController:
         except Exception:
             return None
         try:
-            if not cam.IsValid():
+            if cam is None or not cam.IsValid():
                 return None
         except Exception:
-            pass
+            return None
         return cam
 
     def _pin_identity(self) -> None:
@@ -507,6 +514,10 @@ class CameraController:
         acquisition thread did not exit in time -- see the teardown-safety
         note below.
         """
+        # A recording that was prepared but never begun holds open sidecars and
+        # would otherwise leave the controller refusing "already prepared".
+        self.abort_prepared()
+
         # If recording is active or queued, request stop and give loop time.
         # Since Phase 2, finishing a stop means closing a segment (possibly
         # flushing a large dirty-page-cache write) AND draining the closer
@@ -578,6 +589,14 @@ class CameraController:
 
         # Release system
         self._cleanup_system()
+
+        # The serial found by a legacy (no-serial) controller is pinned only
+        # while it runs, so that fault recovery re-finds the SAME camera. After
+        # a clean stop it must go: otherwise swapping in a different camera and
+        # pressing Preview again would look for the old serial forever.
+        self.serial = self.requested_serial
+        if self.requested_serial is None:
+            self.model = ""
 
         return True, ""
 
@@ -795,19 +814,20 @@ class CameraController:
                         # (validated on the rig by scripts/reinit_spike.py).
                         self.system = self._holder.system or self._holder.acquire(self)
                     self.cam_list = self.system.GetCameras()
-                    if self.cam_list.GetSize() == 0:
-                        return False, "No camera detected during reinit."
                     self.cam = self._pick_camera(self.cam_list)
                     if self.cam is None and self.serial:
-                        # The bus may not have refreshed yet: ask once, retry.
+                        # The bus may not have refreshed yet: ask once, retry
+                        # (also when the list came back empty).
                         try:
-                            self.system.UpdateCameras()
                             self.cam_list.Clear()
+                            self.system.UpdateCameras()
                             self.cam_list = self.system.GetCameras()
                             self.cam = self._pick_camera(self.cam_list)
                         except Exception:
                             self.cam = None
                     if self.cam is None:
+                        if self.cam_list.GetSize() == 0:
+                            return False, "No camera detected during reinit."
                         return False, f"Camera {self.serial} not present during reinit."
                     self.cam.Init()
                     self._configure_camera_nodes()
@@ -1298,10 +1318,12 @@ class CameraController:
         if not self.acquiring or self.cam is None:
             return False, "Cannot record: camera is not acquiring."
 
-        if self.recording_active and self.record_stop_requested:
+        if self.record_stop_requested and (self.recording_active or self.record_start_requested):
             # The previous recording is still draining/closing its last
-            # segment (can take seconds for a ~3 GB file). Reporting success
-            # here used to leave the GUI "recording" while nothing was.
+            # segment (can take seconds for a ~3 GB file), or a start was
+            # accepted and then immediately stopped before the acquisition
+            # thread acted on it. Reporting success here used to leave the GUI
+            # "recording" while nothing was.
             return False, "Previous recording is still closing; try again in a moment."
 
         if self.recording_active or self.record_start_requested:
@@ -1310,15 +1332,47 @@ class CameraController:
         if self._prepared is not None:
             return False, "A recording is already prepared; begin or abort it first."
 
-        # Open the metadata CSV synchronously, on the calling (GUI) thread,
-        # so a bad output path fails the start immediately instead of
-        # silently losing every frame's metadata for the whole session.
-        self._metadata_writer.start(session_paths.metadata_csv)
-        if not self._metadata_writer.wait_until_open():
-            return False, f"Cannot open metadata CSV: {self._metadata_writer.last_error}"
+        self.last_start_error = None
+        # An events log left open by an earlier failed/aborted attempt would
+        # be replaced below and its handle (and, on Windows, file lock) leaked.
+        if self._event_log is not None:
+            try:
+                self._event_log.close()
+            except Exception:
+                pass
+            self._event_log = None
 
+        # Everything this call creates, so a failure removes exactly that and
+        # nothing belonging to an earlier session with the same name.
+        created: list[Path] = []
+
+        def fail(message: str):
+            for step in (self._metadata_writer.stop, self._segment_manifest_writer.stop):
+                try:
+                    step()
+                except Exception:
+                    pass
+            if self._event_log is not None:
+                try:
+                    self._event_log.close()
+                except Exception:
+                    pass
+                self._event_log = None
+            for path in created:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            return False, message
+
+        # The events log goes FIRST: it is opened with mode "x" and refuses to
+        # overwrite, so a retry with a name that already exists fails here,
+        # before the metadata CSV (opened with "w", which truncates) is
+        # touched. Otherwise a same-name retry wiped the earlier session's
+        # per-frame metadata and only then discovered the clash.
         try:
             self._event_log = JsonlEventLog(session_paths.events_jsonl)
+            created.append(session_paths.events_jsonl)
             self._event_log.write(
                 session_header_record(
                     mono_ns=int(time.monotonic() * 1e9),
@@ -1333,22 +1387,22 @@ class CameraController:
                 )
             )
         except Exception as exc:
-            self._metadata_writer.stop()
-            if self._event_log is not None:
-                try:
-                    self._event_log.close()
-                except Exception:
-                    pass
-                self._event_log = None
-            return False, f"Cannot open events log {session_paths.events_jsonl}: {exc}"
+            if self._event_log is None:
+                created.clear()  # the open itself failed: nothing of ours exists
+            return fail(f"Cannot open events log {session_paths.events_jsonl}: {exc}")
+
+        # Open the metadata CSV synchronously, on the calling (GUI) thread,
+        # so a bad output path fails the start immediately instead of
+        # silently losing every frame's metadata for the whole session.
+        self._metadata_writer.start(session_paths.metadata_csv)
+        created.append(session_paths.metadata_csv)
+        if not self._metadata_writer.wait_until_open():
+            return fail(f"Cannot open metadata CSV: {self._metadata_writer.last_error}")
 
         self._segment_manifest_writer.start(session_paths.segments_csv)
+        created.append(session_paths.segments_csv)
         if not self._segment_manifest_writer.wait_until_open():
-            self._metadata_writer.stop()
-            self._event_log.close()
-            self._event_log = None
-            self._remove_unused_sidecars(session_paths)
-            return False, f"Cannot open segments CSV: {self._segment_manifest_writer.last_error}"
+            return fail(f"Cannot open segments CSV: {self._segment_manifest_writer.last_error}")
 
         # Lives for the app's lifetime, not per-session -- start them once.
         if self._closer_thread is None or not self._closer_thread.is_alive():
@@ -1408,6 +1462,31 @@ class CameraController:
         self.record_start_requested = True
         self.record_stop_requested = False
         return True, f"Recording requested: {session_paths.stem}"
+
+    def _discard_failed_start(self) -> None:
+        """Acquisition thread: segment 0 could not be opened after an accepted start.
+
+        No frame was ever written, so close the sidecars prepare_recording()
+        opened and delete them. Without this they stay open (on Windows that
+        also locks the files) and the next prepare would replace a still-open
+        events log. The failure is left in last_start_error for the GUI/group
+        to report, since the start already returned ok.
+        """
+        session_paths = self._session_paths
+        for step in (self._metadata_writer.stop, self._segment_manifest_writer.stop):
+            try:
+                step()
+            except Exception:
+                pass
+        if self._event_log is not None:
+            try:
+                self._event_log.close()
+            except Exception:
+                pass
+            self._event_log = None
+        self._session_paths = None
+        if session_paths is not None:
+            self._remove_unused_sidecars(session_paths)
 
     @staticmethod
     def _remove_unused_sidecars(session_paths: SessionPaths) -> None:
@@ -1471,7 +1550,14 @@ class CameraController:
         # "no camera handle" branch below), and the loop must keep running
         # through that window to retry -- otherwise a single failed reinit
         # would silently end the loop and never resume.
+        cam = image = None
         while not self._stop_event.is_set() and self.acquiring:
+            # Drop last iteration's camera handle and image BEFORE anything
+            # below can start a reinit: _reinitialize_camera sets self.cam to
+            # None and clears the CameraList, which only works if this loop is
+            # not still holding the old device object (see
+            # scripts/reinit_spike.py, which drops its reference first too).
+            cam = image = None
             # --------------------------------------------------
             # START recording (open the video writer) if requested
             # --------------------------------------------------
@@ -1483,6 +1569,8 @@ class CameraController:
                     print(f"{self._log_prefix} Error starting recording:", exc)
                     self.avi_recorder = None
                     self.recording_active = False
+                    self.last_start_error = f"{exc.__class__.__name__}: {exc}"
+                    self._discard_failed_start()
                 finally:
                     self.record_start_requested = False
 
@@ -1568,10 +1656,13 @@ class CameraController:
                         print(f"{self._log_prefix} Error closing events log:", exc)
                     self._event_log = None
 
-                # Reset recording state
+                # Reset recording state. recording_active goes False only after
+                # the paths are gone, and record_stop_requested last, so a
+                # prepare_recording() landing in this window is refused rather
+                # than having its paths cleared underneath it.
+                self._session_paths = None
                 self.recording_active = False
                 self.record_stop_requested = False
-                self._session_paths = None
 
             # --------------------------------------------------
             # Grab next frame from camera, with fault recovery
@@ -1601,6 +1692,7 @@ class CameraController:
                 grab_timeout_ms = self._watchdog_grab_timeout_ms()
                 image = cam.GetNextImage(grab_timeout_ms)
             except Exception as exc:
+                cam = image = None  # may be about to be torn down by a reinit
                 with self._acquisition_stats_lock:
                     self._acquisition_errors += 1
                 error_decision = self._watchdog.note_error(now=time.monotonic(), error=str(exc))

@@ -43,19 +43,35 @@ class CameraSessionReport:
         return not self.problems
 
 
+# How many rows after a timeline_break's recorded record_frame_index the break's
+# discontinuity (a camera_frame_id reset or jump) may appear. The recorded index
+# is the controller's frame counter when the fault was handled, which can lag the
+# append thread by its queue depth, and the reconnect frame itself is appended
+# before the segment roll -- so the discontinuity is near, not exactly at, it.
+BREAK_WINDOW_ROWS = 200
+
+
 def _read_csv(path: Path) -> list[dict[str, str]]:
-    with open(path, newline="") as handle:
+    # utf-8 is what AsyncCsvWriter writes; the platform default (cp1252 on
+    # Windows) would mis-decode a non-ASCII adl_label.
+    with open(path, newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle))
 
 
-def _read_events(path: Path) -> list[dict]:
-    records = []
-    with open(path) as handle:
-        for line in handle:
+def _read_events(path: Path) -> tuple[list[dict], list[int]]:
+    """(records, 1-based numbers of lines that are not valid JSON)."""
+    records: list[dict] = []
+    bad: list[int] = []
+    with open(path, encoding="utf-8") as handle:
+        for number, line in enumerate(handle, 1):
             line = line.strip()
-            if line:
+            if not line:
+                continue
+            try:
                 records.append(json.loads(line))
-    return records
+            except json.JSONDecodeError:
+                bad.append(number)  # e.g. a truncated last line after a crash
+    return records, bad
 
 
 def _int(value: str | None) -> int | None:
@@ -91,7 +107,9 @@ def verify_camera_outputs(
 
     rows = _read_csv(metadata_csv)
     segments = _read_csv(segments_csv)
-    events = _read_events(events_jsonl)
+    events, bad_event_lines = _read_events(events_jsonl)
+    if bad_event_lines:
+        problems.append(f"events log has unparsable line(s): {bad_event_lines[:5]} (truncated?)")
 
     # ---- metadata: dense index, row count
     indices = [i for i in (_int(r.get("record_frame_index")) for r in rows) if i is not None]
@@ -105,23 +123,47 @@ def verify_camera_outputs(
     if indices and indices[0] != 1:
         problems.append(f"record_frame_index starts at {indices[0]}, not 1")
 
-    # ---- camera_frame_id gaps, only inside one continuous stretch (a reinit
-    # resets the camera's own counter and bumps `segment`)
+    # ---- camera_frame_id gaps. A camera fault legitimately breaks the camera's
+    # own counter (it resets, or jumps) around a reinit, and the segment
+    # column flips one row AFTER the reconnect frame, so neither "same segment"
+    # nor an exact row match identifies it. Instead each timeline_break in the
+    # events log is allowed to explain ONE discontinuity in the rows that follow
+    # its recorded index; any other missing frame id is a real loss.
+    break_indices = sorted(
+        e["record_frame_index"]
+        for e in events
+        if e.get("rec") == "timeline_break" and isinstance(e.get("record_frame_index"), int)
+    )
+    pending_breaks = list(break_indices)
+    armed_until: list[int] = []
     gaps = 0
     deltas_ms: list[float] = []
     prev = None
+    have_frame_ids = False
     for row in rows:
+        idx = _int(row.get("record_frame_index"))
         fid, seg = _int(row.get("camera_frame_id")), row.get("segment")
         ts = _int(row.get("timestamp_us"))
-        if prev is not None and prev[1] == seg:
-            if fid is not None and prev[0] is not None and fid > prev[0] + 1:
-                gaps += fid - prev[0] - 1
-            if ts is not None and prev[2] is not None and ts > prev[2]:
-                deltas_ms.append((ts - prev[2]) / 1000.0)
-        prev = (fid, seg, ts)
+        have_frame_ids |= fid is not None
+        if prev is not None:
+            prev_idx, prev_fid, prev_seg, prev_ts = prev
+            while pending_breaks and prev_idx is not None and prev_idx >= pending_breaks[0]:
+                armed_until.append(pending_breaks.pop(0) + BREAK_WINDOW_ROWS)
+            armed_until = [e for e in armed_until if prev_idx is None or prev_idx <= e]
+            discontinuity = fid is not None and prev_fid is not None and fid != prev_fid + 1
+            if discontinuity and armed_until:
+                armed_until.pop(0)  # explained by a recorded fault
+            elif prev_seg == seg:
+                if fid is not None and prev_fid is not None and fid > prev_fid + 1:
+                    gaps += fid - prev_fid - 1
+                if ts is not None and prev_ts is not None and ts > prev_ts:
+                    deltas_ms.append((ts - prev_ts) / 1000.0)
+        prev = (idx, fid, seg, ts)
     report.camera_frame_id_gaps = gaps
+    if rows and not have_frame_ids:
+        problems.append("no camera_frame_id values in the metadata: frame loss cannot be checked")
     if gaps:
-        problems.append(f"{gaps} camera_frame_id gap(s) inside continuous stretches (frames lost)")
+        problems.append(f"{gaps} camera_frame_id gap(s) not explained by a timeline break (frames lost)")
     if deltas_ms:
         report.median_timestamp_delta_ms = statistics.median(deltas_ms)
 
@@ -144,6 +186,22 @@ def verify_camera_outputs(
         problems.append(
             f"last record_frame_index {report.last_record_frame_index} != metadata rows {report.metadata_rows}"
         )
+    if segments:
+        seg_indices = [_int(sg.get("segment_index")) for sg in segments]
+        if seg_indices != list(range(len(segments))):
+            problems.append(f"segment_index is not 0..{len(segments) - 1} without holes: {seg_indices[:8]}")
+        for before, after in zip(segments, segments[1:]):
+            last, first = _int(before.get("last_record_frame_index")), _int(after.get("first_record_frame_index"))
+            if last is not None and first is not None and first != last + 1:
+                problems.append(
+                    f"segment frame ranges do not join: {before.get('segment_file')} ends at {last}, "
+                    f"{after.get('segment_file')} starts at {first}"
+                )
+                break
+        listed = {sg.get("segment_file") for sg in segments}
+        stray = {r.get("segment_file") for r in rows} - listed
+        if stray:
+            problems.append(f"metadata names segment file(s) missing from the manifest: {sorted(stray)[:3]}")
     if expect_stem is not None:
         for seg in segments:
             name = seg.get("segment_file", "")

@@ -78,6 +78,15 @@ Verified against the real `CameraController` by an independent audit of steps 1-
 - **Byte-ceiling rolls are never pre-armed** (`should_prepare` is frame-based): with uncompressed 30 fps every 3 GB roll opens its writer on the append thread. Check `append_queue_depth` around roll boundaries against the < 5 criterion.
 - GUI (step 10/14): per-slot `SessionPaths` via `with_camera(slot.tag)` from one `datetime.now()`; per-camera `fps_of`; per-camera diagnostics logger; `estimate_bytes_per_hour` into `assess_disk` (until then the GUI still uses the 1-camera 100 fps default rate; `SLEEVE_VIDEO_GUI_PLANNED_HOURS` already adds the long-run prompt); `broadcast()` reports `ok=True` even when a setter returns `False`, so callers must inspect `.value`; delete the unused `metadata_csv_path()` helper in `frame_metadata.py`.
 
+## Controller behaviour worth knowing (from the step 8-9 audit)
+
+- A legacy controller (no `serial=`) pins the serial it finds only while it runs; a clean `stop()` releases the pin, so swapping a different camera in and pressing Preview works as before. A controller created with `serial=` keeps it.
+- `start_recording()` can be accepted and still fail asynchronously (segment 0 cannot be opened on the acquisition thread). The sidecars are then closed and deleted and `last_start_error` is set; the GUI/group should poll it after a start. `stop()` also cancels a prepared-but-never-begun recording.
+- Stop followed by an immediate Start is refused while the old recording is closing, including the window where a start was accepted but not yet acted on.
+- Fault layout (pre-existing, validated in the phase 2/3 reports): the first frame after a reinit is appended to the OLD segment and the segment roll happens just after it, so a camera `FrameID` reset or forward jump sits inside one segment. `session_verify` therefore attributes one discontinuity to each `timeline_break` event instead of relying on the `segment` column.
+- The acquisition loop drops its local camera/image handles at the top of every iteration and before any recovery, so `_reinitialize_camera` can actually let go of the old device (the spike dropped its references too). This part is inferred, not rig-verified: the unplug test in `multi_controller_smoke.py --fault-serial` is what proves it.
+- `scripts/multi_controller_smoke.py` refuses to run (exit 2) when a configured camera is missing, treats the unplugged camera's grab errors as expected, and fails if an append queue peaks at 5 or more.
+
 ## Risks (inferred, not verified from code)
 
 - ~~R1/R2~~ **Resolved on the rig (`scripts/reinit_spike.py`, 2026-10-01):** with the Firefly streaming, the Blackfly was unplugged, torn down on its own, re-found by serial with plain `GetCameras()` (one `CameraList` per camera) and restarted; the Firefly had 0 frame gaps and 0 errors throughout. The spike's PASS criterion was strengthened afterwards (grab errors, rate and longest-interval checks, FrameIDs readable) — re-run it once with the new criterion and also with the cameras swapped (unplug the Firefly).

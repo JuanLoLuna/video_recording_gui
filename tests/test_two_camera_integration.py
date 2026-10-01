@@ -34,7 +34,7 @@ if not REAL_PYSPIN:
     PySpin.IsWritable = lambda node: node is not None
 
 
-from backend.camera_control import CameraController  # noqa: E402
+from backend.camera_control import CameraController, enumerate_cameras  # noqa: E402
 from backend.camera_group import CameraGroup, CameraSlot  # noqa: E402
 from backend.recording_paths import SessionPaths  # noqa: E402
 from backend.session_verify import verify_camera_outputs  # noqa: E402
@@ -159,6 +159,120 @@ class FakeSystem:
 
     def ReleaseInstance(self):
         pass
+
+
+class BrokenTLCamera(FakeCamera):
+    def GetTLDeviceNodeMap(self):
+        raise RuntimeError("TL read failed")
+
+
+@unittest.skipIf(REAL_PYSPIN, "real PySpin present: use scripts/multi_controller_smoke.py")
+class StartStopTests(unittest.TestCase):
+    """start()/stop() against fake cameras: shared-System bookkeeping and identity."""
+
+    def make(self, cameras, **kw):
+        self.cameras = cameras
+        holder = SharedSystemHolder(lambda: FakeSystem(self.cameras))
+        controller = CameraController(system_holder=holder, **kw)
+        controller._configure_camera_nodes = lambda: None
+        self.addCleanup(controller.stop)
+        return controller, holder
+
+    def test_a_legacy_controller_follows_a_swapped_camera_after_stop(self):
+        # No serial given (the existing GUI): the first start pins whatever it
+        # finds, but a stop must release the pin, or swapping in a different
+        # camera and pressing Preview again looks for the old one forever.
+        a, b = FakeCamera("111", "A", 8, 6), FakeCamera("222", "B", 8, 6)
+        controller, holder = self.make([a])
+        ok, message = controller.start()
+        self.assertTrue(ok, message)
+        self.assertEqual(controller.serial, "111")
+        self.assertEqual(controller.model, "A")
+        ok, _ = controller.stop()
+        self.assertTrue(ok)
+        self.assertIsNone(controller.serial)
+        self.cameras[:] = [b]
+        ok, message = controller.start()
+        self.assertTrue(ok, message)
+        self.assertEqual(controller.serial, "222")
+
+    def test_a_pinned_serial_survives_stop_because_it_was_requested(self):
+        controller, _ = self.make([FakeCamera("111", "A", 8, 6)], serial="111")
+        controller.start()
+        controller.stop()
+        self.assertEqual(controller.serial, "111")
+
+    def test_no_cameras_releases_the_shared_system(self):
+        controller, holder = self.make([])
+        ok, message = controller.start()
+        self.assertFalse(ok)
+        self.assertIn("No cameras", message)
+        self.assertEqual(holder.count, 0)
+
+    def test_a_requested_serial_that_is_absent_is_not_found_and_releases(self):
+        controller, holder = self.make([FakeCamera("111", "A", 8, 6)], serial="999")
+        ok, message = controller.start()
+        self.assertFalse(ok)
+        self.assertIn("999", message)
+        self.assertEqual(holder.count, 0)
+
+    def test_stop_twice_is_harmless(self):
+        controller, holder = self.make([FakeCamera("111", "A", 8, 6)], serial="111")
+        controller.start()
+        self.assertTrue(controller.stop()[0])
+        self.assertTrue(controller.stop()[0])
+        self.assertEqual(holder.count, 0)
+
+    def test_enumerate_lists_every_camera_and_leaves_the_system_released(self):
+        holder = SharedSystemHolder(lambda: FakeSystem([FakeCamera("111", "A", 8, 6), FakeCamera("222", "B", 8, 6)]))
+        found = enumerate_cameras(holder)
+        self.assertEqual([(c.serial, c.model, c.vendor) for c in found],
+                         [("111", "A", "FAKE"), ("222", "B", "FAKE")])
+        self.assertEqual(holder.count, 0)
+
+    def test_enumerate_keeps_other_cameras_when_one_cannot_be_read(self):
+        holder = SharedSystemHolder(
+            lambda: FakeSystem([BrokenTLCamera("111", "A", 8, 6), FakeCamera("222", "B", 8, 6)])
+        )
+        found = enumerate_cameras(holder)
+        self.assertEqual([c.serial for c in found], ["<unavailable>", "222"])
+        self.assertEqual(holder.count, 0)
+
+    def test_enumerate_does_not_disturb_a_running_controller(self):
+        cams = [FakeCamera("111", "A", 8, 6)]
+        controller, holder = self.make(cams, serial="111")
+        controller.start()
+        self.assertEqual(len(enumerate_cameras(holder)), 1)
+        self.assertEqual(holder.count, 1)  # the controller's reference is untouched
+        self.assertTrue(controller.acquiring)
+
+    def test_a_failed_segment_zero_open_cleans_up_and_reports(self):
+        controller, _ = self.make([FakeCamera("111", "A", 8, 6)], serial="111")
+        controller.start()
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = SessionPaths.for_session(tmp, datetime(2026, 10, 1, 10, 15, 0))
+
+            def cannot_open(index):
+                raise OSError("codec missing")
+
+            controller._open_segment_writer = cannot_open
+            import contextlib, io
+            with contextlib.redirect_stdout(io.StringIO()):
+                ok, _ = controller.start_recording(paths, fps=FPS)
+                self.assertTrue(ok)  # the start was accepted; the failure is asynchronous
+                deadline = time.monotonic() + 3.0
+                while controller.record_start_requested and time.monotonic() < deadline:
+                    time.sleep(0.05)
+            self.assertFalse(controller.recording_active)
+            self.assertIn("codec missing", controller.last_start_error or "")
+            self.assertIsNone(controller._event_log)
+            for path in (paths.metadata_csv, paths.segments_csv, paths.events_jsonl):
+                self.assertFalse(path.exists(), path.name)
+            # ...and the controller is reusable, with the same name, immediately.
+            del controller._open_segment_writer
+            ok, message = controller.prepare_recording(paths, fps=FPS)
+            self.assertTrue(ok, message)
+            controller.abort_prepared()
 
 
 @unittest.skipIf(REAL_PYSPIN, "real PySpin present: use scripts/multi_controller_smoke.py")

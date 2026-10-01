@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 
 try:
-    import PySpin  # noqa: F401
+    import PySpin  # noqa: F401  (the real module on the rig; the stub below otherwise)
 except ImportError:
     sys.modules["PySpin"] = types.ModuleType("PySpin")
 
@@ -173,6 +173,23 @@ class PickCameraTests(unittest.TestCase):
         controller, *_ = make_controller(serial="222")
         self.assertIsNone(controller._pick_camera(FakeCamList([self.b], get_by_serial_raises=True)))
 
+    def test_an_invalid_camera_pointer_is_not_a_match(self):
+        # Real PySpin may return an invalid pointer instead of raising.
+        class Invalid(FakeCamera):
+            def IsValid(self):
+                return False
+
+        controller, *_ = make_controller(serial="222")
+        self.assertIsNone(controller._pick_camera(FakeCamList([Invalid("222")])))
+
+    def test_a_raising_validity_check_is_not_a_match(self):
+        class Broken(FakeCamera):
+            def IsValid(self):
+                raise RuntimeError("stale handle")
+
+        controller, *_ = make_controller(serial="222")
+        self.assertIsNone(controller._pick_camera(FakeCamList([Broken("222")])))
+
     def test_no_serial_uses_the_first_camera_for_legacy_single_camera(self):
         controller = CameraController(system_holder=SharedSystemHolder(lambda: None))
         self.assertIs(controller._pick_camera(FakeCamList([self.a, self.b])), self.a)
@@ -301,7 +318,21 @@ class RecordingLifecycleTests(unittest.TestCase):
         self.controller, self.holder, self.factory, self.log = make_controller(serial="222")
         attach(self.controller, self.holder, self.factory, "222")
         self.controller.model = "Blackfly S"
+        self.addCleanup(self._close_everything)
         self.addCleanup(self.controller.abort_prepared)
+
+    def _close_everything(self):
+        """Release the files a begun recording leaves open (Windows cannot delete them otherwise)."""
+        for writer in (self.controller._metadata_writer, self.controller._segment_manifest_writer):
+            try:
+                writer.stop()
+            except Exception:
+                pass
+        if self.controller._event_log is not None:
+            try:
+                self.controller._event_log.close()
+            except Exception:
+                pass
 
     def header(self):
         first = self.paths.events_jsonl.read_text().splitlines()[0]
@@ -376,6 +407,51 @@ class RecordingLifecycleTests(unittest.TestCase):
         self.assertTrue(ok)
         ok, _ = self.controller.begin_recording()
         self.assertTrue(ok)
+
+    def test_start_then_stop_then_start_before_the_loop_acts_is_refused(self):
+        # Start was accepted and stopped again before the acquisition thread
+        # noticed: not "recording_active", but still not startable.
+        self.controller.record_start_requested = True
+        self.controller.record_stop_requested = True
+        ok, message = self.controller.start_recording(self.paths, fps=30.0)
+        self.assertFalse(ok)
+        self.assertIn("still closing", message)
+
+    def test_same_name_retry_never_touches_the_earlier_sessions_files(self):
+        # The events log refuses to overwrite; the metadata CSV would truncate.
+        # The clash must be found BEFORE anything is truncated.
+        self.paths.metadata_csv.write_text("EARLIER SESSION DATA\n")
+        self.paths.events_jsonl.write_text('{"rec": "header"}\n')
+        ok, message = self.controller.prepare_recording(self.paths, fps=30.0)
+        self.assertFalse(ok)
+        self.assertIn("events log", message)
+        self.assertEqual(self.paths.metadata_csv.read_text(), "EARLIER SESSION DATA\n")
+        self.assertEqual(self.paths.events_jsonl.read_text(), '{"rec": "header"}\n')
+        self.assertFalse(self.paths.segments_csv.exists())
+
+    def test_an_unwritable_metadata_path_leaves_nothing_behind_and_is_retryable(self):
+        (Path(self.tmp.name) / "blocker").write_text("a file where a directory is needed")
+        blocked = SessionPaths.for_session(
+            Path(self.tmp.name) / "blocker" / "sub", datetime(2026, 10, 1, 10, 15, 0), camera_tag="cam222"
+        )
+        ok, _ = self.controller.prepare_recording(blocked, fps=30.0)
+        self.assertFalse(ok)
+        self.assertIsNone(self.controller._event_log)
+        ok, message = self.controller.prepare_recording(self.paths, fps=30.0)
+        self.assertTrue(ok, message)
+
+    def test_stop_cancels_a_recording_that_was_prepared_but_never_begun(self):
+        self.controller.prepare_recording(self.paths, fps=30.0)
+        ok, _ = self.controller.stop()
+        self.assertTrue(ok)
+        self.assertIsNone(self.controller._prepared)
+        for path in (self.paths.metadata_csv, self.paths.segments_csv, self.paths.events_jsonl):
+            self.assertFalse(path.exists(), path.name)
+
+    def test_prepare_clears_the_previous_start_error(self):
+        self.controller.last_start_error = "OSError: boom"
+        self.controller.prepare_recording(self.paths, fps=30.0)
+        self.assertIsNone(self.controller.last_start_error)
 
     def test_not_acquiring_cannot_prepare(self):
         self.controller.acquiring = False
