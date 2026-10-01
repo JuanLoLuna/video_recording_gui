@@ -300,7 +300,9 @@ def read_stream_counters(PySpin, cam) -> dict:
 
 def grab_loop(cam, rec: Recorder, stop: threading.Event, copy_frames: bool, np) -> None:
     while not stop.is_set():
-        t0 = time.monotonic()
+        # perf_counter, not monotonic: on Windows time.monotonic() ticks at
+        # ~15.6 ms, which quantized every interval to 0/15.6/31.2/46.8 ms.
+        t0 = time.perf_counter()
         try:
             image = cam.GetNextImage(GRAB_TIMEOUT_MS)
         except Exception as exc:
@@ -308,7 +310,7 @@ def grab_loop(cam, rec: Recorder, stop: threading.Event, copy_frames: bool, np) 
             rec.last_error = str(exc)
             stop.wait(0.05)  # don't busy-spin on a persistent fault
             continue
-        t1 = time.monotonic()
+        t1 = time.perf_counter()
         if image.IsIncomplete():
             rec.incomplete += 1
             image.Release()
@@ -330,7 +332,7 @@ def run_stage(PySpin, np, system, serials, fps, seconds, copy_frames, mode) -> l
     """Acquire from `serials` simultaneously for `seconds`; one result row each."""
     cam_list = system.GetCameras()
     cams, infos, recs, threads = [], [], [], []
-    counters_before, counters_after = [], []
+    counters_after = []
     stop = threading.Event()
     rows: list[dict] = []
     try:
@@ -348,7 +350,6 @@ def run_stage(PySpin, np, system, serials, fps, seconds, copy_frames, mode) -> l
                   f"buffers={info.buffer_count}, link_limit={info.link_limit}")
             if info.speed not in ("SuperSpeed", "?"):
                 print(f"    !! {info.serial} is on {info.speed}, not SuperSpeed -- check cable/port")
-        counters_before = [read_stream_counters(PySpin, c) for c in cams]
 
         cpu0, wall0 = time.process_time(), time.monotonic()
         for cam in cams:
@@ -376,9 +377,11 @@ def run_stage(PySpin, np, system, serials, fps, seconds, copy_frames, mode) -> l
         cpu_cores = (time.process_time() - cpu0) / max(1e-9, time.monotonic() - wall0)
         counters_after = [read_stream_counters(PySpin, c) for c in cams]
 
-        for info, rec, before, after in zip(infos, recs, counters_before, counters_after):
+        for info, rec, after in zip(infos, recs, counters_after):
             stats = summarize(rec.arrivals, rec.grab_ms, rec.frame_ids, info.bytes_per_frame)
-            stream = {k: after[k] - before.get(k, 0) for k in after}
+            # These reset on BeginAcquisition, so the post-run value is the
+            # per-run total; subtracting the pre-run read would be meaningless.
+            stream = dict(after)
             row = {
                 "mode": mode, "target_fps": fps, "serial": info.serial, "model": info.model,
                 "link_speed": info.speed, "width": info.width, "height": info.height,
@@ -453,6 +456,7 @@ def main() -> int:
     ap.add_argument("--fps", type=float, nargs="+", default=[30.0, 60.0], help="frame rates to test (default: 30 60)")
     ap.add_argument("--seconds", type=float, default=60.0, help="duration of each run (default: 60; use 600 for the real test)")
     ap.add_argument("--serials", nargs="+", help="camera serials (default: every camera found)")
+    ap.add_argument("--no-solo", action="store_true", help="skip the per-camera solo baselines (no contention comparison)")
     ap.add_argument("--no-copy", action="store_true", help="skip the per-frame numpy copy (isolates USB from memcpy cost)")
     ap.add_argument("--out-dir", default="probe_output")
     args = ap.parse_args()
@@ -482,7 +486,7 @@ def main() -> int:
 
         plan = []
         for fps in args.fps:
-            for serial in serials:
+            for serial in ([] if args.no_solo else serials):
                 plan.append((fps, "solo", [serial]))
             plan.append((fps, "both", list(serials)))
         total_s = len(plan) * (args.seconds + 3)
