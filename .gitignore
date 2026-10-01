@@ -19,3 +19,6 @@ htmlcov/
 coverage.xml
 pip-wheel-metadata/
 *.log
+
+# multi_camera_probe.py output
+probe_output/
