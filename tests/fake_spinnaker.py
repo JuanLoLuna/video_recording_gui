@@ -23,7 +23,7 @@ def install_pyspin_stub() -> bool:
     if hasattr(PySpin, "System"):
         return True
     PySpin.CStringPtr = PySpin.CIntegerPtr = PySpin.CFloatPtr = lambda node: node
-    PySpin.CBooleanPtr = PySpin.CEnumerationPtr = lambda node: node
+    PySpin.CBooleanPtr = PySpin.CEnumerationPtr = PySpin.CEnumEntryPtr = lambda node: node
     PySpin.IsReadable = lambda node: node is not None
     PySpin.IsWritable = lambda node: node is not None
     return False
@@ -59,15 +59,22 @@ _RANGES = {
     "StreamBufferCountManual": (1, 6000, 100),
 }
 
+# What a real camera powers on with. ExposureAuto/GainAuto default to
+# Continuous, which is exactly the state the app's exposure lock must undo.
+_DEFAULT_ENTRY = {"ExposureAuto": "Continuous", "GainAuto": "Continuous", "PixelFormat": "Mono8"}
+
 
 class SettingNode:
-    """A camera setting that accepts every read and write the app makes."""
+    """A camera setting that accepts every read and write the app makes, and
+    REMEMBERS what was written (so a test can see what the app really did)."""
 
     def __init__(self, name):
         self.name = name
         low, high, value = _RANGES.get(name, (0, 10**9, 0))
         self.low, self.high, self.value = low, high, value
-        self.entry = Entry("Off")
+        self.entries = {n: Entry(n) for n in ("Off", "Once", "Continuous")}
+        self.entries.setdefault(_DEFAULT_ENTRY.get(name, "Off"), Entry(_DEFAULT_ENTRY.get(name, "Off")))
+        self.entry = self.entries[_DEFAULT_ENTRY.get(name, "Off")]
 
     def GetValue(self):
         return self.value
@@ -82,16 +89,18 @@ class SettingNode:
         return self.high
 
     def GetEntryByName(self, name):
-        return Entry(name)
+        return self.entries.setdefault(name, Entry(name))
 
     def SetIntValue(self, value):
-        pass
+        for entry in self.entries.values():
+            if entry.GetValue() == value:
+                self.entry = entry
 
     def GetCurrentEntry(self):
         return self.entry
 
     def GetEntries(self):
-        return [Entry("Off"), Entry("Continuous")]
+        return list(self.entries.values())
 
 
 class NodeMap:
@@ -102,11 +111,14 @@ class NodeMap:
     def __init__(self, permissive=False, **values):
         self.values = values
         self.permissive = permissive
+        self._settings = {}
 
     def GetNode(self, name):
         if name in self.values:
             return Node(self.values[name])
-        return SettingNode(name) if self.permissive else None
+        if not self.permissive:
+            return None
+        return self._settings.setdefault(name, SettingNode(name))
 
 
 class FakeImage:
@@ -142,6 +154,9 @@ class FakeCamera:
         self.streaming = False
         self._next_at = 0.0
         self._frame_id = 0
+        # One persistent map per camera: settings written by the app stick.
+        self._nodemap = NodeMap(permissive=True, Width=width, Height=height)
+        self._stream_nodemap = NodeMap(permissive=True)
 
     def IsValid(self):
         return True
@@ -153,10 +168,10 @@ class FakeCamera:
         pass
 
     def GetNodeMap(self):
-        return NodeMap(permissive=True, Width=self.width, Height=self.height)
+        return self._nodemap
 
     def GetTLStreamNodeMap(self):
-        return NodeMap(permissive=True)
+        return self._stream_nodemap
 
     def GetTLDeviceNodeMap(self):
         return NodeMap(DeviceSerialNumber=self.serial, DeviceModelName=self.model,

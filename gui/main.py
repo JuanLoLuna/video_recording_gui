@@ -1,7 +1,7 @@
 import atexit
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # Allow direct script execution via `python gui/main.py` by exposing the repo root.
@@ -42,7 +42,11 @@ from backend.audio_control import (
     list_audio_input_devices,
     list_audio_output_devices,
 )
-from backend.camera_control import CameraController, enumerate_cameras
+from backend.camera_control import (
+    EXPOSURE_AUTO_LOCK_MIN_FPS,
+    CameraController,
+    enumerate_cameras,
+)
 from backend.camera_group import CameraGroup, CameraSlot
 from backend.camera_registry import (
     format_camera_summary,
@@ -80,6 +84,7 @@ from backend.power_keepalive import (
     release_keep_awake,
 )
 
+from backend.sustained import SustainedCondition
 from gui.camera_preview import CameraPreviewTile, frame_to_qimage
 
 SYNC_WIDTH_RECORD = 0.100  # 100 ms
@@ -104,24 +109,15 @@ COMPRESSION_DEFAULT_MAX_FPS = 30.0
 # occasional spikes p95 would flag anyway.
 COMPRESSION_QUEUE_DEPTH_WARNING = 5
 
-# fps at or above which "Exposure mode" is force-set to Off and locked
-# (dropdown disabled) rather than left as a free choice. ExposureAuto
-# gives no guarantee of respecting the frame period -- confirmed on the
-# bench: left on Continuous, it converged to ~14.8ms, exceeding the
-# ~10ms period 100fps needs, and our own exposure-clamp
-# (_clamp_exposure_to_frame_period) can only act once ExposureTime is
-# actually writable, i.e. Off. Below this threshold there's enough
-# slack in the frame period that Auto is left as a free user choice, on
-# the same reasoning as COMPRESSION_DEFAULT_MAX_FPS (a starting default
-# there, but a hard lock here -- unlike a slow encode, which only costs
-# fps, a silently-too-long exposure is exactly the failure this app
-# spent a long investigation chasing).
-EXPOSURE_AUTO_LOCK_MIN_FPS = 30.0
+# EXPOSURE_AUTO_LOCK_MIN_FPS (imported from backend.camera_control) is the fps at or
+# above which "Exposure mode" is force-set to Off and locked rather than left as
+# a free choice; see the comment there for why.
 
-# A writer backlog of this many frames, held for this long, means the disk or
-# encoder is not keeping up. Deliberately NOT a momentary threshold: a USB
-# device plugged into the shared dock stalled the SSD for ~5 s on the rig
-# (queue peaked at 150, drained by itself, nothing lost).
+# A writer backlog (of this many frames for any codec, or COMPRESSION_QUEUE_DEPTH_
+# WARNING for MJPEG) must HOLD for this long to count. Deliberately NOT a one-
+# sample threshold: a USB device plugged into the shared dock stalled the SSD for
+# ~5 s on the rig (queue peaked at 150, drained by itself, nothing lost), and
+# "MJPEG is falling behind, turn off compression" would have been false advice.
 WRITER_BACKLOG_FRAMES = 30
 WRITER_BACKLOG_SECONDS = 10.0
 
@@ -160,7 +156,13 @@ class _SlotRuntime:
     diagnostics: PreviewDiagnosticsAccumulator
     logger: AsyncDiagnosticsCsvLogger
     last_seq: int | None = None
-    backlog_since: float | None = None
+    # Writer-queue conditions that only count once they have held for a while.
+    backlog: SustainedCondition = field(
+        default_factory=lambda: SustainedCondition(WRITER_BACKLOG_SECONDS)
+    )
+    mjpeg_behind: SustainedCondition = field(
+        default_factory=lambda: SustainedCondition(WRITER_BACKLOG_SECONDS)
+    )
 
 
 class AppState(Enum):
@@ -612,6 +614,7 @@ class MainWindow(QWidget):
 
         self.preview_health_label = QLabel("Preview pipeline: waiting for preview")
         self.preview_health_label.setStyleSheet("color: #555; font-size: 11px;")
+        self.preview_health_label.setWordWrap(True)  # two cameras' status can be long
         self.preview_health_label.setAlignment(Qt.AlignmentFlag.AlignRight)
         layout.addWidget(self.preview_health_label)
 
@@ -1235,14 +1238,29 @@ class MainWindow(QWidget):
         if not self.frame_rate_spin.isEnabled():
             return
         if self.cameras is not None:
+            previous = {
+                slot.serial: slot.controller.get_acquisition_frame_rate() for slot in self._slots()
+            }
             results = self.cameras.broadcast("set_frame_rate", float(value))
             rejected = [r.slot.label for r in results if not (r.ok and r.value)]
-            if len(rejected) == len(results):
+            if rejected:
+                # One camera refused (e.g. it is mid-recovery): put the ones that
+                # accepted back, so every camera keeps sharing one rate.
+                for r in results:
+                    if r.ok and r.value:
+                        r.slot.controller.set_frame_rate(previous[r.slot.serial])
+                self.frame_rate_spin.blockSignals(True)
+                self.frame_rate_spin.setValue(previous.get(self.camera.serial, value))
+                self.frame_rate_spin.blockSignals(False)
+                self.status_label.setText(
+                    f"Frame rate NOT changed to {float(value):.1f} fps: "
+                    + ", ".join(rejected) + " did not accept it."
+                )
                 return
         else:
-            rejected = [] if self.camera.set_frame_rate(float(value)) else ["camera"]
-            if rejected:
+            if not self.camera.set_frame_rate(float(value)):
                 return
+            rejected = []
         actual = self.camera.get_acquisition_frame_rate()
         # Camera may snap to a nearby achievable rate; reflect what it accepted.
         if abs(actual - float(value)) > 0.05:
@@ -1272,7 +1290,7 @@ class MainWindow(QWidget):
         # always go through blockSignals(). From here on the user's choice
         # sticks; the fps-based default stops touching this checkbox.
         self._compression_manually_set = True
-        if not self._call_on_all_cameras("set_compression_enabled", checked):
+        if not self._set_compression_on_all(checked):
             # Refused (recording started between the click and here) --
             # put the checkbox back without re-entering this handler.
             self.compression_checkbox.blockSignals(True)
@@ -1300,7 +1318,7 @@ class MainWindow(QWidget):
             return
         desired = fps <= COMPRESSION_DEFAULT_MAX_FPS
         if self.compression_checkbox.isChecked() != desired:
-            if self._call_on_all_cameras("set_compression_enabled", desired):
+            if self._set_compression_on_all(desired):
                 self.compression_checkbox.blockSignals(True)
                 self.compression_checkbox.setChecked(desired)
                 self.compression_checkbox.blockSignals(False)
@@ -1323,11 +1341,12 @@ class MainWindow(QWidget):
                 f"Locked to Off at {fps:.0f} fps (>= {EXPOSURE_AUTO_LOCK_MIN_FPS:.0f} fps): "
                 "auto exposure isn't guaranteed to fit the frame period."
             )
+            # EVERY camera, every time: the combo shows only the camera the
+            # controls point at, so "it already reads Off" says nothing about
+            # the others, and a camera left on auto exposure at >= 30 fps is
+            # exactly the failure this lock exists to prevent.
+            self._call_on_all_cameras("set_enum_param", "ExposureAuto", "Off")
             if combo.count() > 0 and combo.currentText() != "Off":
-                # EVERY camera, not just the one the controls point at: a camera
-                # left on auto exposure at >= 30 fps is exactly the failure this
-                # lock exists to prevent.
-                self._call_on_all_cameras("set_enum_param", "ExposureAuto", "Off")
                 combo.blockSignals(True)
                 combo.setCurrentText("Off")
                 combo.blockSignals(False)
@@ -1540,6 +1559,21 @@ class MainWindow(QWidget):
         results = self.cameras.broadcast(method_name, *args)
         return all(r.ok and bool(r.value) for r in results)
 
+    def _set_compression_on_all(self, enabled: bool) -> bool:
+        """Change the codec on every camera, or on none: if one refuses (it is
+        still closing its last recording), the ones that accepted go back."""
+        slots = self._slots()
+        if not slots:
+            return bool(self._placeholder_camera.set_compression_enabled(enabled))
+        previous = {slot.serial: slot.controller.get_compression_enabled() for slot in slots}
+        results = self.cameras.broadcast("set_compression_enabled", enabled)
+        if all(r.ok and r.value for r in results):
+            return True
+        for r in results:
+            if r.ok and r.value:
+                r.slot.controller.set_compression_enabled(previous[r.slot.serial])
+        return False
+
     def _clear_camera_group(self) -> None:
         self.cameras = None
         self._slot_rt = {}
@@ -1603,18 +1637,25 @@ class MainWindow(QWidget):
         if self.preview_running:
             self._sync_auto_mode_combos_from_camera()
             self._sync_image_sliders_from_camera()
+            # The combo sync re-enables the dropdown from the new camera's
+            # state; put the lock back.
+            self._apply_exposure_auto_lock_for_fps(self.camera.get_acquisition_frame_rate())
 
     def _reset_all_diagnostics(self) -> None:
         for slot in self._slots():
             rt = self._slot_rt[slot.serial]
             rt.diagnostics.reset(slot.controller.get_acquisition_stats())
-            rt.backlog_since = None
+            rt.backlog.reset()
+            rt.mjpeg_behind.reset()
 
     def _apply_camera_selection(self, discovered, selection) -> tuple[bool, str]:
         """(found, status message) for a Detect click; installs the camera group on success."""
         if not selection.bound:
             self._clear_camera_group()
-            return False, format_camera_summary(selection)
+            message = format_camera_summary(selection)
+            if selection.warnings:
+                message += "\n" + "\n".join(f"Warning: {w}" for w in selection.warnings)
+            return False, message
         if selection.missing:
             # A configured camera is absent: a manual start is refused rather than
             # quietly recording with fewer cameras than asked for. (An unattended
@@ -1644,6 +1685,7 @@ class MainWindow(QWidget):
             discovered = enumerate_cameras()
             selection = select_cameras(discovered, parse_serials_env())
         except Exception as exc:
+            self._clear_camera_group()
             found, message = False, f"Error: could not list cameras ({exc})"
         else:
             found, message = self._apply_camera_selection(discovered, selection)
@@ -1796,8 +1838,10 @@ class MainWindow(QWidget):
             if not result.ok:
                 print(f"[camera] stop() deferred cleanup: {result.message}")
             self.preview_running = False
-            for rt in self._slot_rt.values():
+            for slot in self._slots():
+                rt = self._slot_rt[slot.serial]
                 rt.tile.clear()
+                rt.tile.set_caption(slot.label)
                 rt.last_seq = None
             self.preview_health_label.setText("Preview pipeline: waiting for preview")
             self.status_label.setText("Preview stopped.")
@@ -1874,15 +1918,13 @@ class MainWindow(QWidget):
             return False
 
         self._recording_warnings.reset(now_s=time.monotonic())
-        skipped = [o.serial for o in result.outcomes if not o.ok]
-        if skipped:
-            self._recording_warnings.note_issue(
-                "recording WITHOUT camera(s) " + ", ".join(f"#{serial}" for serial in skipped)
-                + " (they did not start)",
-                now_s=time.monotonic(),
-            )
         self._update_recording_warning_banner()
-        self._start_preview_diagnostics_logging(paths_by_serial)
+        # (A camera that did not start is reported on every diagnostics tick by
+        # _sample_preview_diagnostics, so the banner cannot quietly fade to
+        # "Recovered" while it is still not recording.)
+        self._start_preview_diagnostics_logging(
+            paths_by_serial, [o.serial for o in result.outcomes if o.ok]
+        )
 
         self._stop_mic_preview()
         # Parallel WAV sharing the same session stem as the video segments.
@@ -1959,11 +2001,12 @@ class MainWindow(QWidget):
         self.state = AppState.PREVIEWING
         self._apply_state()
 
-    def _start_preview_diagnostics_logging(self, paths_by_serial) -> None:
-        """Start a sidecar diagnostics CSV per camera for this recording session."""
+    def _start_preview_diagnostics_logging(self, paths_by_serial, serials=None) -> None:
+        """Start a sidecar diagnostics CSV for each camera that is recording this session."""
         self._reset_all_diagnostics()
         for serial, rt in self._slot_rt.items():
-            rt.logger.start(paths_by_serial[serial].diagnostics_csv)
+            if serials is None or serial in serials:
+                rt.logger.start(paths_by_serial[serial].diagnostics_csv)
 
     def _stop_preview_diagnostics_logging(self) -> None:
         """Flush the current interval and finish every camera's diagnostics sidecar."""
@@ -2060,6 +2103,16 @@ class MainWindow(QWidget):
             audio_reconnects = max(audio_reconnects, int(row["audio_reconnects"]))
 
             if recording:
+                controller = slot.controller
+                if not (controller.recording_active or controller.record_start_requested):
+                    # An accepted start can still fail on the acquisition thread
+                    # (segment 0 will not open), and a best-effort resume starts
+                    # without a camera that refused. Say so on every tick.
+                    self._recording_warnings.note_issue(
+                        f"{tag}NOT recording: "
+                        f"{controller.last_start_error or 'this camera did not start'}",
+                        now_s=now_s,
+                    )
                 if frame_gaps or incomplete or errors or append_failures:
                     self._recording_warnings.note_issue(
                         f"{tag}{frame_gaps} frame gap(s), {incomplete} incomplete image(s), "
@@ -2075,34 +2128,29 @@ class MainWindow(QWidget):
                 # hardware-dependent (see set_compression_enabled) -- flag it
                 # live from append_queue_depth (see COMPRESSION_QUEUE_DEPTH_WARNING
                 # for why that's used instead of an append_ms latency percentile).
+                # Both writer-queue warnings need the backlog to HOLD (see
+                # WRITER_BACKLOG_SECONDS): a brief stall that drains is not a fault.
                 queue_depth = row["append_queue_depth"]
-                if (
+                depth = int(queue_depth) if queue_depth != "" else 0
+                mjpeg_slow = (
                     slot.controller.get_compression_enabled()
-                    and queue_depth != ""
-                    and int(queue_depth) >= COMPRESSION_QUEUE_DEPTH_WARNING
-                ):
+                    and depth >= COMPRESSION_QUEUE_DEPTH_WARNING
+                )
+                if rt.mjpeg_behind.update(mjpeg_slow, now_s):
                     self._recording_warnings.note_issue(
                         f"{tag}MJPEG encoding is falling behind capture (append queue depth "
-                        f"{queue_depth}) -- frames are piling up waiting to be written "
+                        f"{depth}) -- frames are piling up waiting to be written "
                         "and may start dropping. Consider turning off compression for "
                         "this frame rate.",
                         now_s=now_s,
                     )
-                # Any codec: a backlog that STAYS high means the disk or encoder
-                # is not keeping up. A brief spike that drains (a USB event on the
-                # shared dock stalled the SSD for ~5 s on the rig) is not flagged.
-                if queue_depth != "" and int(queue_depth) >= WRITER_BACKLOG_FRAMES:
-                    if rt.backlog_since is None:
-                        rt.backlog_since = now_s
-                    elif now_s - rt.backlog_since >= WRITER_BACKLOG_SECONDS:
-                        self._recording_warnings.note_issue(
-                            f"{tag}{queue_depth} frames have been waiting to be written for "
-                            f"over {WRITER_BACKLOG_SECONDS:.0f} s -- the disk or encoder is "
-                            "not keeping up.",
-                            now_s=now_s,
-                        )
-                else:
-                    rt.backlog_since = None
+                if rt.backlog.update(depth >= WRITER_BACKLOG_FRAMES, now_s):
+                    self._recording_warnings.note_issue(
+                        f"{tag}{depth} frames have been waiting to be written for "
+                        f"over {WRITER_BACKLOG_SECONDS:.0f} s -- the disk or encoder is "
+                        "not keeping up.",
+                        now_s=now_s,
+                    )
 
             if age_value == "":
                 segments.append(f"{prefix}no new frame ({rendered_fps:.1f} displayed fps)")

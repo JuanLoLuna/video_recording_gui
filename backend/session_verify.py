@@ -234,10 +234,13 @@ def verify_camera_outputs(
 
     # ---- achieved rate from the wall clock
     times = [float(r["system_time"]) for r in rows if r.get("system_time")]
+    # monotonic_s (perf_counter) when present: wall-clock system_time can step
+    # (NTP) and would fake a capture stall.
+    clock = "monotonic_s" if rows and all(r.get("monotonic_s") not in (None, "") for r in rows) else "system_time"
     stamped = [
-        (float(r["system_time"]), _int(r.get("record_frame_index")))
+        (float(r[clock]), _int(r.get("record_frame_index")))
         for r in rows
-        if r.get("system_time")
+        if r.get(clock) not in (None, "")
     ]
     for (before, _), (after, frame_index) in zip(stamped, stamped[1:]):
         if after - before > report.max_capture_gap_s:

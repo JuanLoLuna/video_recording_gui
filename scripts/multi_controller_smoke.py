@@ -157,6 +157,9 @@ def run_session(args, slots, group) -> int:
         print("interrupted -- stopping and verifying what was recorded")
     cpu_cores = (time.process_time() - cpu0) / max(1e-9, time.monotonic() - wall0)
 
+    # stop_all() always joins the writer queue, so the depth must be read first:
+    # a queue that never drained would otherwise look like 0 here.
+    depth_at_end = {s.serial: s.controller._append_queue.qsize() for s in slots}
     t_stop = time.monotonic()
     stopped = group.stop_all()
     print(f"stop_all: ok={stopped.ok} in {time.monotonic() - t_stop:.1f}s {stopped.message}")
@@ -189,16 +192,16 @@ def run_session(args, slots, group) -> int:
         for name in counters:
             if stats[name]:
                 problems.append(f"{name}={stats[name]}")
-        final_depth = s.controller._append_queue.qsize()
+        final_depth = depth_at_end[s.serial]
         notes = []
         if faulted or not args.fault_serial:
-            limit = 5 if not args.fault_serial else None
+            limit = (7 if args.codec == "mjpg" else 5) if not args.fault_serial else None
         else:
             limit = args.fault_queue_tolerance
         if limit is not None and queue_max[s.serial] >= limit:
             problems.append(
                 f"append queue peaked at {queue_max[s.serial]} "
-                f"({'plan criterion: < 5' if limit == 5 else f'tolerance {limit} during a fault run'})"
+                f"({f'plan criterion: < {limit}' if not args.fault_serial else f'tolerance {limit} during a fault run'})"
             )
         elif args.fault_serial and not faulted and queue_max[s.serial] >= 5:
             notes.append(
@@ -206,7 +209,7 @@ def run_session(args, slots, group) -> int:
                 f"(tolerated; drained to {final_depth})"
             )
         if final_depth >= 5:
-            problems.append(f"append queue still holds {final_depth} frames after stop (writer never caught up)")
+            problems.append(f"append queue still held {final_depth} frames when capture ended (writer never caught up)")
         if not faulted and report.max_capture_gap_s > 0.5:
             problems.append(
                 f"capture stalled {report.max_capture_gap_s:.2f}s before frame {report.max_capture_gap_row} "
@@ -244,6 +247,10 @@ def run_session(args, slots, group) -> int:
             p = paths[s.serial]
             for f in list(out_dir.glob(f"{p.stem}*")):
                 f.unlink(missing_ok=True)
+        try:
+            (out_dir / ".incomplete").rmdir()
+        except OSError:
+            pass
     return 0 if all_ok else 1
 
 

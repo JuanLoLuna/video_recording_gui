@@ -141,6 +141,11 @@ class CameraGroup:
     def any_recording(self) -> bool:
         return any(bool(slot.controller.recording_active) for slot in self._slots)
 
+    def _fail_text(self, slot: CameraSlot, message: str) -> str:
+        """A failure message; names the camera only when there are several (one
+        camera's messages read exactly as they did before multi-camera support)."""
+        return f"{slot.label}: {message}" if len(self._slots) > 1 else str(message)
+
     def _recording_start_order(self) -> list[CameraSlot]:
         """Everyone else first, the primary last (see the module docstring)."""
         return [s for s in self._slots if not s.is_primary] + [
@@ -168,7 +173,7 @@ class CameraGroup:
             if ok:
                 started.append(slot)
                 continue
-            failures.append(f"{slot.label}: {message}")
+            failures.append(self._fail_text(slot, message))
             if best_effort:
                 continue
             deferred = self._roll_back_started(started)
@@ -251,7 +256,7 @@ class CameraGroup:
             if ok:
                 prepared.append(slot)
                 continue
-            failures.append(f"{slot.label}: {message}")
+            failures.append(self._fail_text(slot, message))
             if not best_effort:
                 self._abort_all(prepared)
                 return GroupResult(False, failures[0], tuple(outcomes))
@@ -259,6 +264,7 @@ class CameraGroup:
             return GroupResult(False, "; ".join(failures), tuple(outcomes))
 
         begun: list[CameraSlot] = []
+        begin_messages: dict[str, str] = {}
         for slot in prepared:
             try:
                 ok, message = slot.controller.begin_recording()
@@ -266,8 +272,9 @@ class CameraGroup:
                 ok, message = False, f"{exc.__class__.__name__}: {exc}"
             if ok:
                 begun.append(slot)
+                begin_messages[slot.serial] = str(message)
                 continue
-            failures.append(f"{slot.label}: {message}")
+            failures.append(self._fail_text(slot, message))
             outcomes.append(SlotOutcome(slot.serial, False, f"begin failed: {message}"))
             if not best_effort:
                 # Extremely unlikely (begin only raises a flag), but never
@@ -281,6 +288,11 @@ class CameraGroup:
                 return GroupResult(False, failures[-1], tuple(outcomes))
         if not begun:
             return GroupResult(False, "; ".join(failures), tuple(outcomes))
+        # What the user sees is what each camera said when it began
+        # ("Recording requested: <stem>"), as the single-phase path always did.
+        outcomes = [
+            SlotOutcome(o.serial, o.ok, begin_messages.get(o.serial, o.message)) for o in outcomes
+        ]
         message = "; ".join(failures) if failures else self._join(outcomes)
         return GroupResult(True, message, tuple(outcomes))
 
@@ -307,7 +319,7 @@ class CameraGroup:
             if ok:
                 started.append(slot)
                 continue
-            failures.append(f"{slot.label}: {message}")
+            failures.append(self._fail_text(slot, message))
             if best_effort:
                 continue
             for done in started:

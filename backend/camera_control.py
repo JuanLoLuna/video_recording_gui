@@ -61,6 +61,17 @@ EXPOSURE_FRAME_PERIOD_HEADROOM = 0.9
 # buffers / ~655 MB of RAM.
 STREAM_BUFFER_SECONDS_TARGET = 5.0
 
+# fps at or above which "Exposure mode" is forced to Off (see the GUI's
+# _apply_exposure_auto_lock_for_fps). ExposureAuto gives no guarantee of
+# respecting the frame period -- confirmed on the bench: left on Continuous it
+# converged to ~14.8 ms, exceeding the ~10 ms period 100 fps needs, and the
+# exposure clamp below can only act once ExposureTime is writable, i.e. Off.
+# Below this there is enough slack that Auto stays a free user choice. Lives
+# here (not just in the GUI) because a camera that was unplugged and replugged
+# comes back on its power-on default (usually Continuous), and the GUI's lock
+# only runs when the frame-rate widgets change.
+EXPOSURE_AUTO_LOCK_MIN_FPS = 30.0
+
 
 @dataclass
 class _CloserJob:
@@ -686,7 +697,18 @@ class CameraController:
             actual = float(frame_rate.GetValue())
             self.target_frame_rate = actual
             self.recording_fps = actual
+            if actual >= EXPOSURE_AUTO_LOCK_MIN_FPS:
+                self._force_exposure_auto_off(nodemap)
             self._clamp_exposure_to_frame_period(actual)
+
+    def _force_exposure_auto_off(self, nodemap) -> None:
+        """Set ExposureAuto to Off if the camera has it (best effort, never raises)."""
+        try:
+            node = PySpin.CEnumerationPtr(nodemap.GetNode("ExposureAuto"))
+            if PySpin.IsWritable(node):
+                node.SetIntValue(node.GetEntryByName("Off").GetValue())
+        except Exception as exc:
+            print(f"{self._log_prefix} could not force ExposureAuto Off: {exc}")
 
     def _clamp_exposure_to_frame_period(self, fps: float) -> None:
         """Cap ExposureTime so it fits the frame period implied by `fps`.

@@ -60,8 +60,16 @@ class MainWindowCameraTests(unittest.TestCase):
         app()
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.addCleanup(lambda: os.environ.pop("SLEEVE_VIDEO_GUI_SEGMENT_SECONDS", None))
-        self.addCleanup(lambda: os.environ.pop(CAMERA_SERIALS_ENV, None))
+        saved = {k: os.environ.get(k) for k in ("SLEEVE_VIDEO_GUI_SEGMENT_SECONDS", CAMERA_SERIALS_ENV)}
+
+        def restore_environ():
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.addCleanup(restore_environ)
         os.environ["SLEEVE_VIDEO_GUI_SEGMENT_SECONDS"] = "1"
         os.environ.pop(CAMERA_SERIALS_ENV, None)
         previous = spinnaker_system._default_holder
@@ -206,16 +214,212 @@ class MainWindowCameraTests(unittest.TestCase):
         for rt in window._slot_rt.values():
             self.assertIn("displayed fps", rt.tile.caption.text())
 
-    def test_frame_rate_and_compression_controls_reach_both_cameras(self):
-        window = self.window(BLACKFLY, FIREFLY)
+    def previewing(self, *specs):
+        window = self.window(*specs)
         window.on_detect_clicked()
         window.on_preview_clicked()
+        self.assertEqual(window.state, AppState.PREVIEWING, window.status_label.text())
         pump(0.3)
-        window.compression_checkbox.setChecked(True)  # a genuine click path
+        return window
+
+    def exposure_modes(self, window):
+        return {s.serial: s.controller.get_enum_param("ExposureAuto")[0] for s in window.cameras.slots}
+
+    def test_compression_changes_reach_both_cameras(self):
+        window = self.previewing(BLACKFLY, FIREFLY)
         window._on_compression_toggled(True)
         self.assertTrue(all(s.controller.get_compression_enabled() for s in window.cameras.slots))
         window._on_compression_toggled(False)
         self.assertFalse(any(s.controller.get_compression_enabled() for s in window.cameras.slots))
+
+    def test_a_codec_change_one_camera_refuses_is_undone_on_the_others(self):
+        window = self.previewing(BLACKFLY, FIREFLY)
+        window._on_compression_toggled(False)
+        refusing = window.cameras.slot_for_serial("26134271").controller
+        refusing.set_compression_enabled = lambda enabled: False  # e.g. still closing its last recording
+        window._on_compression_toggled(True)
+        # No camera may end up on a different codec from the others.
+        self.assertEqual(
+            {s.controller.get_compression_enabled() for s in window.cameras.slots}, {False}
+        )
+
+    def test_a_frame_rate_change_reaches_both_cameras(self):
+        window = self.previewing(BLACKFLY, FIREFLY)
+        self.assertTrue(window.frame_rate_spin.isEnabled())
+        window.frame_rate_spin.setValue(20.0)
+        for slot in window.cameras.slots:
+            self.assertAlmostEqual(slot.controller.get_acquisition_frame_rate(), 20.0, places=1)
+
+    def test_a_frame_rate_one_camera_refuses_is_rolled_back_everywhere(self):
+        window = self.previewing(BLACKFLY, FIREFLY)
+        before = {s.serial: s.controller.get_acquisition_frame_rate() for s in window.cameras.slots}
+        window.cameras.slot_for_serial("26134271").controller.set_frame_rate = lambda value: False
+        window.frame_rate_spin.setValue(20.0)
+        after = {s.serial: s.controller.get_acquisition_frame_rate() for s in window.cameras.slots}
+        self.assertEqual(before, after)  # one shared rate, unchanged
+        self.assertIn("NOT changed", window.status_label.text())
+
+    # ------------------------------------------------- exposure lock (audit H1/H2)
+    def test_the_exposure_lock_forces_every_camera_to_off_not_just_the_selected_one(self):
+        window = self.window(BLACKFLY, FIREFLY)
+        # The primary is already Off (an earlier session); the other camera is on
+        # its power-on default, Continuous. The combo only shows the primary.
+        window.on_detect_clicked()
+        window.cameras.slot_for_serial("23227865").controller.set_enum_param("ExposureAuto", "Off")
+        self.assertEqual(self.exposure_modes_pre(window)["26134271"], "Continuous")
+        window.on_preview_clicked()
+        pump(0.2)
+        self.assertEqual(set(self.exposure_modes(window).values()), {"Off"})
+
+    def exposure_modes_pre(self, window):
+        """ExposureAuto of each fake camera before anything started it."""
+        return {
+            cam.serial: cam.GetNodeMap().GetNode("ExposureAuto").GetCurrentEntry().GetSymbolic()
+            for cam in self.cameras
+        }
+
+    def test_the_gui_lock_itself_reaches_a_camera_the_combo_does_not_show(self):
+        # The controller also forces Off when it configures a camera, so this
+        # drives the GUI's own lock: a non-selected camera drifts back to
+        # Continuous while previewing, and the combo (which shows the PRIMARY,
+        # already Off) gives no hint of it.
+        window = self.previewing(BLACKFLY, FIREFLY)
+        node = next(c for c in self.cameras if c.serial == "26134271").GetNodeMap().GetNode("ExposureAuto")
+        node.SetIntValue(node.GetEntryByName("Continuous").GetValue())
+        self.assertEqual(self.exposure_modes(window)["26134271"], "Continuous")
+        self.assertEqual(window._auto_mode_meta["ExposureAuto"]["combo"].currentText(), "Off")
+        window._apply_exposure_auto_lock_for_fps(30.0)
+        self.assertEqual(set(self.exposure_modes(window).values()), {"Off"})
+
+    def test_switching_the_adjust_camera_does_not_unlock_exposure_mode(self):
+        window = self.previewing(BLACKFLY, FIREFLY)
+        combo = window._auto_mode_meta["ExposureAuto"]["combo"]
+        self.assertFalse(combo.isEnabled())  # locked at 30 fps
+        other = next(s.serial for s in window.cameras.slots if s.serial != window.camera.serial)
+        window.tuning_camera_combo.setCurrentIndex(window.tuning_camera_combo.findData(other))
+        self.assertFalse(combo.isEnabled())
+        self.assertEqual(set(self.exposure_modes(window).values()), {"Off"})
+
+    def test_a_replugged_camera_comes_back_with_exposure_off(self):
+        # The controller itself re-applies the lock whenever it configures a camera
+        # (start AND every reinit), because a replugged camera powers on in Continuous.
+        window = self.previewing(BLACKFLY, FIREFLY)
+        slot = window.cameras.slot_for_serial("26134271")
+        camera = next(c for c in self.cameras if c.serial == "26134271")
+        camera.GetNodeMap().GetNode("ExposureAuto").SetIntValue(
+            camera.GetNodeMap().GetNode("ExposureAuto").GetEntryByName("Continuous").GetValue()
+        )
+        ok, message = slot.controller._reinitialize_camera()
+        self.assertTrue(ok, message)
+        self.assertEqual(self.exposure_modes(window)["26134271"], "Off")
+
+    # ------------------------------------------- a camera that is not recording (H3)
+    def test_a_camera_whose_segment_zero_fails_is_called_out_not_silently_healthy(self):
+        import contextlib, io
+
+        window = self.previewing(BLACKFLY, FIREFLY)
+
+        def cannot_open(index):
+            raise OSError("codec missing")
+
+        window.cameras.slot_for_serial("26134271").controller._open_segment_writer = cannot_open
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(window._begin_recording_session(bypass_confirmation=True))
+            pump(2.4)  # two diagnostics ticks
+        state = window._recording_warnings.summarize(now_s=time.monotonic())
+        self.assertTrue(state.visible)
+        self.assertEqual(state.level, "active")
+        self.assertIn("Blackfly S #26134271", state.detail + state.headline)
+        self.assertIn("NOT recording", state.detail + state.headline)
+        self.assertIn("codec missing", state.detail + state.headline)
+        window._stop_recording_session("done")
+
+    def test_a_resume_that_leaves_a_camera_out_keeps_warning_loudly(self):
+        window = self.previewing(BLACKFLY, FIREFLY)
+        window.cameras.slot_for_serial("26134271").controller.prepare_recording = (
+            lambda *a, **k: (False, "Cannot open metadata CSV: disk full")
+        )
+        self.assertTrue(window._begin_recording_session(bypass_confirmation=True))  # best effort
+        pump(2.4)
+        state = window._recording_warnings.summarize(now_s=time.monotonic())
+        self.assertEqual(state.level, "active")
+        self.assertIn("#26134271", state.detail + state.headline)
+        # Only the camera that started gets a diagnostics CSV.
+        names = os.listdir(self.tmp.name)
+        self.assertEqual(len([n for n in names if n.endswith("_diagnostics.csv")]), 1, names)
+        window._stop_recording_session("done")
+
+    # --------------------------------------- transient writer stalls are not faults
+    def spike_depth(self, window, serial, depths):
+        controller = window.cameras.slot_for_serial(serial).controller
+        original = controller.get_diagnostics_camera_state
+        ticks = iter(depths)
+        state = {"last": depths[-1]}
+
+        def patched():
+            try:
+                state["last"] = next(ticks)
+            except StopIteration:
+                pass
+            return {**original(), "append_queue_depth": state["last"]}
+
+        controller.get_diagnostics_camera_state = patched
+
+    def test_a_brief_writer_stall_that_drains_raises_no_warning(self):
+        # The dock stall seen on the rig: queue 150 for ~4 s, then 0, nothing lost.
+        window = self.previewing(BLACKFLY, FIREFLY)
+        window.cameras.slot_for_serial("26134271").controller.set_compression_enabled(True)
+        self.spike_depth(window, "26134271", [150, 150, 150, 150, 0, 0, 0, 0])
+        self.assertTrue(window._begin_recording_session(bypass_confirmation=True))
+        for _ in range(7):
+            window._sample_preview_diagnostics()
+        state = window._recording_warnings.summarize(now_s=time.monotonic())
+        self.assertFalse(state.visible, state.headline + state.detail)
+        window._stop_recording_session("done")
+
+    def test_a_backlog_that_stays_high_does_warn(self):
+        window = self.previewing(BLACKFLY, FIREFLY)
+        window._slot_rt["26134271"].backlog.hold_seconds = 0.3
+        window._slot_rt["26134271"].mjpeg_behind.hold_seconds = 0.3
+        self.spike_depth(window, "26134271", [150] * 50)
+        self.assertTrue(window._begin_recording_session(bypass_confirmation=True))
+        for _ in range(4):
+            window._sample_preview_diagnostics()
+            time.sleep(0.2)
+        state = window._recording_warnings.summarize(now_s=time.monotonic())
+        self.assertTrue(state.visible)
+        self.assertIn("waiting to be written", state.detail + state.headline)
+        window._stop_recording_session("done")
+
+    # ------------------------------------------------- one camera reads as before
+    def test_one_camera_record_start_and_failure_texts_read_as_before(self):
+        window = self.previewing(FIREFLY)
+        self.assertTrue(window._begin_recording_session(bypass_confirmation=True))
+        self.assertTrue(
+            window.status_label.text().startswith("Recording requested: recording_"),
+            window.status_label.text(),
+        )
+        window._stop_recording_session("done")
+
+    def test_a_manual_start_goes_through_the_all_or_nothing_path(self):
+        window = self.previewing(BLACKFLY, FIREFLY)
+        window.cameras.slot_for_serial("26134271").controller.prepare_recording = (
+            lambda *a, **k: (False, "Cannot open metadata CSV: disk full")
+        )
+        window.on_record_clicked()  # NOT bypass_confirmation
+        self.assertEqual(window.state, AppState.PREVIEWING)
+        self.assertEqual(window.status_label.text(), "Blackfly S #26134271: Cannot open metadata CSV: disk full")
+        self.assertEqual(os.listdir(self.tmp.name), [])  # the other camera was not started either
+
+    def test_redetect_after_a_recorded_session_builds_a_fresh_group(self):
+        window = self.window(BLACKFLY, FIREFLY)
+        self.run_session(window, seconds=1.2)
+        first = window.cameras
+        window.on_detect_clicked()
+        self.assertIsNot(window.cameras, first)
+        self.assertEqual(window.state, AppState.CAMERA_DETECTED)
+        self.assertEqual(len(window._slot_rt), 2)
+        self.assertEqual(self.holder.count, 0)
 
     def test_closing_the_window_releases_every_camera_and_the_system(self):
         window = self.window(BLACKFLY, FIREFLY)

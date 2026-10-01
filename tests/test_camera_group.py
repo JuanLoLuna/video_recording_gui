@@ -75,6 +75,7 @@ class TwoPhaseController(FakeController):
 
     def begin_recording(self):
         self.log.append(f"{self.name}:begin")
+        self._begin = (self._begin[0], f"Recording requested: {self.name}") if self._begin == (True, "go") else self._begin
         self._maybe_raise("begin_recording")
         if self._begin[0]:
             self.recording_active = True
@@ -440,6 +441,39 @@ class TwoPhaseRecordingTests(unittest.TestCase):
         log.clear()
         self.assertTrue(self.go(group).ok)
         self.assertNotIn("a:prepare:p111:30.0", log)
+
+
+class MessageWordingTests(unittest.TestCase):
+    def one_camera(self, log, **kw):
+        a = TwoPhaseController("a", log, **kw)
+        return CameraGroup([CameraSlot(a, serial="111", model="Firefly", tag=None, is_primary=True)]), a
+
+    def test_one_camera_failure_messages_are_not_prefixed(self):
+        log = []
+        group, _ = self.one_camera(log, start=(False, "No camera detected."))
+        self.assertEqual(group.start_all().message, "No camera detected.")
+
+    def test_one_camera_recording_refusal_reads_as_before(self):
+        log = []
+        group, _ = self.one_camera(log, prepare=(False, "Cannot open metadata CSV: boom"))
+        group.start_all()
+        result = group.start_recording_all(lambda s: "p", lambda s: 30.0)
+        self.assertEqual(result.message, "Cannot open metadata CSV: boom")
+
+    def test_several_cameras_name_the_one_that_failed(self):
+        log = []
+        group, a, b = make_two_phase_group(log, b={"prepare": (False, "no space")})
+        group.start_all()
+        result = group.start_recording_all(lambda s: "p", lambda s: 30.0)
+        self.assertEqual(result.message, "Blackfly #222: no space")
+
+    def test_success_reports_what_each_camera_said_when_it_began(self):
+        log = []
+        group, _ = self.one_camera(log)
+        group.start_all()
+        result = group.start_recording_all(lambda s: "p", lambda s: 30.0)
+        self.assertEqual(result.message, "Recording requested: a")  # not "prepared"
+        self.assertEqual(result.outcomes[0].message, "Recording requested: a")
 
 
 class FanOutTests(unittest.TestCase):
