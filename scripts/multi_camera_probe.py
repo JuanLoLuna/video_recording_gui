@@ -220,6 +220,7 @@ class Recorder:
     queue_depths: list = field(default_factory=list)
     frames_written: int = 0
     write_errors: int = 0
+    backend: str = "?"
 
 
 @dataclass
@@ -395,17 +396,19 @@ def grab_loop(cam, rec: Recorder, stop: threading.Event, copy_frames: bool, np) 
         rec.frame_ids.append(frame_id)
 
 
-def open_writer(cv2, path: Path, codec: str, quality: int, fps: float, width: int, height: int):
+def open_writer(cv2, path: Path, codec: str, quality: int, fps: float, width: int, height: int,
+                use_quality_param: bool = True):
     """cv2.VideoWriter opened the way CameraController._open_segment_writer does."""
     if codec == "mjpg":
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-        params = [cv2.VIDEOWRITER_PROP_IS_COLOR, 0, cv2.VIDEOWRITER_PROP_QUALITY, int(quality)]
-        writer = cv2.VideoWriter(str(path), fourcc, fps, (width, height), params)
-        if writer.isOpened():
-            return writer
-        writer.release()
-        print(f"    note: quality={quality} not applied (backend rejected the params overload); "
-              "MJPEG will use OpenCV's default quality")
+        if use_quality_param:
+            params = [cv2.VIDEOWRITER_PROP_IS_COLOR, 0, cv2.VIDEOWRITER_PROP_QUALITY, int(quality)]
+            writer = cv2.VideoWriter(str(path), fourcc, fps, (width, height), params)
+            if writer.isOpened():
+                return writer
+            writer.release()
+            print(f"    note: quality={quality} not applied (backend rejected the params overload); "
+                  "MJPEG will use OpenCV's default quality")
     else:
         fourcc = cv2.VideoWriter_fourcc(*"GREY")
     writer = cv2.VideoWriter(str(path), fourcc, fps, (width, height), isColor=False)
@@ -459,12 +462,14 @@ def run_stage(PySpin, np, system, serials, fps, seconds, copy_frames, mode, reco
             for info, rec in zip(infos, recs):
                 path = record["dir"] / f"{mode}_{info.serial}_{int(fps)}fps.avi"
                 writers.append(open_writer(record["cv2"], path, record["codec"], record["quality"],
-                                           info.applied_fps, info.width, info.height))
+                                           info.applied_fps, info.width, info.height,
+                                           use_quality_param=not record.get("no_quality_param")))
                 paths.append(path)
                 try:
                     backend = writers[-1].getBackendName()
                 except Exception:
                     backend = "?"
+                rec.backend = backend
                 print(f"    {info.serial}: writer backend={backend}, codec={record['codec']}")
                 rec.q = queue.Queue()
                 t = threading.Thread(target=write_loop, args=(rec, writers[-1]), daemon=True)
@@ -516,7 +521,7 @@ def run_stage(PySpin, np, system, serials, fps, seconds, copy_frames, mode, reco
             t_drain = time.perf_counter()
             next_print = t_drain + 2.0
             while any(r.q.unfinished_tasks for r in recs):
-                if time.perf_counter() - t_drain > DRAIN_TIMEOUT_S:
+                if time.perf_counter() - t_drain > record["drain_timeout"]:
                     drain_timed_out = True
                     break
                 time.sleep(0.1)
@@ -527,7 +532,7 @@ def run_stage(PySpin, np, system, serials, fps, seconds, copy_frames, mode, reco
             drain_s = time.perf_counter() - t_drain
             if drain_timed_out:
                 left = {r.serial: r.q.unfinished_tasks for r in recs}
-                print(f"    !! writers did not flush within {DRAIN_TIMEOUT_S:.0f}s (left: {left}); "
+                print(f"    !! writers did not flush within {record['drain_timeout']:.0f}s (left: {left}); "
                       "writers are too slow for this rate", flush=True)
                 # A writer may still be inside write(): releasing it from here
                 # would be unsafe, so leak the handles and let the caller stop.
@@ -565,7 +570,7 @@ def run_stage(PySpin, np, system, serials, fps, seconds, copy_frames, mode, reco
                 row.update(summarize_writer(
                     rec.write_ms, rec.queue_depths, len(rec.arrivals), rec.frames_written,
                     rec.write_errors, file_sizes[idx], span))
-                row.update({"codec": record["codec"], "drain_s": drain_s, "close_s": close_s,
+                row.update({"codec": record["codec"], "writer_backend": rec.backend, "drain_s": drain_s, "close_s": close_s,
                             "drain_timed_out": drain_timed_out})
             row["pass"], row["reason"] = verdict(row)
             rows.append(row)
@@ -603,7 +608,7 @@ CSV_FIELDS = [
     "applied_fps", "fps_ceiling", "seconds", "frames", "achieved_fps", "mb_per_s",
     "frame_gaps", "incomplete", "errors", "grab_ms_p95", "grab_ms_max",
     "interval_ms_p99", "interval_ms_max", "process_cpu_cores", "stream_counters",
-    "codec", "frames_written", "frames_lost_in_writer", "write_errors", "append_ms_mean",
+    "codec", "writer_backend", "frames_written", "frames_lost_in_writer", "write_errors", "append_ms_mean",
     "append_ms_p95", "append_ms_max", "queue_p95", "queue_max", "file_mb", "disk_mb_per_s",
     "gb_per_hour", "drain_s", "close_s", "drain_timed_out",
     "pass", "reason", "last_error",
@@ -637,13 +642,13 @@ def print_report(all_rows: list[dict]) -> None:
         print("\nWriter stage (cv2.VideoWriter per camera, same settings as the app):")
         print(f"{'fps':>4} {'codec':<5} {'serial':<9} {'app_mean':>8} {'app_p95':>7} {'app_max':>7} "
               f"{'q_p95':>5} {'q_max':>5} {'written':>8} {'lost':>5} {'disk MB/s':>9} {'GB/h':>6} "
-              f"{'drain_s':>7} {'close_s':>7}")
+              f"{'drain_s':>7} {'close_s':>7}  backend")
         for r in rec_rows:
             print(f"{r['target_fps']:>4.0f} {r['codec']:<5} {r['serial']:<9} "
                   f"{fmt(r['append_ms_mean'], '.1f'):>8} {fmt(r['append_ms_p95'], '.1f'):>7} "
                   f"{fmt(r['append_ms_max'], '.1f'):>7} {fmt(r['queue_p95'], '.0f'):>5} {r['queue_max']:>5} "
                   f"{r['frames_written']:>8} {r['frames_lost_in_writer']:>5} {r['disk_mb_per_s']:>9.1f} "
-                  f"{r['gb_per_hour']:>6.1f} {r['drain_s']:>7.2f} {r['close_s']:>7.2f}")
+                  f"{r['gb_per_hour']:>6.1f} {r['drain_s']:>7.2f} {r['close_s']:>7.2f}  {r['writer_backend']}")
         print("  app_* = write() time per frame; q_* = frames waiting in the writer queue "
               "(GUI warns at 5); drain_s = backlog left when capture stopped.")
     for r in all_rows:
@@ -663,6 +668,11 @@ def main() -> int:
     ap.add_argument("--codec", nargs="+", choices=["mjpg", "grey"], default=["mjpg"],
                     help="writer stage codecs (default: mjpg). grey = uncompressed, ~184 GB/h for two cameras at 30 fps")
     ap.add_argument("--quality", type=int, default=75, help="MJPEG quality 0-100 (app default 75)")
+    ap.add_argument("--no-quality-param", action="store_true",
+                    help="MJPG: open with the plain constructor instead of the (IS_COLOR, QUALITY) params overload "
+                         "(diagnostic: that overload can select a different OpenCV backend)")
+    ap.add_argument("--drain-timeout", type=float, default=DRAIN_TIMEOUT_S,
+                    help="seconds to wait for the writers to flush after capture stops (default %(default)s)")
     ap.add_argument("--keep", action="store_true", help="keep the recorded AVIs (default: delete after each run)")
     args = ap.parse_args()
 
@@ -685,8 +695,9 @@ def main() -> int:
         if missing:
             print(f"Serials not found: {missing}. Discovered: {discovered}")
             return 2
-        if len(serials) < 2:
-            print(f"Need at least 2 cameras for a multi-camera probe; have {serials}")
+        if len(serials) < 2 and not args.record_dir:
+            print(f"Need at least 2 cameras for a multi-camera probe; have {serials} "
+                  "(a single camera is allowed with --record-dir, for isolating the writer)")
             return 2
 
         record_dir = None
@@ -714,7 +725,9 @@ def main() -> int:
         for n, (fps, mode, group, codec) in enumerate(plan, 1):
             print(f"[{n}/{len(plan)}] {mode} @ {fps:.0f} fps: {group}")
             record = None if codec is None else {
-                "dir": record_dir, "codec": codec, "quality": args.quality, "keep": args.keep, "cv2": cv2}
+                "dir": record_dir, "codec": codec, "quality": args.quality, "keep": args.keep, "cv2": cv2,
+                "no_quality_param": args.no_quality_param,
+                "drain_timeout": args.drain_timeout}
             try:
                 all_rows += run_stage(PySpin, np, system, group, fps, args.seconds,
                                       not args.no_copy, mode, record)
