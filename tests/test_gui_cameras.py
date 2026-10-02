@@ -124,8 +124,12 @@ class MainWindowCameraTests(unittest.TestCase):
         self.assertFalse(window.tuning_camera_row.isHidden())
         self.assertEqual(window.tuning_camera_combo.count(), 2)
         self.assertIn("2 cameras", window.status_label.text())
-        # No env var: the user is told how to pin the names.
-        self.assertIn(CAMERA_SERIALS_ENV, window.status_label.text())
+        # No env var needed: a note says which camera has the plain names, and that
+        # pinning is optional. It is not presented as a warning.
+        text = window.status_label.text()
+        self.assertIn("Note: File names: Firefly #23227865", text)
+        self.assertIn("optional", text)
+        self.assertNotIn("Warning", text)
         tags = {slot.serial: slot.tag for slot in window.cameras.slots}
         self.assertEqual(tags, {"23227865": None, "26134271": "cam26134271"})
 

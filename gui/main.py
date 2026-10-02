@@ -1650,6 +1650,8 @@ class MainWindow(QWidget):
             message = format_camera_summary(selection)
         if selection.warnings:
             message += "\n" + "\n".join(f"Warning: {w}" for w in selection.warnings)
+        if selection.notes:
+            message += "\n" + "\n".join(f"Note: {n}" for n in selection.notes)
         return True, message
 
     def on_detect_clicked(self):

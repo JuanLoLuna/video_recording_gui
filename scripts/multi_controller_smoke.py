@@ -13,7 +13,7 @@ Run ON THE RIG (recorder GUI and SpinView closed):
 
 Useful variants:
     --codec mjpg                     MJPEG instead of uncompressed GREY
-    --serials 23227865 26134271      pin cameras/order (else SLEEVE_VIDEO_GUI_CAMERA_SERIALS, else all)
+    --serials 23227865 26134271      use only these cameras, primary first (optional; default: every connected camera)
     --seconds 600                    the 10-minute stress run
     --fault-serial 26134271          you WILL unplug/replug that camera during the run:
                                      it must show a timeline break + reinit, the other camera none
@@ -239,6 +239,8 @@ def _main_with_args(args) -> int:
     print(format_camera_summary(selection))
     for warning in selection.warnings:
         print(f"  WARNING: {warning}")
+    for note in selection.notes:
+        print(f"  note: {note}")
     if not selection.bound:
         return 2
     if selection.missing:

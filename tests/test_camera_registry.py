@@ -92,19 +92,34 @@ class SelectCamerasTests(unittest.TestCase):
 
 
 class SelectionWarningTests(unittest.TestCase):
-    def test_several_cameras_without_the_env_var_warn_about_unstable_names(self):
+    def test_several_cameras_without_the_env_var_get_a_note_not_a_warning(self):
         selection = select_cameras([FIREFLY, BLACKFLY])
-        self.assertEqual(len(selection.warnings), 1)
-        self.assertIn(CAMERA_SERIALS_ENV, selection.warnings[0])
-        # The suggestion is directly pasteable.
-        self.assertIn("23227865,26134271", selection.warnings[0])
+        self.assertEqual(selection.warnings, ())  # nothing is wrong
+        self.assertEqual(len(selection.notes), 1)
+        note = selection.notes[0]
+        # It says which camera got the plain names, and what the others get.
+        self.assertIn("Firefly FFY-U3-04S2M #23227865", note)
+        self.assertIn("#26134271 -> _cam26134271", note)
+        # ...and that the variable is optional.
+        self.assertIn(CAMERA_SERIALS_ENV, note)
+        self.assertIn("optional", note)
+
+    def test_the_note_follows_whichever_cameras_are_connected(self):
+        # A different set of cameras on another computer: no configuration needed.
+        other = CameraDescriptor("1000", "Some Other Camera")
+        selection = select_cameras([BLACKFLY, other])
+        self.assertEqual([c.serial for c in selection.bound], ["1000", "26134271"])
+        self.assertIn("Some Other Camera #1000", selection.notes[0])
+        self.assertEqual(selection.warnings, ())
 
     def test_one_camera_without_the_env_var_is_quiet_legacy_behaviour(self):
         self.assertEqual(select_cameras([BLACKFLY]).warnings, ())
+        self.assertEqual(select_cameras([BLACKFLY]).notes, ())
 
     def test_configured_cameras_do_not_warn_about_pinning(self):
         selection = select_cameras([FIREFLY, BLACKFLY], ["23227865", "26134271"])
         self.assertEqual(selection.warnings, ())
+        self.assertEqual(selection.notes, ())  # the user chose the names: nothing to explain
 
     def test_missing_primary_is_called_out(self):
         selection = select_cameras([BLACKFLY], ["23227865", "26134271"])

@@ -19,13 +19,16 @@ Naming rules (see backend/recording_paths.py)
     even while another one is missing. Without the env var and with a single
     camera attached, that camera is the primary (legacy names).
 
-Known hazard, surfaced rather than hidden: WITHOUT the env var, which camera
-holds the untagged names depends on who is plugged in (2 cameras -> lowest
-serial; 1 camera -> that camera). If a camera drops out, the survivor silently
-takes over the untagged names -- possibly a different sensor under the usual
-name. select_cameras() therefore reports a warning whenever several cameras are
-seen without the env var, and the controller records camera_serial in every
-events header so a swap is detectable afterwards. Set the env var to pin names.
+The variable is OPTIONAL. Unset (the normal case, and the right one when the
+cameras or the computer change between sessions) the app simply uses whatever
+cameras are connected. The one thing to know: WITHOUT it, which camera holds the
+plain file names depends on who is plugged in (2 cameras -> lowest serial;
+1 camera -> that camera). select_cameras() reports this as a NOTE naming the
+camera that got the plain name, not as a warning, and the controller records
+camera_serial/camera_model in every events header, so any file can be traced to
+its camera. Set the variable only to keep one physical camera's file names
+constant whatever else is attached, to ignore extra cameras, or to refuse to start
+when a listed camera is missing.
 """
 
 from __future__ import annotations
@@ -82,7 +85,8 @@ class CameraSelection:
     bound: tuple[BoundCamera, ...]
     missing: tuple[str, ...]  # configured serials that were not detected
     unused: tuple[CameraDescriptor, ...]  # detected but not configured
-    warnings: tuple[str, ...] = ()  # things the GUI should say out loud
+    warnings: tuple[str, ...] = ()  # problems the GUI should say out loud
+    notes: tuple[str, ...] = ()  # information worth showing, not a problem
 
     @property
     def multi_camera(self) -> bool:
@@ -106,6 +110,7 @@ def select_cameras(
     configured: Sequence[str] | None = None,
 ) -> CameraSelection:
     warnings: list[str] = []
+    notes: list[str] = []
     by_serial: dict[str, CameraDescriptor] = {}
     unreadable = 0
     for descriptor in discovered:
@@ -141,10 +146,12 @@ def select_cameras(
         unused = ()
         present = list(ordering)
         if len(ordering) > 1:
-            warnings.append(
-                f"{len(ordering)} cameras detected but {CAMERA_SERIALS_ENV} is not set: "
-                "file names follow lowest-serial-first and will change if a camera is "
-                f"missing. Set {CAMERA_SERIALS_ENV}=" + ",".join(ordering) + " to pin them."
+            first = by_serial[ordering[0]]
+            others = ", ".join(f"#{serial} -> _cam{serial}" for serial in ordering[1:])
+            notes.append(
+                f"File names: {first.model or 'camera'} #{ordering[0]} (lowest serial) has the "
+                f"plain names; the others get a suffix ({others}). "
+                f"{CAMERA_SERIALS_ENV} is optional; set it only to keep names fixed."
             )
 
     primary_serial = ordering[0] if ordering else None
@@ -158,7 +165,11 @@ def select_cameras(
         for serial in present
     )
     return CameraSelection(
-        bound=bound, missing=missing, unused=unused, warnings=tuple(warnings)
+        bound=bound,
+        missing=missing,
+        unused=unused,
+        warnings=tuple(warnings),
+        notes=tuple(notes),
     )
 
 

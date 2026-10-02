@@ -464,7 +464,7 @@
         <thead><tr><th>Feature</th><th>What it does</th><th>Commit</th></tr></thead>
         <tbody>
           <tr><td>Per-camera file names</td><td class="wrap"><code>SessionPaths.camera_tag</code>: the primary camera keeps today's names; any other camera gets <code>_cam&lt;serial&gt;</code> inside the stem. The shared WAV is never tagged.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/06f6cac">06f6cac</a></td></tr>
-          <tr><td>Camera registry</td><td class="wrap">Picks cameras by <code>SLEEVE_VIDEO_GUI_CAMERA_SERIALS</code>, warns when names are unpinned or the primary is missing, ignores unreadable serials.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/d8168a7">d8168a7</a></td></tr>
+          <tr><td>Camera registry</td><td class="wrap">Uses whatever cameras are connected: the lowest serial keeps the plain file names and any other gets <code>_cam&lt;serial&gt;</code>. The optional <code>SLEEVE_VIDEO_GUI_CAMERA_SERIALS</code> restricts which cameras are used and their order. The window notes which camera got the plain names, warns if a pinned primary is missing, and ignores unreadable serials.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/d8168a7">d8168a7</a></td></tr>
           <tr><td>Disk guard</td><td class="wrap">Bytes per hour from each camera's real frame size and codec; thresholds sized for one-hour sessions; optional <code>SLEEVE_VIDEO_GUI_PLANNED_HOURS</code>.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/e0435e5">e0435e5</a></td></tr>
           <tr><td>Shared Spinnaker System</td><td class="wrap">One owner of the process-wide System, with references tracked per camera so a repeated stop cannot free it under another camera.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/1d91502">1d91502</a>, <a href="https://github.com/JuanLoLuna/video_recording_gui/commit/c6893dc">c6893dc</a></td></tr>
           <tr><td>Camera group</td><td class="wrap"><code>CameraGroup</code>: ordered start and stop, all-or-nothing recording start in two phases, best-effort mode for an unattended resume.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/3114ca8">3114ca8</a></td></tr>
@@ -689,12 +689,12 @@
     <div class="section-head"><span class="section-num">04</span><h2>Open items</h2></div>
     <div class="open-grid">
       <div class="open-card next">
-        <h4>Pin the camera names</h4>
-        <p>Set <code>SLEEVE_VIDEO_GUI_CAMERA_SERIALS=23227865,26134271</code> on the rig. Without it the unsuffixed names follow whichever camera is plugged in, and a missing camera hands them to the other one.</p>
-      </div>
-      <div class="open-card next">
         <h4>One-hour two-camera session in the application</h4>
         <p>The window ran for 13 minutes. A full-length session with 15-minute segments and a decoded-video check of the result is the remaining validation step.</p>
+      </div>
+      <div class="open-card">
+        <h4>Plain file names follow the lowest serial</h4>
+        <p>The app uses whatever cameras are connected, so a different set of cameras can change which one has the plain names. The window shows which camera got them, and every events header records <code>camera_serial</code> and <code>camera_model</code>. <code>SLEEVE_VIDEO_GUI_CAMERA_SERIALS</code> is optional, for keeping one camera's names fixed.</p>
       </div>
       <div class="open-card">
         <h4>Second-camera files and ingestion</h4>
@@ -718,7 +718,7 @@
   <section id="next" class="closing">
     <div class="section-head"><span class="section-num">05</span><h2>Where this leaves things</h2></div>
     <div class="prose">
-      <p>Two cameras record together at 30&nbsp;fps with MJPEG by default, hold 60&nbsp;fps with room to spare, survive one camera being unplugged while the other keeps recording, and check their own video after writing it. A single camera behaves as before. What remains is operational: pin the camera names, run one full hour through the application, and decide when to teach the downstream pipeline about the second camera's files.</p>
+      <p>Two cameras record together at 30&nbsp;fps with MJPEG by default, hold 60&nbsp;fps with room to spare, survive one camera being unplugged while the other keeps recording, and check their own video after writing it. A single camera behaves as before. What remains is operational: run one full hour through the application, and decide when to teach the downstream pipeline about the second camera's files.</p>
     </div>
   </section>
 
