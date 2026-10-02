@@ -34,6 +34,45 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
+EXPECTED_CODEC = {"grey": "raw/uncompressed", "mjpg": "MJPG"}
+
+
+def check_videos(args, p, report) -> tuple[list[str], list[str]]:
+    """Decode a camera's first and last segment: right codec, every frame, not black.
+
+    Frame count and timing can look perfect while the pictures are black (that
+    happened with OpenCV's built-in MJPEG encoder on grayscale), so the pixels
+    themselves are checked. Returns (problems, info lines).
+    """
+    import csv
+
+    import verify_avi  # scripts/ is on sys.path when this file is run as a script
+
+    with open(p.segments_csv, newline="", encoding="utf-8") as handle:
+        manifest = {row["segment_file"]: int(row["frame_count"]) for row in csv.DictReader(handle)}
+    problems, lines = [], []
+    for index in sorted({0, max(0, report.segment_count - 1)}):
+        path = p.video_final(index)
+        info = verify_avi.scan_video(str(path), stride=args.video_stride)
+        if not info["opened"]:
+            problems.append(f"{path.name} cannot be opened/decoded")
+            continue
+        per_frame = info["file_size"] / max(1, info["decoded"]) / 1024
+        lines.append(
+            f"video {path.name}: {info['fourcc']} {info['width']}x{info['height']}, {info['decoded']} frames, "
+            f"{per_frame:.0f} KB/frame, brightness {info['mean_min']:.0f}..{info['mean_max']:.0f}"
+        )
+        if info["fourcc"] != EXPECTED_CODEC[args.codec]:
+            problems.append(f"{path.name} is {info['fourcc']}, expected {EXPECTED_CODEC[args.codec]} for --codec {args.codec}")
+        if info["decoded"] != info["container_frame_count"]:
+            problems.append(f"{path.name} decoded {info['decoded']} of {info['container_frame_count']} frames")
+        if path.name in manifest and info["decoded"] != manifest[path.name]:
+            problems.append(f"{path.name} has {info['decoded']} frames, segments.csv says {manifest[path.name]}")
+        if info["all_black"]:
+            problems.append(f"{path.name} decodes to BLACK frames")
+    return problems, lines
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--seconds", type=float, default=120.0, help="recording duration")
@@ -46,6 +85,9 @@ def main() -> int:
     ap.add_argument("--fault-queue-tolerance", type=int, default=300,
                     help="in a --fault-serial run, the append-queue peak (frames) tolerated on the cameras that were "
                          "NOT unplugged, provided it drains back to < 5 (default 300 = 10 s at 30 fps)")
+    ap.add_argument("--video-stride", type=int, default=5,
+                    help="decode-check brightness/frozen frames every Nth frame of the first and last segment "
+                         "of each camera (default 5; every frame is still decoded)")
     ap.add_argument("--cleanup", action="store_true", help="delete the recorded files afterwards")
     args = ap.parse_args()
 
@@ -175,6 +217,8 @@ def run_session(args, slots, group) -> int:
         )
         stats = final_stats[s.serial]
         problems = list(report.problems)
+        video_problems, video_lines = check_videos(args, p, report)
+        problems += video_problems
         leftovers = (
             [f for f in p.incomplete_dir.iterdir() if f.name.startswith(p.stem + "_part") or f.name.startswith("UNEXPECTED")]
             if p.incomplete_dir.exists() else []
@@ -234,6 +278,8 @@ def run_session(args, slots, group) -> int:
         print(f"    longest write() {append_ms_max[s.serial]:.0f} ms, longest grab {grab_ms_max[s.serial]:.0f} ms, "
               f"longest gap between captured frames {report.max_capture_gap_s * 1000:.0f} ms "
               f"(before frame {report.max_capture_gap_row}), queue peak {queue_max[s.serial]} at t+{queue_max_at[s.serial]:.0f}s")
+        for line in video_lines:
+            print(f"    {line}")
         for note in notes:
             print(f"    note: {note}")
         for problem in problems:
