@@ -518,5 +518,69 @@ class StreamRateTests(unittest.TestCase):
         self.assertIsNone(controller.get_stream_rate())
 
 
+class WorkerThreadSurvivalTests(unittest.TestCase):
+    """One bad segment / frame must not kill the only consumer thread of a queue."""
+
+    @staticmethod
+    def drained(q, timeout=3.0):
+        import threading
+
+        done = threading.Event()
+        threading.Thread(target=lambda: (q.join(), done.set()), daemon=True).start()
+        return done.wait(timeout)
+
+    def test_the_closer_thread_keeps_finalizing_after_a_failed_segment(self):
+        from types import SimpleNamespace
+
+        from backend.segment_manifest import SegmentManifestEntry
+
+        controller, *_ = make_controller()
+        processed = []
+
+        def run(job):
+            if job.segment_index == 1:
+                raise FileNotFoundError(3, "The system cannot find the path specified")
+            processed.append(job.segment_index)
+
+        controller._run_closer_job = run
+        controller._start_closer_thread()
+        for index in (1, 2, 3):
+            controller._closer_queue.put(
+                SimpleNamespace(
+                    segment_index=index,
+                    manifest_entry=SegmentManifestEntry(segment_index=index, segment_file=f"s{index}.avi"),
+                )
+            )
+        import contextlib, io
+
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            self.assertTrue(self.drained(controller._closer_queue), "the closer thread died")
+        self.assertEqual(processed, [2, 3])
+        self.assertEqual(controller.closer_failures, 1)
+        self.assertTrue(controller._closer_thread.is_alive())
+        self.assertIn("ERROR finalizing segment 1", printed.getvalue())
+
+    def test_the_append_thread_keeps_writing_after_a_failed_frame(self):
+        controller, *_ = make_controller()
+        processed = []
+
+        def run(job):
+            if job == "bad":
+                raise RuntimeError("rotation blew up")
+            processed.append(job)
+
+        controller._run_append_job = run
+        controller._start_append_thread()
+        for job in ("a", "bad", "b"):
+            controller._append_queue.put(job)
+        import contextlib, io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(self.drained(controller._append_queue), "the append thread died")
+        self.assertEqual(processed, ["a", "b"])
+        self.assertEqual(controller.get_acquisition_stats()["append_failures"], 1)
+        self.assertTrue(controller._append_thread.is_alive())
+
+
 if __name__ == "__main__":
     unittest.main()

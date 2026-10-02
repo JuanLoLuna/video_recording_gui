@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -81,6 +82,43 @@ def resolve_output_dir(
 def session_basename(started_at: datetime) -> str:
     """e.g. recording_20260827_143012 -- matches the existing naming exactly."""
     return f"recording_{started_at.strftime('%Y%m%d_%H%M%S')}"
+
+
+def ensure_directory(
+    path: Path,
+    *,
+    attempts: int = 6,
+    delay_s: float = 0.05,
+    sleep=time.sleep,
+    log=print,
+) -> None:
+    """mkdir -p that tolerates a transient filesystem error on Windows.
+
+    Two cameras share the .incomplete staging folder and both create it. On the
+    rig, Path.mkdir(exist_ok=True) failed once with WinError 183 ("file already
+    exists") although the folder was there (pathlib re-raises when its own
+    is_dir() check also flaps), which aborted a pre-armed segment. Retry a few
+    times with a short, growing pause and only raise if the folder is really not
+    usable; the first failure is logged with enough state to diagnose it.
+    """
+    last: OSError | None = None
+    for attempt in range(attempts):
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            return
+        except OSError as exc:
+            last = exc
+            if path.is_dir():
+                return
+            if attempt == 0:
+                log(
+                    f"[paths] could not create {path}: {exc} "
+                    f"(exists={path.exists()}, parent_exists={path.parent.exists()}); retrying"
+                )
+            if attempt < attempts - 1:
+                sleep(delay_s * (attempt + 1))
+    assert last is not None
+    raise last
 
 
 def check_writable(output_dir: str | Path) -> tuple[bool, str]:

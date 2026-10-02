@@ -2086,6 +2086,12 @@ class MainWindow(QWidget):
                         f"{controller.last_start_error or 'this camera did not start'}",
                         now_s=now_s,
                     )
+                if controller.closer_failures:
+                    self._recording_warnings.note_issue(
+                        f"{tag}{controller.closer_failures} segment(s) could not be finalized "
+                        "-- their files are left in .incomplete/ inside the output folder",
+                        now_s=now_s,
+                    )
                 if frame_gaps or incomplete or errors or append_failures:
                     self._recording_warnings.note_issue(
                         f"{tag}{frame_gaps} frame gap(s), {incomplete} incomplete image(s), "

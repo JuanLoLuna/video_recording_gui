@@ -13,6 +13,7 @@ from backend.recording_paths import (
     SessionPaths,
     camera_tag_for_serial,
     check_writable,
+    ensure_directory,
     resolve_output_dir,
     session_basename,
 )
@@ -242,6 +243,59 @@ class CameraTagTests(unittest.TestCase):
         paths = self.paths("cam26134271")
         stem = paths.metadata_csv.name[: -len("_metadata.csv")]
         self.assertTrue(paths.video_final(0).name.startswith(stem + "-"))
+
+
+class FlakyPath:
+    """A path whose mkdir fails a few times (the Windows hiccup seen on the rig)."""
+
+    def __init__(self, fail_times, *, is_dir=False, name="smoke_output/.incomplete"):
+        self.fail_times, self.dir_flag, self.name = fail_times, is_dir, name
+        self.calls = 0
+        self.parent = self
+
+    def mkdir(self, parents=False, exist_ok=False):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise FileExistsError(183, "Cannot create a file when that file already exists")
+
+    def is_dir(self):
+        return self.dir_flag
+
+    def exists(self):
+        return True
+
+    def __str__(self):
+        return self.name
+
+
+class EnsureDirectoryTests(unittest.TestCase):
+    def test_a_transient_failure_is_retried_with_growing_pauses(self):
+        path, pauses, logged = FlakyPath(2), [], []
+        ensure_directory(path, sleep=pauses.append, log=logged.append)
+        self.assertEqual(path.calls, 3)
+        self.assertEqual(pauses, [0.05, 0.10])
+        self.assertEqual(len(logged), 1)  # only the first failure is reported
+        self.assertIn("exists=True", logged[0])
+
+    def test_a_directory_that_really_exists_needs_no_retry(self):
+        path, pauses = FlakyPath(5, is_dir=True), []
+        ensure_directory(path, sleep=pauses.append, log=lambda m: None)
+        self.assertEqual(path.calls, 1)
+        self.assertEqual(pauses, [])
+
+    def test_a_persistent_failure_is_raised_after_the_attempts(self):
+        path = FlakyPath(99)
+        with self.assertRaises(FileExistsError):
+            ensure_directory(path, attempts=4, sleep=lambda s: None, log=lambda m: None)
+        self.assertEqual(path.calls, 4)
+
+    def test_a_real_directory_is_created_once_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = Path(d) / "a" / ".incomplete"
+            ensure_directory(target)
+            ensure_directory(target)
+            self.assertTrue(target.is_dir())
+
 
 if __name__ == "__main__":
     unittest.main()

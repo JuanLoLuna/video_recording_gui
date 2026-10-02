@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
@@ -112,7 +113,13 @@ def should_prepare(
 _PART_SUFFIX_RE = re.compile(r"^(?P<prefix>.+)-(?P<index>\d{4})\.avi$")
 
 
-def reconcile_part_files(part_base: Path) -> list[Path]:
+def reconcile_part_files(
+    part_base: Path,
+    *,
+    attempts: int = 4,
+    delay_s: float = 0.05,
+    sleep=time.sleep,
+) -> list[Path]:
     """Find the SDK-numbered files SpinVideo actually wrote under part_base.
 
     Normally exactly one: f"{part_base}-0000.avi" (SpinVideo always
@@ -124,13 +131,32 @@ def reconcile_part_files(part_base: Path) -> list[Path]:
 
     Returns an empty list (does not raise) if nothing matches -- e.g. the
     writer never successfully opened.
+
+    The staging folder is shared by every camera and was seen to be briefly
+    unreadable on Windows (is_dir() True, then iterdir() -> WinError 3). A few
+    short retries ride that out; a folder that stays absent yields [] as
+    before, and any other persistent OS error is raised to the caller.
     """
     parent = part_base.parent
     prefix = part_base.name
-    if not parent.is_dir():
-        return []
+    entries = None
+    last_error: OSError | None = None
+    for attempt in range(attempts):
+        try:
+            if not parent.is_dir():
+                raise FileNotFoundError(str(parent))
+            entries = list(parent.iterdir())
+            break
+        except OSError as exc:
+            last_error = exc
+            if attempt < attempts - 1:
+                sleep(delay_s * (attempt + 1))
+    if entries is None:
+        if isinstance(last_error, FileNotFoundError):
+            return []
+        raise last_error
     candidates: list[tuple[int, Path]] = []
-    for entry in parent.iterdir():
+    for entry in entries:
         m = _PART_SUFFIX_RE.match(entry.name)
         if m and m.group("prefix") == prefix:
             candidates.append((int(m.group("index")), entry))

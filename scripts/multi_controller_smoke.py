@@ -86,6 +86,22 @@ def check_videos(args, p, report) -> tuple[list[str], list[str]]:
     return problems, lines
 
 
+class _Tee:
+    """Write to the console and to a log file, so a run can be shared as text."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, text):
+        for stream in self.streams:
+            stream.write(text)
+        return len(text)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--seconds", type=float, default=120.0, help="recording duration")
@@ -106,6 +122,22 @@ def main() -> int:
 
     # Read when recording starts, so it must be set before start_recording_all().
     os.environ["SLEEVE_VIDEO_GUI_SEGMENT_SECONDS"] = str(args.segment_seconds)
+
+    # Everything printed is also saved next to the recordings, so the whole run
+    # (not just what fits on a screen) can be sent as one text file.
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    log_path = Path(args.output_dir) / f"smoke_log_{datetime.now():%Y%m%d_%H%M%S}.txt"
+    with open(log_path, "w", encoding="utf-8") as log_file:
+        real_stdout = sys.stdout
+        sys.stdout = _Tee(real_stdout, log_file)
+        try:
+            print(f"(saving this output to {log_path})")
+            return _main_with_args(args)
+        finally:
+            sys.stdout = real_stdout
+
+
+def _main_with_args(args) -> int:
 
     from backend.camera_control import CameraController, enumerate_cameras
     from backend.camera_group import CameraGroup, CameraSlot
@@ -250,6 +282,11 @@ def run_session(args, slots, group) -> int:
             if stats[name]:
                 problems.append(f"{name}={stats[name]}")
         final_depth = depth_at_end[s.serial]
+        if s.controller.closer_failures:
+            problems.append(
+                f"{s.controller.closer_failures} segment(s) failed to finalize "
+                "(their files are left in .incomplete/)"
+            )
         notes = []
         if faulted or not args.fault_serial:
             limit = (7 if args.codec == "mjpg" else 5) if not args.fault_serial else None

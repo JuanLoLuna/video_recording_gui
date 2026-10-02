@@ -25,7 +25,7 @@ from backend.timeline_break import (
     session_stop_record,
     timeline_break_record,
 )
-from backend.recording_paths import SessionPaths
+from backend.recording_paths import SessionPaths, ensure_directory
 from backend.segment_policy import (
     BYTES_SAMPLE_INTERVAL_FRAMES,
     reconcile_part_files,
@@ -314,6 +314,8 @@ class CameraController:
         # risk dropping frames at every rotation boundary. Lives for the
         # whole app (daemon thread, started lazily), not per-session.
         self._closer_queue: queue.Queue = queue.Queue()
+        # Segments whose finalize step raised (the closer thread keeps going).
+        self.closer_failures = 0
         self._closer_thread: threading.Thread | None = None
         # Append() (+ the per-frame bookkeeping/rotation contingent on it
         # succeeding) profiled at a ~fixed ~18ms/frame regardless of codec,
@@ -971,7 +973,7 @@ class CameraController:
         rename/reconcile logic keeps working unchanged.
         """
         part_base = self._session_paths.video_part_base(segment_index)
-        part_base.parent.mkdir(parents=True, exist_ok=True)
+        ensure_directory(part_base.parent)
         part_path = part_base.with_name(part_base.name + "-0000.avi")
         width, height = self._get_frame_dimensions()
         # MJPEG profiled at ~14-15ms/frame through cv2.VideoWriter in
@@ -1160,6 +1162,28 @@ class CameraController:
             job = self._closer_queue.get()
             try:
                 self._run_closer_job(job)
+            except Exception as exc:
+                # One bad segment must never end this thread: it is the only
+                # consumer of the queue, so a dead closer silently stops every
+                # later segment from being finalized and makes stop() wait out
+                # its whole deadline (seen on the rig after one transient
+                # WinError 3). The part file, if any, stays in .incomplete/.
+                self.closer_failures += 1
+                print(
+                    f"{self._log_prefix} ERROR finalizing segment {job.segment_index}: "
+                    f"{exc.__class__.__name__}: {exc} -- continuing; its file (if any) "
+                    "stays in .incomplete/"
+                )
+                try:
+                    self._segment_manifest_writer.submit(
+                        manifest_row(
+                            dataclass_replace(
+                                job.manifest_entry, closed_at=time.time(), close_duration_s=0.0, bytes=0
+                            )
+                        )
+                    )
+                except Exception:
+                    pass
             finally:
                 self._closer_queue.task_done()
 
@@ -1226,6 +1250,13 @@ class CameraController:
             job = self._append_queue.get()
             try:
                 self._run_append_job(job)
+            except Exception as exc:
+                # Same reasoning as the closer loop: an unexpected error in
+                # one frame's bookkeeping (e.g. a failed segment rotation) must
+                # not kill the only thread that writes frames.
+                print(f"{self._log_prefix} ERROR in frame append: {exc.__class__.__name__}: {exc} -- continuing")
+                with self._acquisition_stats_lock:
+                    self._append_failures += 1
             finally:
                 self._append_queue.task_done()
 

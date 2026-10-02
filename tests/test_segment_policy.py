@@ -217,5 +217,61 @@ class PlanRenamesTests(unittest.TestCase):
         )
 
 
+class _Entry:
+    def __init__(self, name):
+        self.name = name
+
+
+class _FlakyParent:
+    """is_dir()/iterdir() that fail in a scripted way (the staging folder is shared by cameras)."""
+
+    def __init__(self, iterdir_results):
+        self.results = list(iterdir_results)
+        self.iterdir_calls = 0
+
+    def is_dir(self):
+        return True
+
+    def iterdir(self):
+        self.iterdir_calls += 1
+        result = self.results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return iter(result)
+
+
+class _PartBase:
+    def __init__(self, parent, name="rec_cam1_part0003"):
+        self.parent, self.name = parent, name
+
+
+class ReconcileRetryTests(unittest.TestCase):
+    def reconcile(self, results):
+        parent = _FlakyParent(results)
+        return reconcile_part_files(_PartBase(parent), sleep=lambda s: None), parent
+
+    def test_a_folder_that_vanishes_briefly_is_retried(self):
+        # The rig traceback: is_dir() True, then iterdir() -> WinError 3.
+        found, parent = self.reconcile(
+            [FileNotFoundError(3, "path not found"), [_Entry("rec_cam1_part0003-0000.avi")]]
+        )
+        self.assertEqual([e.name for e in found], ["rec_cam1_part0003-0000.avi"])
+        self.assertEqual(parent.iterdir_calls, 2)
+
+    def test_a_folder_that_stays_missing_yields_nothing_as_before(self):
+        found, _ = self.reconcile([FileNotFoundError(3, "gone")] * 4)
+        self.assertEqual(found, [])
+
+    def test_another_persistent_os_error_is_raised(self):
+        with self.assertRaises(PermissionError):
+            self.reconcile([PermissionError(5, "denied")] * 4)
+
+    def test_other_cameras_files_in_the_folder_are_ignored(self):
+        found, _ = self.reconcile(
+            [[_Entry("rec_cam2_part0003-0000.avi"), _Entry("rec_cam1_part0003-0000.avi")]]
+        )
+        self.assertEqual([e.name for e in found], ["rec_cam1_part0003-0000.avi"])
+
+
 if __name__ == "__main__":
     unittest.main()
