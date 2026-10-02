@@ -94,6 +94,28 @@ class SmokeScriptTests(unittest.TestCase):
         self.assertEqual(code, 2, text)
         self.assertIn("refusing to run", text)
 
+    def test_the_log_file_holds_the_final_result_and_is_written_line_by_line(self):
+        code, text = self.run_script("--codec", "grey")
+        logs = sorted(Path(self.tmp.name).glob("smoke_log_*.txt"))
+        self.assertEqual(len(logs), 1)
+        content = logs[0].read_text(encoding="utf-8")
+        self.assertIn("RESULT:", content)
+        self.assertIn("start_recording_all", content)
+        self.assertEqual(code, 0)
+
+    def test_progress_reaches_the_file_before_the_run_ends(self):
+        # Simulates a run that is killed mid-way: the lines printed so far must
+        # already be on disk, not sitting in a buffer.
+        import io
+        module = load_smoke()
+        out_dir = Path(self.tmp.name)
+        log_path = out_dir / "partial.txt"
+        with open(log_path, "w", encoding="utf-8", buffering=1) as log_file:
+            tee = module._Tee(io.StringIO(), log_file)
+            tee.write("first line\n")
+            tee.write("second line\n")
+            self.assertEqual(log_path.read_text(encoding="utf-8"), "first line\nsecond line\n")
+
 
 @unittest.skipIf(REAL_PYSPIN, "real PySpin present: run the script on the rig")
 class SegmentSpotCheckTests(unittest.TestCase):

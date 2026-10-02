@@ -165,7 +165,10 @@ def main() -> int:
     # (not just what fits on a screen) can be sent as one text file.
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     log_path = Path(args.output_dir) / f"smoke_log_{datetime.now():%Y%m%d_%H%M%S}.txt"
-    with open(log_path, "w", encoding="utf-8") as log_file:
+    # Line-buffered: every line reaches the file as it is printed, so a run that is
+    # killed, hangs or crashes still leaves everything it said (a block-buffered
+    # file loses the final results exactly when they matter most).
+    with open(log_path, "w", encoding="utf-8", buffering=1) as log_file:
         real_stdout = sys.stdout
         sys.stdout = _Tee(real_stdout, log_file)
         try:
