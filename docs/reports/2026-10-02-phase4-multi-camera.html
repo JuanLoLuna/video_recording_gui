@@ -1,0 +1,733 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }</style>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<title>Video Recorder Phase 4</title>
+
+<style>
+  :root {
+    --paper: #eef1ee;
+    --paper-raised: #f6f8f5;
+    --ink: #1a231f;
+    --ink-soft: #4c5750;
+    --ink-faint: #7c8880;
+    --rule: #ccd4cd;
+    --rule-soft: #dde3dc;
+    --accent: #1f5c6b;
+    --accent-soft: #dceaec;
+    --accent-ink: #0f3540;
+    --good: #3e7d5c;
+    --good-soft: #e1ede5;
+    --warn: #a8631a;
+    --warn-soft: #f3e6d5;
+    --bad: #a63a2c;
+    --bad-soft: #f4e0dc;
+    --shadow: 0 1px 2px rgba(26,35,31,0.06), 0 8px 24px -12px rgba(26,35,31,0.18);
+    --grid-line: rgba(31,92,107,0.08);
+
+    --font-display: "Big Shoulders Display", "Arial Narrow", sans-serif;
+    --font-body: "Public Sans", -apple-system, "Segoe UI", sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #12181a;
+      --paper-raised: #182121;
+      --ink: #e7ece7;
+      --ink-soft: #aab5ac;
+      --ink-faint: #71807a;
+      --rule: #2c3937;
+      --rule-soft: #23302e;
+      --accent: #5db3c4;
+      --accent-soft: #1c3438;
+      --accent-ink: #bfe6ee;
+      --good: #6bbf93;
+      --good-soft: #1d3227;
+      --warn: #d99a4e;
+      --warn-soft: #382a17;
+      --bad: #e0796a;
+      --bad-soft: #3a221e;
+      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px -12px rgba(0,0,0,0.5);
+      --grid-line: rgba(93,179,196,0.10);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --paper: #12181a;
+    --paper-raised: #182121;
+    --ink: #e7ece7;
+    --ink-soft: #aab5ac;
+    --ink-faint: #71807a;
+    --rule: #2c3937;
+    --rule-soft: #23302e;
+    --accent: #5db3c4;
+    --accent-soft: #1c3438;
+    --accent-ink: #bfe6ee;
+    --good: #6bbf93;
+    --good-soft: #1d3227;
+    --warn: #d99a4e;
+    --warn-soft: #382a17;
+    --bad: #e0796a;
+    --bad-soft: #3a221e;
+    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px -12px rgba(0,0,0,0.5);
+    --grid-line: rgba(93,179,196,0.10);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: var(--accent); color: var(--paper); }
+  a { color: var(--accent); }
+  a:focus-visible, button:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .page {
+    max-width: 920px;
+    margin: 0 auto;
+    padding: clamp(28px, 5vw, 64px) clamp(18px, 5vw, 40px) 96px;
+  }
+
+  /* ---------- header ---------- */
+  .masthead {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding-bottom: 28px;
+    margin-bottom: 40px;
+    border-bottom: 3px solid var(--ink);
+    background-image:
+      linear-gradient(var(--grid-line) 1px, transparent 1px);
+    background-size: 100% 8px;
+    background-position: 0 100%;
+    background-repeat: repeat-x;
+    padding-top: 4px;
+  }
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  h1.title {
+    font-family: var(--font-display);
+    font-weight: 800;
+    font-size: clamp(38px, 6.4vw, 60px);
+    line-height: 0.96;
+    letter-spacing: 0.002em;
+    margin: 0;
+    text-wrap: balance;
+    text-transform: uppercase;
+  }
+  .dek {
+    font-size: 17px;
+    color: var(--ink-soft);
+    max-width: 62ch;
+    margin: 2px 0 0;
+  }
+  .meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 22px;
+    margin-top: 10px;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    color: var(--ink-faint);
+  }
+  .meta-row b { color: var(--ink-soft); font-weight: 600; }
+
+  /* ---------- prose sections ---------- */
+  section { margin-bottom: 56px; }
+  .section-head {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    margin-bottom: 18px;
+  }
+  .section-num {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--accent);
+    font-weight: 600;
+    letter-spacing: 0.04em;
+  }
+  h2 {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: clamp(24px, 3.6vw, 32px);
+    text-transform: uppercase;
+    letter-spacing: 0.005em;
+    margin: 0;
+    text-wrap: balance;
+  }
+  h3 {
+    font-family: var(--font-body);
+    font-weight: 700;
+    font-size: 18px;
+    margin: 28px 0 10px;
+    color: var(--ink);
+  }
+  .prose { max-width: 68ch; }
+  .prose p { margin: 0 0 14px; }
+  .prose ul, .prose ol { margin: 0 0 14px; padding-left: 22px; }
+  .prose li { margin-bottom: 6px; }
+  code {
+    font-family: var(--font-mono);
+    font-size: 0.88em;
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+    padding: 0.1em 0.4em;
+    border-radius: 3px;
+  }
+
+  /* ---------- scoreboard ---------- */
+  .scoreboard {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 14px;
+    margin-top: 8px;
+  }
+  @media (max-width: 720px) { .scoreboard { grid-template-columns: 1fr; } }
+  .score-card {
+    background: var(--paper-raised);
+    border: 1px solid var(--rule);
+    border-top: 3px solid var(--accent);
+    border-radius: 3px;
+    padding: 18px 18px 16px;
+    box-shadow: var(--shadow);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .score-label {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+  .score-value {
+    font-family: var(--font-mono);
+    font-weight: 600;
+    font-size: 27px;
+    letter-spacing: -0.01em;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+  }
+  .score-sub { font-size: 13px; color: var(--ink-soft); }
+
+  /* ---------- verdict pill ---------- */
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    padding: 3px 9px 3px 8px;
+    border-radius: 100px;
+    width: fit-content;
+  }
+  .pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .pill.good { background: var(--good-soft); color: var(--good); }
+  .pill.warn { background: var(--warn-soft); color: var(--warn); }
+  .pill.bad  { background: var(--bad-soft);  color: var(--bad); }
+
+  /* ---------- readout card (per-item results) ---------- */
+  .readout {
+    background: var(--paper-raised);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    box-shadow: var(--shadow);
+    margin-bottom: 22px;
+    overflow: hidden;
+  }
+  .readout-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+    flex-wrap: wrap;
+    padding: 18px 22px;
+    border-bottom: 1px solid var(--rule-soft);
+    background-image: linear-gradient(var(--grid-line) 1px, transparent 1px);
+    background-size: 100% 10px;
+  }
+  .readout-title { font-weight: 700; font-size: 16.5px; }
+  .readout-title .path { color: var(--ink-faint); font-weight: 500; }
+  .readout-body {
+    padding: 20px 22px 22px;
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 22px 32px;
+  }
+  @media (max-width: 640px) { .readout-body { grid-template-columns: 1fr; } }
+  .headline-stat .num {
+    font-family: var(--font-mono);
+    font-weight: 600;
+    font-size: 40px;
+    letter-spacing: -0.015em;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    color: var(--accent-ink);
+  }
+  .headline-stat .num small { font-size: 0.4em; color: var(--ink-faint); font-weight: 500; margin-left: 4px; }
+  .headline-stat .cap { font-size: 12.5px; color: var(--ink-faint); margin-top: 6px; max-width: 22ch; }
+
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 14px 20px;
+  }
+  .stat { display: flex; flex-direction: column; gap: 2px; }
+  .stat dt {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+  .stat dd {
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 15px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+  }
+
+  /* shipped-feature table */
+  .runs {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--font-mono);
+    font-size: 13px;
+  }
+  .runs-wrap { overflow-x: auto; border-top: 1px solid var(--rule-soft); }
+  .runs th, .runs td {
+    text-align: left;
+    padding: 9px 22px 9px 0;
+    white-space: nowrap;
+  }
+  .runs th:first-child, .runs td:first-child { padding-left: 22px; }
+  .runs thead th {
+    font-size: 10.5px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    font-weight: 600;
+    border-bottom: 1px solid var(--rule-soft);
+  }
+  .runs tbody td { border-bottom: 1px solid var(--rule-soft); color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+  .runs tbody tr:last-child td { border-bottom: none; font-weight: 600; color: var(--ink); }
+  .runs td.num { font-variant-numeric: tabular-nums; }
+  .runs td.wrap { white-space: normal; }
+
+  /* ---------- bug/finding stories ---------- */
+  .bug {
+    border-left: 3px solid var(--bad);
+    background: var(--paper-raised);
+    border-radius: 0 4px 4px 0;
+    padding: 16px 20px;
+    margin-bottom: 14px;
+    box-shadow: var(--shadow);
+  }
+  .bug-head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+  }
+  .bug-num { font-family: var(--font-mono); color: var(--bad); font-weight: 600; font-size: 13px; }
+  .bug-title { font-weight: 700; font-size: 15.5px; }
+  .bug dl { margin: 10px 0 0; display: grid; grid-template-columns: max-content 1fr; gap: 5px 14px; }
+  .bug dt {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    padding-top: 2px;
+  }
+  .bug dd { margin: 0; font-size: 14px; color: var(--ink-soft); }
+  .bug .arrow { font-family: var(--font-mono); color: var(--bad); }
+  .bug .fixed { color: var(--good); font-weight: 600; }
+  .bug .open { color: var(--warn); font-weight: 600; }
+
+  /* ---------- open items ---------- */
+  .open-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+  @media (max-width: 680px) { .open-grid { grid-template-columns: 1fr; } }
+  .open-card {
+    background: var(--paper-raised);
+    border: 1px solid var(--rule);
+    border-top: 3px solid var(--warn);
+    border-radius: 3px;
+    padding: 16px 18px;
+    box-shadow: var(--shadow);
+  }
+  .open-card.next { border-top-color: var(--accent); }
+  .open-card h4 { margin: 0 0 6px; font-size: 15px; font-weight: 700; }
+  .open-card p { margin: 0; font-size: 13.5px; color: var(--ink-soft); }
+
+  /* ---------- closing ---------- */
+  .closing {
+    background: var(--accent-soft);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 24px 26px;
+  }
+  .closing h2 { color: var(--accent-ink); }
+  .closing .prose { color: var(--ink); }
+
+  footer {
+    margin-top: 64px;
+    padding-top: 20px;
+    border-top: 1px solid var(--rule);
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--ink-faint);
+  }
+
+  @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+</style>
+</head>
+<body>
+
+
+<div class="page">
+
+  <header class="masthead">
+    <span class="eyebrow">Engineering validation report</span>
+    <h1 class="title">Video Recorder Phase&nbsp;4</h1>
+    <p class="dek">A second camera: a Firefly (720&times;540) beside the Blackfly S (1280&times;1024), both recording at 30&nbsp;fps through one Thunderbolt dock, validated on the real rig with the video decoded and checked afterwards.</p>
+    <div class="meta-row">
+      <span><b>Status</b> shipped and hardware-validated &mdash; one-hour two-camera session still to run</span>
+      <span><b>Repo</b> <a href="https://github.com/JuanLoLuna/video_recording_gui/tree/feat/multi-camera">github.com/JuanLoLuna/video_recording_gui</a> &middot; branch <code>feat/multi-camera</code></span>
+      <span><b>Period</b> 2026-09-30 &ndash; 2026-10-02, following the Phase&nbsp;3 report</span>
+    </div>
+  </header>
+
+  <section id="summary">
+    <div class="section-head"><span class="section-num">00</span><h2>Summary</h2></div>
+    <div class="prose">
+      <p>Phase 3 made the recorder reliable for one camera. This period added a second one without changing how a single camera records. The work ran in three passes: a feasibility probe on the rig, a rebuild of the camera layer around one controller per camera bound by serial number, and a series of headless recording runs on the real cameras that decode their own output.</p>
+      <p>Real hardware again found what review did not: a silent encoder fallback that wrote a segment of black frames with perfect timing, a worker thread that died on one filesystem error, and an SSD stall caused by plugging a device into the dock. Each is now detected or survived. Cross-camera synchronization was deliberately left out of scope, and the second camera's files are archive-only until the downstream pipeline learns the new file names.</p>
+    </div>
+    <div class="scoreboard">
+      <div class="score-card">
+        <span class="score-label">Two cameras &middot; MJPEG &middot; 30 fps</span>
+        <span class="score-value">0<small> frame gaps</small></span>
+        <span class="score-sub">36,002 frames in 10 min; all 61 segments decoded and checked</span>
+        <span class="pill good">Validated</span>
+      </div>
+      <div class="score-card">
+        <span class="score-label">Headroom &middot; 60 fps</span>
+        <span class="score-value">60<small> fps, both</small></span>
+        <span class="score-sub">59.977 and 59.995 fps over 5 min, MJPEG, 0 gaps; one retried writer open, nothing lost</span>
+        <span class="pill good">Validated</span>
+      </div>
+      <div class="score-card">
+        <span class="score-label">Black segment</span>
+        <span class="score-value">1<small> of 61</small></span>
+        <span class="score-sub">Right frame count, black pixels; now guarded three ways</span>
+        <span class="pill warn">Found and guarded</span>
+      </div>
+    </div>
+  </section>
+
+  <section id="shipped">
+    <div class="section-head"><span class="section-num">01</span><h2>What shipped this period</h2></div>
+    <div class="prose"><p>Twenty-six commits on <code>feat/multi-camera</code> (plus the MJPEG backend fix <a href="https://github.com/JuanLoLuna/video_recording_gui/commit/789b05e">789b05e</a> merged to <code>main</code> first). 213 unit tests became 511. Three independent code audits ran during the work; they found the exposure-lock and stop-then-start bugs below and the other defects fixed along the way.</p></div>
+    <div class="runs-wrap">
+      <table class="runs">
+        <thead><tr><th>Feature</th><th>What it does</th><th>Commit</th></tr></thead>
+        <tbody>
+          <tr><td>Per-camera file names</td><td class="wrap"><code>SessionPaths.camera_tag</code>: the primary camera keeps today's names; any other camera gets <code>_cam&lt;serial&gt;</code> inside the stem. The shared WAV is never tagged.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/06f6cac">06f6cac</a></td></tr>
+          <tr><td>Camera registry</td><td class="wrap">Picks cameras by <code>SLEEVE_VIDEO_GUI_CAMERA_SERIALS</code>, warns when names are unpinned or the primary is missing, ignores unreadable serials.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/d8168a7">d8168a7</a></td></tr>
+          <tr><td>Disk guard</td><td class="wrap">Bytes per hour from each camera's real frame size and codec; thresholds sized for one-hour sessions; optional <code>SLEEVE_VIDEO_GUI_PLANNED_HOURS</code>.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/e0435e5">e0435e5</a></td></tr>
+          <tr><td>Shared Spinnaker System</td><td class="wrap">One owner of the process-wide System, with references tracked per camera so a repeated stop cannot free it under another camera.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/1d91502">1d91502</a>, <a href="https://github.com/JuanLoLuna/video_recording_gui/commit/c6893dc">c6893dc</a></td></tr>
+          <tr><td>Camera group</td><td class="wrap"><code>CameraGroup</code>: ordered start and stop, all-or-nothing recording start in two phases, best-effort mode for an unattended resume.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/3114ca8">3114ca8</a></td></tr>
+          <tr><td>Controller per camera</td><td class="wrap">Binds by serial, re-finds the same serial after a fault while the other camera streams, two-phase recording start, per-camera log lines and threads.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/06f8320">06f8320</a>, <a href="https://github.com/JuanLoLuna/video_recording_gui/commit/d63760f">d63760f</a></td></tr>
+          <tr><td>GUI</td><td class="wrap">Detect through the registry, one preview tile per camera, a camera selector for the tuning controls, per-camera diagnostics, one banner with camera prefixes.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/75266db">75266db</a>, <a href="https://github.com/JuanLoLuna/video_recording_gui/commit/1e77b0b">1e77b0b</a></td></tr>
+          <tr><td>Verification tooling</td><td class="wrap">Session verifier, the headless two-camera smoke script, <code>verify_avi.py</code> with codec and black-frame checks and a folder scan.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/5f54418">5f54418</a>, <a href="https://github.com/JuanLoLuna/video_recording_gui/commit/55490e0">55490e0</a></td></tr>
+          <tr><td>Codec policy</td><td class="wrap">Quality slider removed; MJPEG pre-selected at 30&nbsp;fps or below for one or two cameras, uncompressed above.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/52fa62d">52fa62d</a>, <a href="https://github.com/JuanLoLuna/video_recording_gui/commit/689fe95">689fe95</a></td></tr>
+          <tr><td>Survives hiccups</td><td class="wrap">Retries for the shared staging folder; the segment-closing and frame-writing threads log and continue instead of dying.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/2086639">2086639</a></td></tr>
+          <tr><td>MJPEG guard</td><td class="wrap">A non-FFMPEG MJPEG writer is discarded and retried pinned to FFMPEG; each finished segment's first frame is decoded and compared with what was recorded.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/b04a017">b04a017</a>, <a href="https://github.com/JuanLoLuna/video_recording_gui/commit/0d4cb0c">0d4cb0c</a></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="hardware">
+    <div class="section-head"><span class="section-num">02</span><h2>Real hardware validation</h2></div>
+    <div class="prose"><p>Rig: Lenovo ThinkPad (i7-10510U, 16&nbsp;GB), Windows, Spinnaker 4.2.0.88, OpenCV 4.11.0. Both cameras SuperSpeed on a Thunderbolt dock; recordings on the internal drive for the full-stack runs. Cameras: Firefly FFY-U3-04S2M #23227865 and Blackfly S BFS-U3-13Y3M #26134271.</p></div>
+
+    <div class="readout">
+      <div class="readout-head">
+        <div class="readout-title">Feasibility probe &middot; <span class="path">two cameras together vs each alone</span></div>
+        <span class="pill good">No contention vs solo</span>
+      </div>
+      <div class="readout-body">
+        <div class="headline-stat">
+          <div class="num">0<small> gaps</small></div>
+          <div class="cap">at 30 and 60 fps, acquisition only</div>
+        </div>
+        <dl class="stat-grid">
+          <div class="stat"><dt>30 fps together</dt><dd>30.13 / 30.00 fps</dd></div>
+          <div class="stat"><dt>60 fps together</dt><dd>60.21 / 59.95 fps</dd></div>
+          <div class="stat"><dt>Bandwidth at 60</dt><dd>78.9 + 23.3 MB/s</dd></div>
+          <div class="stat"><dt>Process CPU</dt><dd>&le; 0.15 cores</dd></div>
+        </dl>
+      </div>
+    </div>
+    <div class="prose">
+      <p>Threads are enough: no GIL contention, so no process per camera. The writer stage added MJPEG on both cameras: mean write time per frame 8.7&nbsp;ms (Blackfly) and 2.0&nbsp;ms (Firefly) at 30&nbsp;fps against a 33&nbsp;ms budget, 8.5 and 2.0&nbsp;ms at 60&nbsp;fps, queue peak at most 6, 0.39 cores rising to 0.76. Both cameras together write about 13&nbsp;GB/h as MJPEG against about 184&nbsp;GB/h uncompressed at 30&nbsp;fps.</p>
+    </div>
+
+    <div class="readout">
+      <div class="readout-head">
+        <div class="readout-title">One camera recovers while the other streams &middot; <span class="path">reinit_spike.py</span></div>
+        <span class="pill good">Camera-only recovery works</span>
+      </div>
+      <div class="readout-body">
+        <div class="headline-stat">
+          <div class="num">0<small> gaps</small></div>
+          <div class="cap">on the Firefly while the Blackfly was unplugged and replugged</div>
+        </div>
+        <dl class="stat-grid">
+          <div class="stat"><dt>Firefly frames</dt><dd>1,633, 0 errors</dd></div>
+          <div class="stat"><dt>Re-found by</dt><dd>serial, plain GetCameras()</dd></div>
+          <div class="stat"><dt>Restart</dt><dd>150 frames in 5 s</dd></div>
+          <div class="stat"><dt>Design impact</dt><dd>No group restart needed</dd></div>
+        </dl>
+      </div>
+    </div>
+    <div class="prose">
+      <p>This was the largest design risk: whether a replugged camera can be re-discovered while the other keeps streaming off the same Spinnaker System. It can, with one camera list per camera, so recovery rebuilds only the affected camera.</p>
+    </div>
+
+    <h3>Full-stack runs</h3>
+    <div class="prose"><p>The headless smoke script runs the real controllers, group, paths and verifier against the real cameras, then decodes the first and last segment of each camera and spot-checks the rest.</p></div>
+    <div class="readout">
+      <div class="readout-head">
+        <div class="readout-title">Recording runs &middot; <span class="path">smoke_log_20261002_*</span></div>
+        <span class="pill good">All data checks passed</span>
+      </div>
+      <div class="runs-wrap">
+        <table class="runs">
+          <thead><tr><th>Run</th><th>Setup</th><th>Firefly rows</th><th>Blackfly rows</th><th>Result</th></tr></thead>
+          <tbody>
+            <tr><td>140445</td><td class="wrap">MJPEG, 30 fps, 600 s</td><td>17,998</td><td>18,004</td><td class="wrap">Script PASS; Firefly segment 23 later found black (finding 01)</td></tr>
+            <tr><td>144535</td><td class="wrap">MJPEG, 30 fps, 600 s</td><td>17,998</td><td>18,004</td><td class="wrap">PASS; 61 of 61 segments OK; one writer open retried</td></tr>
+            <tr><td>150639</td><td class="wrap">MJPEG, 60 fps, 300 s</td><td>17,999</td><td>18,004</td><td class="wrap">Data PASS; queue peak 7 tripped a limit set for 30 fps (finding 08)</td></tr>
+            <tr><td>152009</td><td class="wrap">Uncompressed, 60 fps, 300 s</td><td>17,995*</td><td>17,999*</td><td class="wrap">Capture clean, queue peak 1; final video check not recorded</td></tr>
+            <tr><td>153238</td><td class="wrap">MJPEG, 30 fps, Blackfly unplugged 52 s</td><td>5,398</td><td>3,837</td><td class="wrap">PASS; 1 break, 1 reinit, 0 gaps</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div class="prose">
+      <p>*Frames counted at t+300 s from the progress line. In run 144535 both cameras held 29.989 and 30.000 fps with 0 frame-id gaps, queue peaks of 4 and 1, 0.70 cores, and MJPEG sizes of 22&ndash;26 and 61&ndash;63&nbsp;KB per frame, about 9&nbsp;GB/h for the pair. At 60&nbsp;fps (run 150639) the cameras held 59.977 and 59.995&nbsp;fps at 0.93 cores.</p>
+    </div>
+
+    <div class="readout">
+      <div class="readout-head">
+        <div class="readout-title">Fault run &middot; <span class="path">recording_20261002_153239</span></div>
+        <span class="pill good">Clean recovery</span>
+      </div>
+      <div class="readout-body">
+        <div class="headline-stat">
+          <div class="num">51.7<small>s</small></div>
+          <div class="cap">Blackfly outage, recovered by serial while the Firefly kept recording</div>
+        </div>
+        <dl class="stat-grid">
+          <div class="stat"><dt>Blackfly</dt><dd>1 break &middot; 1 reinit &middot; 0 gaps</dd></div>
+          <div class="stat"><dt>Blackfly segments</dt><dd>8 (6 + 1 fault roll + stop)</dd></div>
+          <div class="stat"><dt>Firefly queue peak</dt><dd>0</dd></div>
+          <div class="stat"><dt>Firefly longest gap</dt><dd>36 ms</dd></div>
+        </dl>
+      </div>
+    </div>
+    <div class="prose">
+      <p>The Blackfly retried nine times ("not present"), then re-found itself and resumed. The untouched Firefly never paused and recorded 5,398 frames in nine segments with no break or reinit.</p>
+    </div>
+
+    <div class="readout">
+      <div class="readout-head">
+        <div class="readout-title">The real application &middot; <span class="path">GUI, both cameras</span></div>
+        <span class="pill good">Operator check</span>
+      </div>
+      <div class="readout-body">
+        <div class="headline-stat">
+          <div class="num">13<small> min</small></div>
+          <div class="cap">two cameras through the window itself</div>
+        </div>
+        <dl class="stat-grid">
+          <div class="stat"><dt>Exercised</dt><dd>Detect, preview, record</dd></div>
+          <div class="stat"><dt>Outcome</dt><dd>No problems observed</dd></div>
+          <div class="stat"><dt>Evidence</dt><dd>Operator report</dd></div>
+          <div class="stat"><dt>Not scanned</dt><dd>Output files of this run</dd></div>
+        </dl>
+      </div>
+    </div>
+    <div class="prose">
+      <p>Everything above went through the headless script; this is the only run of the application itself on the rig. The GUI was otherwise tested against fake cameras with Qt offscreen. The measured evidence in this report is the script runs, not this check.</p>
+    </div>
+  </section>
+
+  <section id="finding">
+    <div class="section-head"><span class="section-num">03</span><h2>What broke, and how it's handled</h2></div>
+    <div class="prose"><p>Eight findings. Hardware found the first three, the cable problem and the test-script problems; independent audits found the exposure lock and the stop-then-start bug.</p></div>
+
+    <div class="bug">
+      <div class="bug-head"><span class="bug-num">01</span><span class="bug-title">A fallback encoder wrote a segment of black frames and every live check passed</span></div>
+      <dl>
+        <dt>Symptom</dt><dd>Firefly segment 23 of run 140445 decoded to all-black frames. Its frame count, timestamps and metadata were perfect, so nothing in the app noticed.</dd>
+        <dt>Cause</dt><dd><span class="arrow">&rarr;</span> OpenCV's FFMPEG writer could not create the file around a segment boundary and the constructor silently fell through to its built-in CV_MJPEG writer, which decodes grayscale as black on this rig. The same fallback recurred in runs 144535 and 150639; in 144535 the log also shows the <code>mkdir</code> error (WinError&nbsp;183 while <code>exists()</code> was false) at the same moment.</dd>
+        <dt>Found by</dt><dd>A log line reading "opened on backend CV_MJPEG, not FFMPEG", then the operator decoding the whole folder: 1 bad segment of 61.</dd>
+        <dt>Result</dt><dd><span class="fixed">Fixed</span> in three layers: the writer is retried pinned to FFMPEG and the segment open fails rather than record with another backend; every finished segment's first frame is decoded and compared with the recorded frame (a "VIDEO PROBLEM" banner); the smoke script checks every segment. Runs 144535 and 150639 hit the event and recovered with no bad segment.</dd>
+      </dl>
+    </div>
+
+    <div class="bug">
+      <div class="bug-head"><span class="bug-num">02</span><span class="bug-title">One transient folder error killed the thread that finalizes segments</span></div>
+      <dl>
+        <dt>Symptom</dt><dd>In run 132903 the Blackfly stopped finalizing segments partway through: the manifest and events log were incomplete, 20 files stayed in <code>.incomplete</code>, and stopping waited 92.3&nbsp;s before giving up.</dd>
+        <dt>Cause</dt><dd><span class="arrow">&rarr;</span> A shared staging folder briefly misbehaved (WinError&nbsp;183 creating it, WinError&nbsp;3 listing it). Neither worker loop caught exceptions, so one error ended the only thread that closes segments.</dd>
+        <dt>Found by</dt><dd>The first MJPEG smoke run on the local drive; the Firefly in the same run passed.</dd>
+        <dt>Result</dt><dd><span class="fixed">Fixed</span> &mdash; folder operations retry, both worker loops log and continue, a failed segment still gets a manifest row, and the count shows in the banner. The cause of the folder glitch itself is unknown (open item).</dd>
+      </dl>
+    </div>
+
+    <div class="bug">
+      <div class="bug-head"><span class="bug-num">03</span><span class="bug-title">Plugging a device into the dock stalls the SSD for about five seconds</span></div>
+      <dl>
+        <dt>Symptom</dt><dd>When the Blackfly was plugged into the dock, the Firefly's longest <code>write()</code> took 5,032&nbsp;ms and its queue reached 150 frames, then drained to 0. No frame was lost and capture never paused (longest gap 86&nbsp;ms).</dd>
+        <dt>Cause</dt><dd><span class="arrow">&rarr;</span> A USB event on the shared dock. The control run (laptop port to laptop port) showed none: longest write 16&nbsp;ms, queue peak 1.</dd>
+        <dt>Found by</dt><dd>The smoke script's new per-camera diagnostics (longest write, longest capture gap), after a first run showed the queue spike without a cause.</dd>
+        <dt>Result</dt><dd><span class="open">Handled, not fixed</span> &mdash; the frames wait in memory. The writer-backlog and MJPEG warnings now require the backlog to hold for 10&nbsp;s, so a stall that drains does not raise a false alarm.</dd>
+      </dl>
+    </div>
+
+    <div class="bug">
+      <div class="bug-head"><span class="bug-num">04</span><span class="bug-title">The exposure lock only reached the camera the controls pointed at</span></div>
+      <dl>
+        <dt>Symptom</dt><dd>With the first camera already on Off and the second on Continuous, starting preview at 30&nbsp;fps left the second on auto exposure. Switching the "Adjust camera" selector also re-enabled the locked dropdown.</dd>
+        <dt>Cause</dt><dd><span class="arrow">&rarr;</span> The lock only fired when the visible dropdown read something other than Off, and a replugged camera powers on in Continuous.</dd>
+        <dt>Found by</dt><dd>An independent audit and a probe that drove the real window against fake cameras.</dd>
+        <dt>Result</dt><dd><span class="fixed">Fixed</span> &mdash; the lock is applied to every camera every time, re-applied by the selector, and re-applied by the controller whenever it configures a camera (start and every reinit).</dd>
+      </dl>
+    </div>
+
+    <div class="bug">
+      <div class="bug-head"><span class="bug-num">05</span><span class="bug-title">Stop then Start could report success while recording nothing</span></div>
+      <dl>
+        <dt>Symptom</dt><dd>Pressing Start within seconds of Stop returned "already in progress" while the previous recording was still closing its last segment, so the window said it was recording and no video was written.</dd>
+        <dt>Cause</dt><dd><span class="arrow">&rarr;</span> An existing bug on <code>main</code>: <code>start_recording</code> treated a recording that was being closed as one in progress.</dd>
+        <dt>Found by</dt><dd>Audit of the controller, not by hardware.</dd>
+        <dt>Result</dt><dd><span class="fixed">Fixed</span> &mdash; the start is refused with "previous recording is still closing", including the window where a start was accepted but not yet acted on.</dd>
+      </dl>
+    </div>
+
+    <div class="bug">
+      <div class="bug-head"><span class="bug-num">06</span><span class="bug-title">The MJPEG quality box never did anything</span></div>
+      <dl>
+        <dt>Symptom</dt><dd>The "%" box next to the MJPEG checkbox changed neither file size nor picture on any code path.</dd>
+        <dt>Cause</dt><dd><span class="arrow">&rarr;</span> Quality cannot be set on the FFMPEG path (<code>writer.set</code> returns False, size unchanged); passing it as a constructor parameter made the FFMPEG writer refuse the call, so OpenCV fell back to its built-in writer, measured at about 800&nbsp;ms per frame while writing over the slow cable of finding&nbsp;07 (4&ndash;17&nbsp;ms to local disk, so how much of that was the writer is only partly proven).</dd>
+        <dt>Found by</dt><dd>The MJPEG investigation, measured on frames from both cameras: about 42&nbsp;dB PSNR, SSIM 0.965&ndash;0.976, 10&times; (Firefly) to 14&times; (Blackfly) smaller than raw.</dd>
+        <dt>Result</dt><dd><span class="fixed">Fixed</span> &mdash; the box is removed and MJPEG is documented as fixed quality. The study's existing video is already MJPEG at similar bitrates.</dd>
+      </dl>
+    </div>
+
+    <div class="bug">
+      <div class="bug-head"><span class="bug-num">07</span><span class="bug-title">Two cables silently ran at USB 2 speed</span></div>
+      <dl>
+        <dt>Symptom</dt><dd>The Firefly enumerated as HighSpeed, and the external SSD sustained about 48&nbsp;MB/s (41&nbsp;ms per 1.97&nbsp;MB frame, against 7.9&nbsp;ms after the swap).</dd>
+        <dt>Cause</dt><dd><span class="arrow">&rarr;</span> A cable that negotiated down. Nothing in the app can tell a slow cable from a slow drive.</dd>
+        <dt>Found by</dt><dd><code>camera_inventory.py</code> (link speed) and the writer latency probe.</dd>
+        <dt>Result</dt><dd><span class="fixed">Fixed</span> by swapping cables. Check the negotiated link speed first whenever something is unexpectedly slow.</dd>
+      </dl>
+    </div>
+
+    <div class="bug">
+      <div class="bug-head"><span class="bug-num">08</span><span class="bug-title">The test script's own checks were wrong four times</span></div>
+      <dl>
+        <dt>Symptom</dt><dd>Failures that were not recording problems: a fixed queue limit tripped at 60&nbsp;fps (7 frames is 0.12&nbsp;s), a run that stopped exactly on a segment boundary crashed the video check on an empty final segment, a 0.1% frame-rate tolerance failed 2&ndash;3&nbsp;s test runs, and the final results sat unwritten in a buffer so a stuck run left a log that just stopped.</dd>
+        <dt>Cause</dt><dd><span class="arrow">&rarr;</span> Thresholds copied from 30&nbsp;fps, an untested edge case, and block-buffered output.</dd>
+        <dt>Found by</dt><dd>Rig runs and repeated local loops of the smoke tests.</dd>
+        <dt>Result</dt><dd><span class="fixed">Fixed</span> &mdash; limits scale with frame rate, empty segments are handled, the log is line-buffered, and a stuck stop now prints what each camera is waiting for.</dd>
+      </dl>
+    </div>
+
+    <div class="prose">
+      <p>The pattern: the worst problem (01) had a perfect frame count, perfect timing and perfect metadata. Only decoding the pixels found it. Checks that look at what was written, not at bookkeeping about writing, are what earned their place this period.</p>
+    </div>
+  </section>
+
+  <section id="open">
+    <div class="section-head"><span class="section-num">04</span><h2>Open items</h2></div>
+    <div class="open-grid">
+      <div class="open-card next">
+        <h4>Pin the camera names</h4>
+        <p>Set <code>SLEEVE_VIDEO_GUI_CAMERA_SERIALS=23227865,26134271</code> on the rig. Without it the unsuffixed names follow whichever camera is plugged in, and a missing camera hands them to the other one.</p>
+      </div>
+      <div class="open-card next">
+        <h4>One-hour two-camera session in the application</h4>
+        <p>The window ran for 13 minutes. A full-length session with 15-minute segments and a decoded-video check of the result is the remaining validation step.</p>
+      </div>
+      <div class="open-card">
+        <h4>Second-camera files and ingestion</h4>
+        <p>Files with a <code>_cam&lt;serial&gt;</code> suffix do not match the naming rules in the downstream pipeline. They are archive-only until the first two-camera ingest, by decision; the proposed pattern is in the plan.</p>
+      </div>
+      <div class="open-card">
+        <h4>Why the staging folder flaps on C:</h4>
+        <p>Unexplained. It appeared on the local drive only, around segment changes. Retries make it harmless; excluding the recording folder from real-time scanning is the test if it matters.</p>
+      </div>
+      <div class="open-card">
+        <h4>Uncompressed 60&nbsp;fps final check</h4>
+        <p>The capture was clean (queue peak 1) but the run printed nothing after its last progress line and the closing video check was never recorded. The script now reports where a slow stop is waiting.</p>
+      </div>
+      <div class="open-card">
+        <h4>MJPEG and the keypoint results</h4>
+        <p>Quality is fixed at about 42&nbsp;dB. The existing study video is already MJPEG, and a keypoint and joint-angle comparison is in progress on a separate branch.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="next" class="closing">
+    <div class="section-head"><span class="section-num">05</span><h2>Where this leaves things</h2></div>
+    <div class="prose">
+      <p>Two cameras record together at 30&nbsp;fps with MJPEG by default, hold 60&nbsp;fps with room to spare, survive one camera being unplugged while the other keeps recording, and check their own video after writing it. A single camera behaves as before. What remains is operational: pin the camera names, run one full hour through the application, and decide when to teach the downstream pipeline about the second camera's files.</p>
+    </div>
+  </section>
+
+  <footer>
+    <span><a href="https://github.com/JuanLoLuna/video_recording_gui/tree/feat/multi-camera">github.com/JuanLoLuna/video_recording_gui</a> &middot; feat/multi-camera</span>
+    <span>Report generated 2026-10-02</span>
+  </footer>
+
+</div>
+
+</body>
+</html>
