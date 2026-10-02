@@ -95,5 +95,58 @@ class SmokeScriptTests(unittest.TestCase):
         self.assertIn("refusing to run", text)
 
 
+@unittest.skipIf(REAL_PYSPIN, "real PySpin present: run the script on the rig")
+class SegmentSpotCheckTests(unittest.TestCase):
+    """A bad segment in the MIDDLE of a run must be found, not only the first and last."""
+
+    def build(self, middle_black):
+        import csv
+        from types import SimpleNamespace
+
+        import cv2
+        import numpy as np
+
+        from backend.recording_paths import SessionPaths
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        paths = SessionPaths.for_session(tmp.name, __import__("datetime").datetime(2026, 10, 2, 14, 0, 0))
+        good = np.tile(np.linspace(40, 200, 64, dtype=np.uint8), (48, 1))
+        rows = []
+        for index in range(5):
+            frames = [np.zeros_like(good) if (index == 2 and middle_black) else good for _ in range(10)]
+            writer = cv2.VideoWriter(str(paths.video_final(index)), cv2.VideoWriter_fourcc(*"MJPG"), 30.0, (64, 48), isColor=False)
+            for frame in frames:
+                writer.write(frame)
+            writer.release()
+            rows.append({"segment_file": paths.video_final(index).name, "frame_count": 10})
+        with open(paths.segments_csv, "w", newline="", encoding="utf-8") as handle:
+            w = csv.DictWriter(handle, fieldnames=["segment_file", "frame_count"])
+            w.writeheader()
+            w.writerows(rows)
+        return paths, SimpleNamespace(segment_count=5)
+
+    def run_check(self, middle_black):
+        module = load_smoke()
+        paths, report = self.build(middle_black)
+        args = SimpleNamespace_args(codec="mjpg", video_stride=1)
+        return module.check_videos(args, paths, report)
+
+    def test_a_black_segment_in_the_middle_is_reported(self):
+        problems, lines = self.run_check(middle_black=True)
+        self.assertTrue(any("0002.avi" in p and "BLACK" in p for p in problems), problems)
+        self.assertTrue(any("quick-checked 3 other" in line for line in lines), lines)
+
+    def test_all_good_segments_pass(self):
+        problems, _ = self.run_check(middle_black=False)
+        self.assertEqual(problems, [])
+
+
+def SimpleNamespace_args(**kw):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(**kw)
+
+
 if __name__ == "__main__":
     unittest.main()

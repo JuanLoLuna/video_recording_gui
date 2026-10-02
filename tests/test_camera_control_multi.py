@@ -582,5 +582,103 @@ class WorkerThreadSurvivalTests(unittest.TestCase):
         self.assertTrue(controller._append_thread.is_alive())
 
 
+class FakeCv2:
+    """Just the cv2 surface _open_cv2_writer touches, with scripted backends."""
+
+    CAP_FFMPEG = 1900
+
+    class Writer:
+        def __init__(self, backend, tmp_path=None):
+            self.backend, self.released = backend, False
+            if tmp_path is not None:
+                Path(tmp_path).write_bytes(b"partial")
+
+        def isOpened(self):
+            return self.backend is not None
+
+        def getBackendName(self):
+            return self.backend
+
+        def release(self):
+            self.released = True
+
+    def __init__(self, plain_backend, pinned_backends=()):
+        self.plain_backend = plain_backend
+        self.pinned = list(pinned_backends)
+        self.created = []
+        self.pinned_calls = 0
+
+    def VideoWriter_fourcc(self, *chars):
+        return 1196444237
+
+    def VideoWriter(self, path, *args, **kwargs):
+        if args and args[0] == self.CAP_FFMPEG:
+            backend = self.pinned.pop(0) if self.pinned else None
+            self.pinned_calls += 1
+        else:
+            backend = self.plain_backend
+        writer = FakeCv2.Writer(backend, path)
+        self.created.append(writer)
+        return writer
+
+
+class MjpegBackendGuardTests(unittest.TestCase):
+    def setUp(self):
+        import backend.camera_control as camera_control
+
+        self.camera_control = camera_control
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "seg.avi"
+        self.original_cv2 = camera_control.cv2
+        self.addCleanup(lambda: setattr(camera_control, "cv2", self.original_cv2))
+        self.original_sleep = camera_control.time.sleep
+        camera_control.time.sleep = lambda s: None
+        self.addCleanup(lambda: setattr(camera_control.time, "sleep", self.original_sleep))
+        self.controller, *_ = make_controller()
+
+    def open(self, fake, *, compress=True):
+        self.camera_control.cv2 = fake
+        self.controller._use_compression = compress
+        import contextlib, io
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            return self.controller._open_cv2_writer(self.path, 1196444237, 64, 48, False)
+
+    def test_an_ffmpeg_writer_is_returned_untouched(self):
+        fake = FakeCv2("FFMPEG")
+        writer = self.open(fake)
+        self.assertEqual(writer.backend, "FFMPEG")
+        self.assertEqual(fake.pinned_calls, 0)
+        self.assertEqual(self.controller.writer_open_retries, 0)
+
+    def test_a_silent_fall_through_to_cv_mjpeg_is_discarded_and_retried_pinned_to_ffmpeg(self):
+        # The rig: one pre-armed segment opened on CV_MJPEG after a transient error.
+        fake = FakeCv2("CV_MJPEG", pinned_backends=["FFMPEG"])
+        writer = self.open(fake)
+        self.assertEqual(writer.backend, "FFMPEG")
+        self.assertTrue(fake.created[0].released)  # the CV_MJPEG writer was thrown away
+        self.assertEqual(fake.pinned_calls, 1)
+        self.assertEqual(self.controller.writer_open_retries, 1)
+
+    def test_it_refuses_rather_than_recording_with_another_backend(self):
+        fake = FakeCv2("CV_MJPEG", pinned_backends=["CV_MJPEG", None, "CV_MJPEG"])
+        with self.assertRaises(RuntimeError) as caught:
+            self.open(fake)
+        self.assertIn("FFMPEG", str(caught.exception))
+        self.assertTrue(all(w.released for w in fake.created))  # nothing left open
+
+    def test_a_pinned_attempt_that_cannot_open_is_retried(self):
+        fake = FakeCv2("CV_MJPEG", pinned_backends=[None, "FFMPEG"])
+        self.assertEqual(self.open(fake).backend, "FFMPEG")
+        self.assertEqual(self.controller.writer_open_retries, 2)
+
+    def test_uncompressed_recording_is_left_exactly_as_it_was(self):
+        fake = FakeCv2("SOME_OTHER_BACKEND")
+        writer = self.open(fake, compress=False)
+        self.assertEqual(writer.backend, "SOME_OTHER_BACKEND")
+        self.assertEqual(fake.pinned_calls, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

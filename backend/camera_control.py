@@ -316,6 +316,8 @@ class CameraController:
         self._closer_queue: queue.Queue = queue.Queue()
         # Segments whose finalize step raised (the closer thread keeps going).
         self.closer_failures = 0
+        # MJPEG writer opens that had to be retried because FFMPEG did not take the file.
+        self.writer_open_retries = 0
         self._closer_thread: threading.Thread | None = None
         # Append() (+ the per-frame bookkeeping/rotation contingent on it
         # succeeding) profiled at a ~fixed ~18ms/frame regardless of codec,
@@ -1017,17 +1019,52 @@ class CameraController:
         writer = cv2.VideoWriter(
             str(path), fourcc, self.recording_fps, (width, height), isColor=is_color
         )
-        if self._use_compression and writer.isOpened():
+        if not self._use_compression:
+            return writer  # uncompressed GREY: the validated path, unchanged
+
+        # MJPEG must be written by the FFMPEG backend. If FFMPEG cannot open the
+        # file (seen on the rig around a segment boundary, when a transient
+        # filesystem error hit), OpenCV silently falls through to its built-in
+        # CV_MJPEG writer, which was measured to be far slower and, for
+        # grayscale input, to decode as black frames. A "working" recording with
+        # black pictures is the worst outcome, so: discard that writer and retry
+        # pinned to FFMPEG so it cannot fall through; refuse if that fails too.
+        backend = self._writer_backend(writer)
+        for attempt in range(3):
+            if backend == "FFMPEG":
+                return writer
+            writer.release()
+            self.writer_open_retries += 1
+            print(
+                f"{self._log_prefix} MJPEG writer for {path.name} opened on backend {backend!r}, "
+                f"not FFMPEG; retrying pinned to FFMPEG (attempt {attempt + 1}/3)"
+            )
             try:
-                backend = writer.getBackendName()
-            except Exception:
-                backend = "?"
-            if backend not in ("FFMPEG", "?"):
-                # Never fail the recording over this, but make it loud: any
-                # other backend has not been validated at the app's frame rate.
-                print(f"{self._log_prefix} WARNING: MJPEG writer opened on backend {backend!r}, not FFMPEG "
-                      "-- write speed is unvalidated and may not keep up")
-        return writer
+                path.unlink(missing_ok=True)  # the discarded writer's partial file
+            except OSError:
+                pass
+            time.sleep(0.1 * (attempt + 1))
+            writer = cv2.VideoWriter(
+                str(path), cv2.CAP_FFMPEG, fourcc, self.recording_fps, (width, height), is_color
+            )
+            backend = self._writer_backend(writer)
+        if backend == "FFMPEG":
+            return writer
+        writer.release()
+        raise RuntimeError(
+            f"MJPEG writer for {path.name} could not be opened on the FFMPEG backend "
+            f"(last backend: {backend!r}); refusing to record with a different backend"
+        )
+
+    @staticmethod
+    def _writer_backend(writer) -> str:
+        """Backend name of an OPEN writer, or "not opened"."""
+        try:
+            if not writer.isOpened():
+                return "not opened"
+            return writer.getBackendName()
+        except Exception:
+            return "unknown"
 
     def _maybe_rotate_segment(self) -> None:
         """Append thread only. Called after each successful Append().

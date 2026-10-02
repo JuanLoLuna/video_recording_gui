@@ -83,6 +83,31 @@ def check_videos(args, p, report) -> tuple[list[str], list[str]]:
             problems.append(f"{path.name} has {info['decoded']} frames, segments.csv says {manifest[path.name]}")
         if info["all_black"]:
             problems.append(f"{path.name} decodes to BLACK frames")
+    # Every OTHER segment gets the cheap check (first/middle/last frame): a single
+    # bad segment in the middle of a run (e.g. one written by a fallback encoder)
+    # would otherwise go unnoticed because only the first and last are fully decoded.
+    scanned = {non_empty[0], non_empty[-1]}
+    others = [i for i in non_empty if i not in scanned]
+    bad = 0
+    for index in others:
+        path = p.video_final(index)
+        quick = verify_avi.quick_check(str(path))
+        expected_frames = manifest.get(path.name)
+        if not quick["opened"] or quick.get("unreadable"):
+            problems.append(f"{path.name} cannot be opened/decoded")
+            bad += 1
+            continue
+        if quick["fourcc"] != EXPECTED_CODEC[args.codec]:
+            problems.append(f"{path.name} is {quick['fourcc']}, expected {EXPECTED_CODEC[args.codec]}")
+            bad += 1
+        if expected_frames is not None and quick["frames"] != expected_frames:
+            problems.append(f"{path.name} has {quick['frames']} frames, segments.csv says {expected_frames}")
+            bad += 1
+        if quick["all_black"]:
+            problems.append(f"{path.name} decodes to BLACK frames")
+            bad += 1
+    if others:
+        lines.append(f"quick-checked {len(others)} other segment(s): {len(others) - bad} OK, {bad} with problems")
     return problems, lines
 
 
@@ -328,6 +353,11 @@ def run_session(args, slots, group) -> int:
         print(f"    longest write() {append_ms_max[s.serial]:.0f} ms, longest grab {grab_ms_max[s.serial]:.0f} ms, "
               f"longest gap between captured frames {report.max_capture_gap_s * 1000:.0f} ms "
               f"(before frame {report.max_capture_gap_row}), queue peak {queue_max[s.serial]} at t+{queue_max_at[s.serial]:.0f}s")
+        if s.controller.writer_open_retries:
+            notes.append(
+                f"{s.controller.writer_open_retries} MJPEG writer open(s) did not get the FFMPEG backend "
+                "first time and were retried pinned to FFMPEG (recovered)"
+            )
         for line in video_lines:
             print(f"    {line}")
         for note in notes:

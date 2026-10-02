@@ -81,5 +81,28 @@ class ScanVideoTests(unittest.TestCase):
             self.assertFalse(verify_avi.scan_video(str(junk))["opened"])
 
 
+class QuickCheckTests(unittest.TestCase):
+    def check(self, codec, frames):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "q.avi"
+            write_video(path, codec, frames)
+            return verify_avi.quick_check(str(path))
+
+    def test_a_good_video_reports_frames_codec_and_brightness(self):
+        info = self.check("MJPG", moving_frames(20))
+        self.assertTrue(info["opened"])
+        self.assertEqual(info["frames"], 20)
+        self.assertEqual(info["fourcc"], "MJPG")
+        self.assertEqual(len(info["means"]), 3)
+        self.assertFalse(info["all_black"])
+
+    def test_a_black_video_is_flagged_by_the_cheap_check_too(self):
+        info = self.check("MJPG", [np.zeros((48, 64), dtype=np.uint8) for _ in range(12)])
+        self.assertTrue(info["all_black"])
+
+    def test_missing_file_is_not_opened(self):
+        self.assertFalse(verify_avi.quick_check("/no/such.avi")["opened"])
+
+
 if __name__ == "__main__":
     unittest.main()

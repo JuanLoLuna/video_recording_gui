@@ -126,6 +126,37 @@ def scan_video(avi_path: str, *, stride: int = 1, max_frozen_run: int = 5, black
     return result
 
 
+def quick_check(avi_path: str, *, black_mean: float = 5.0) -> dict:
+    """Cheap per-segment check: opens, frame count, codec, brightness of 3 sampled frames.
+
+    Reads the first, middle and last frame instead of decoding everything, so it
+    can cover every segment of a long run in seconds.
+    """
+    result = {"opened": False, "path": avi_path}
+    if not os.path.isfile(avi_path):
+        return result
+    cap = cv2.VideoCapture(avi_path)
+    if not cap.isOpened():
+        return result
+    frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    means = []
+    for position in sorted({0, frames // 2, max(0, frames - 1)}) if frames else []:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, position)
+        ok, frame = cap.read()
+        if ok:
+            means.append(float(frame.mean()))
+    result.update(
+        opened=True,
+        frames=frames,
+        fourcc=fourcc_name(cap),
+        means=means,
+        all_black=bool(means) and all(m < black_mean for m in means),
+        unreadable=bool(frames) and not means,
+    )
+    cap.release()
+    return result
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("avi_path")
