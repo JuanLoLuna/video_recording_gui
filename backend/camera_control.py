@@ -72,6 +72,14 @@ STREAM_BUFFER_SECONDS_TARGET = 5.0
 # only runs when the frame-rate widgets change.
 EXPOSURE_AUTO_LOCK_MIN_FPS = 30.0
 
+# After each segment is finalized, its first frame is decoded from the FILE and
+# compared with the frame that was handed to the writer. A segment that "worked"
+# (right frame count, normal timing) but decodes black went unnoticed on the rig;
+# this is the only check that looks at what was actually written. A scene darker
+# than the minimum cannot be told apart from a black file, so it is skipped.
+SEGMENT_PIXEL_CHECK_MIN_MEAN = 10.0
+SEGMENT_PIXEL_BLACK_RATIO = 0.25
+
 
 @dataclass
 class _CloserJob:
@@ -82,6 +90,8 @@ class _CloserJob:
     final_path: Path
     segment_index: int
     manifest_entry: SegmentManifestEntry
+    # Mean pixel value of the segment's first frame as recorded (None = unknown / empty).
+    first_frame_mean: float | None = None
 
 
 @dataclass
@@ -316,6 +326,10 @@ class CameraController:
         self._closer_queue: queue.Queue = queue.Queue()
         # Segments whose finalize step raised (the closer thread keeps going).
         self.closer_failures = 0
+        # (segment_index, reason) for segments whose finished file does not decode to
+        # the picture that was recorded. Cleared by every prepare_recording().
+        self.segment_pixel_problems: list[tuple[int, str]] = []
+        self._segment_first_frame_mean: float | None = None
         # MJPEG writer opens that had to be retried because FFMPEG did not take the file.
         self.writer_open_retries = 0
         self._closer_thread: threading.Thread | None = None
@@ -1185,6 +1199,9 @@ class CameraController:
                 final_path=final_path,
                 segment_index=segment_index,
                 manifest_entry=entry,
+                first_frame_mean=(
+                    self._segment_first_frame_mean if self._frames_in_segment > 0 else None
+                ),
             )
         )
 
@@ -1258,6 +1275,36 @@ class CameraController:
             bytes=total_bytes,
         )
         self._segment_manifest_writer.submit(manifest_row(entry))
+
+        # Look at what was actually written, after the file is final and the
+        # manifest row is out, so it can never delay either.
+        if part_files and job.first_frame_mean is not None:
+            problem = self._check_segment_pixels(job.final_path, job.first_frame_mean)
+            if problem:
+                self.segment_pixel_problems.append((job.segment_index, problem))
+                print(f"{self._log_prefix} ERROR: segment {job.segment_index} ({job.final_path.name}) {problem}")
+
+    @staticmethod
+    def _check_segment_pixels(path: Path, recorded_mean: float) -> str | None:
+        """None if the finished file decodes to roughly the picture that was recorded."""
+        if recorded_mean < SEGMENT_PIXEL_CHECK_MIN_MEAN:
+            return None  # too dark to tell a dark scene from a black file
+        capture = cv2.VideoCapture(str(path))
+        try:
+            if not capture.isOpened():
+                return "cannot be opened after it was finalized"
+            ok, frame = capture.read()
+            if not ok:
+                return "has a first frame that cannot be decoded"
+            decoded_mean = float(frame.mean())
+        finally:
+            capture.release()
+        if decoded_mean < SEGMENT_PIXEL_BLACK_RATIO * recorded_mean:
+            return (
+                f"decodes (nearly) black: first frame mean {decoded_mean:.1f} "
+                f"vs {recorded_mean:.1f} when recorded"
+            )
+        return None
 
     def _safe_rename(self, source: Path, destination: Path) -> int:
         size = 0
@@ -1341,6 +1388,7 @@ class CameraController:
         if self._frames_in_segment == 1:
             self._segment_first_record_frame_index = self.frame_counter
             self._segment_first_system_time = job.captured_wall_s
+            self._segment_first_frame_mean = float(job.frame_array.mean())
 
         if self._mark_next_frame_segment_resume:
             row_sync_label = "segment_resume"
@@ -1420,6 +1468,7 @@ class CameraController:
             return False, "A recording is already prepared; begin or abort it first."
 
         self.last_start_error = None
+        self.segment_pixel_problems = []
         # An events log left open by an earlier failed/aborted attempt would
         # be replaced below and its handle (and, on Windows, file lock) leaked.
         if self._event_log is not None:

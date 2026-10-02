@@ -307,6 +307,8 @@ def run_session(args, slots, group) -> int:
             if stats[name]:
                 problems.append(f"{name}={stats[name]}")
         final_depth = depth_at_end[s.serial]
+        for index, reason in s.controller.segment_pixel_problems:
+            problems.append(f"the app itself flagged segment {index}: {reason}")
         if s.controller.closer_failures:
             problems.append(
                 f"{s.controller.closer_failures} segment(s) failed to finalize "

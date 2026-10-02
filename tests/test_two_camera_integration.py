@@ -21,7 +21,7 @@ from backend.camera_group import CameraGroup, CameraSlot  # noqa: E402
 from backend.recording_paths import SessionPaths  # noqa: E402
 from backend.session_verify import verify_camera_outputs  # noqa: E402
 from backend.spinnaker_system import SharedSystemHolder  # noqa: E402
-from fake_spinnaker import FPS, FakeCamera, FakeSystem  # noqa: E402
+from fake_spinnaker import FPS, FakeCamera, FakeImage, FakeSystem  # noqa: E402
 
 
 class BrokenTLCamera(FakeCamera):
@@ -247,6 +247,76 @@ class TwoCameraRecordingTests(unittest.TestCase):
             report = verify_camera_outputs(p.metadata_csv, p.segments_csv, p.events_jsonl,
                                            expect_stem=p.stem, expect_serial=slot.serial)
             self.assertTrue(report.ok, report.problems)
+
+
+@unittest.skipIf(REAL_PYSPIN, "real PySpin present: use scripts/multi_controller_smoke.py")
+class BlackSegmentDetectionTests(unittest.TestCase):
+    """A segment that is finalized correctly but decodes black must be reported by the app."""
+
+    def make(self, black):
+        import numpy as np
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        previous = os.environ.get("SLEEVE_VIDEO_GUI_SEGMENT_SECONDS")
+        os.environ["SLEEVE_VIDEO_GUI_SEGMENT_SECONDS"] = "1"
+        self.addCleanup(
+            lambda: os.environ.pop("SLEEVE_VIDEO_GUI_SEGMENT_SECONDS", None)
+            if previous is None else os.environ.__setitem__("SLEEVE_VIDEO_GUI_SEGMENT_SECONDS", previous)
+        )
+        camera = FakeCamera("111", "Cam", 64, 48)
+        holder = SharedSystemHolder(lambda: FakeSystem([camera]))
+        controller = CameraController(serial="111", system_holder=holder)
+        controller._configure_camera_nodes = lambda: None
+        controller.target_frame_rate = FPS
+        if black:
+            real_open = controller._open_segment_writer
+
+            class BlackWriter:
+                """Reports success, finalizes normally, but writes a black picture."""
+
+                def __init__(self, inner):
+                    self.inner = inner
+
+                def write(self, frame):
+                    return self.inner.write(np.zeros_like(frame))
+
+                def release(self):
+                    return self.inner.release()
+
+                def isOpened(self):
+                    return self.inner.isOpened()
+
+            controller._open_segment_writer = lambda index: BlackWriter(real_open(index))
+        # Bright, time-varying frames so the recorded first-frame mean is well above the dark limit.
+        original = FakeImage.GetNDArray
+        FakeImage.GetNDArray = lambda self: np.full((self.height, self.width), 120, dtype=np.uint8)
+        self.addCleanup(lambda: setattr(FakeImage, "GetNDArray", original))
+        group = CameraGroup([CameraSlot(controller, serial="111", model="Cam", tag=None, is_primary=True)])
+        self.addCleanup(group.stop_all)
+        return controller, group
+
+    def record(self, controller, group, seconds=3.2):
+        paths = SessionPaths.for_session(self.tmp.name, datetime(2026, 10, 2, 14, 0, 0))
+        self.assertTrue(group.start_all().ok)
+        self.assertTrue(group.start_recording_all(lambda s: paths, lambda s: FPS).ok)
+        time.sleep(seconds)
+        self.assertTrue(group.stop_all().ok)
+
+    def test_good_segments_raise_no_pixel_problem(self):
+        controller, group = self.make(black=False)
+        self.record(controller, group)
+        self.assertEqual(controller.segment_pixel_problems, [])
+
+    def test_black_segments_are_reported_by_the_app(self):
+        import contextlib, io
+
+        controller, group = self.make(black=True)
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            self.record(controller, group)
+        self.assertGreaterEqual(len(controller.segment_pixel_problems), 3)  # every rotated segment
+        self.assertTrue(all("black" in reason for _, reason in controller.segment_pixel_problems))
+        self.assertIn("ERROR: segment", printed.getvalue())
 
 
 if __name__ == "__main__":

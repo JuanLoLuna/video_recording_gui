@@ -157,6 +157,33 @@ def quick_check(avi_path: str, *, black_mean: float = 5.0) -> dict:
     return result
 
 
+def scan_folder(folder: str) -> int:
+    """Cheap check of EVERY .avi in a folder (first/middle/last frame of each).
+
+    Use it to audit a whole recording folder, e.g. one made while the MJPEG
+    writer could silently fall back to a backend that decodes black.
+    Returns 1 if any file cannot be opened/decoded or is black.
+    """
+    names = sorted(n for n in os.listdir(folder) if n.lower().endswith(".avi"))
+    if not names:
+        print(f"no .avi files in {folder}")
+        return 1
+    bad = 0
+    print(f"{'file':<62} {'frames':>7} {'codec':<17} {'brightness':<14} status")
+    for name in names:
+        info = quick_check(os.path.join(folder, name))
+        if not info["opened"] or info.get("unreadable"):
+            status, bad = "CANNOT DECODE", bad + 1
+            print(f"{name:<62} {'-':>7} {'-':<17} {'-':<14} {status}")
+            continue
+        status = "BLACK" if info["all_black"] else "ok"
+        bad += status != "ok"
+        bright = "/".join(f"{m:.0f}" for m in info["means"]) or "-"
+        print(f"{name:<62} {info['frames']:>7} {info['fourcc']:<17} {bright:<14} {status}")
+    print(f"\n{len(names)} file(s) checked, {bad} with problems")
+    return 1 if bad else 0
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("avi_path")
@@ -170,6 +197,9 @@ def main() -> None:
         help="warn if this many consecutive checked frames are pixel-identical (default: 5)",
     )
     args = ap.parse_args()
+
+    if os.path.isdir(args.avi_path):
+        sys.exit(scan_folder(args.avi_path))
 
     if not os.path.isfile(args.avi_path):
         print(f"FAILED: {args.avi_path} does not exist")

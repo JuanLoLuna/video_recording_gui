@@ -680,5 +680,57 @@ class MjpegBackendGuardTests(unittest.TestCase):
         self.assertEqual(fake.pinned_calls, 0)
 
 
+class SegmentPixelCheckTests(unittest.TestCase):
+    """The only check that looks at what was actually written to disk."""
+
+    def setUp(self):
+        import cv2
+
+        self.cv2 = cv2
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def video(self, name, frame, count=6, codec="MJPG"):
+        path = Path(self.tmp.name) / name
+        writer = self.cv2.VideoWriter(str(path), self.cv2.VideoWriter_fourcc(*codec), 30.0,
+                                      (frame.shape[1], frame.shape[0]), isColor=False)
+        for _ in range(count):
+            writer.write(frame)
+        writer.release()
+        return path
+
+    @staticmethod
+    def check(path, recorded_mean):
+        return CameraController._check_segment_pixels(path, recorded_mean)
+
+    def test_a_good_file_passes_for_both_codecs(self):
+        frame = np.tile(np.linspace(40, 200, 64, dtype=np.uint8), (48, 1))
+        for codec in ("MJPG", "GREY"):
+            path = self.video(f"{codec}.avi", frame, codec=codec)
+            self.assertIsNone(self.check(path, float(frame.mean())), codec)
+
+    def test_a_black_file_is_flagged_when_the_recorded_picture_was_not_black(self):
+        black = np.zeros((48, 64), dtype=np.uint8)
+        message = self.check(self.video("black.avi", black), 120.0)
+        self.assertIn("black", message)
+        self.assertIn("120.0", message)
+
+    def test_a_genuinely_dark_scene_is_not_called_black(self):
+        # Lens cap / lights off: indistinguishable from a black file, so no verdict.
+        black = np.zeros((48, 64), dtype=np.uint8)
+        self.assertIsNone(self.check(self.video("dark.avi", black), 3.0))
+
+    def test_compression_noise_is_not_a_false_alarm(self):
+        rng = np.random.default_rng(0)
+        frame = np.clip(120 + rng.normal(0, 25, (48, 64)), 0, 255).astype(np.uint8)
+        self.assertIsNone(self.check(self.video("noisy.avi", frame), float(frame.mean())))
+
+    def test_a_file_that_cannot_be_opened_is_flagged(self):
+        junk = Path(self.tmp.name) / "junk.avi"
+        junk.write_bytes(b"not a video")
+        self.assertIn("cannot be opened", self.check(junk, 120.0))
+        self.assertIn("cannot be opened", self.check(Path(self.tmp.name) / "missing.avi", 120.0))
+
+
 if __name__ == "__main__":
     unittest.main()

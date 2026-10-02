@@ -2086,6 +2086,14 @@ class MainWindow(QWidget):
                         f"{controller.last_start_error or 'this camera did not start'}",
                         now_s=now_s,
                     )
+                if controller.segment_pixel_problems:
+                    index, reason = controller.segment_pixel_problems[-1]
+                    self._recording_warnings.note_issue(
+                        f"{tag}VIDEO PROBLEM: segment {index} {reason} "
+                        f"({len(controller.segment_pixel_problems)} affected so far). "
+                        "Do not rely on that video.",
+                        now_s=now_s,
+                    )
                 if controller.closer_failures:
                     self._recording_warnings.note_issue(
                         f"{tag}{controller.closer_failures} segment(s) could not be finalized "

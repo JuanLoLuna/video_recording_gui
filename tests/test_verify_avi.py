@@ -104,5 +104,46 @@ class QuickCheckTests(unittest.TestCase):
         self.assertFalse(verify_avi.quick_check("/no/such.avi")["opened"])
 
 
+class ScanFolderTests(unittest.TestCase):
+    def folder(self, kinds):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        good = moving_frames(10)
+        for i, kind in enumerate(kinds):
+            frames = [np.zeros_like(good[0]) for _ in good] if kind == "black" else good
+            write_video(Path(d.name) / f"seg-{i:04d}.avi", "MJPG", frames)
+            if kind == "junk":
+                (Path(d.name) / f"seg-{i:04d}.avi").write_bytes(b"x")
+        return d.name
+
+    def run_scan(self, folder):
+        import contextlib, io
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = verify_avi.scan_folder(folder)
+        return code, out.getvalue()
+
+    def test_a_clean_folder_returns_zero(self):
+        code, text = self.run_scan(self.folder(["good", "good", "good"]))
+        self.assertEqual(code, 0, text)
+        self.assertIn("3 file(s) checked, 0 with problems", text)
+
+    def test_a_black_file_in_the_middle_is_listed_and_fails_the_scan(self):
+        code, text = self.run_scan(self.folder(["good", "black", "good"]))
+        self.assertEqual(code, 1)
+        self.assertIn("1 with problems", text)
+        self.assertRegex(text, r"seg-0001\.avi.*BLACK")
+
+    def test_an_undecodable_file_fails_the_scan(self):
+        code, text = self.run_scan(self.folder(["good", "junk"]))
+        self.assertEqual(code, 1)
+        self.assertIn("CANNOT DECODE", text)
+
+    def test_an_empty_folder_is_a_failure_not_a_pass(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(self.run_scan(d)[0], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
