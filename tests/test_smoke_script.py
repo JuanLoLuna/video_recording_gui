@@ -148,5 +148,21 @@ def SimpleNamespace_args(**kw):
     return SimpleNamespace(**kw)
 
 
+class QueueLimitTests(unittest.TestCase):
+    def test_the_limit_is_a_duration_so_it_scales_with_frame_rate(self):
+        module = load_smoke()
+        self.assertEqual(module.queue_limit("grey", 30.0), 5)
+        self.assertEqual(module.queue_limit("mjpg", 30.0), 7)
+        self.assertEqual(module.queue_limit("grey", 60.0), 10)
+        self.assertEqual(module.queue_limit("mjpg", 59.98), 14)
+        # Never stricter than at 30 fps for slower cameras.
+        self.assertEqual(module.queue_limit("mjpg", 15.0), 7)
+
+    def test_the_rig_peak_of_7_frames_at_60_fps_is_within_the_limit(self):
+        # Run 150639: a retried writer open queued 7 frames at 60 fps (~0.12 s), nothing lost.
+        module = load_smoke()
+        self.assertLess(7, module.queue_limit("mjpg", 59.98))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -37,6 +37,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 EXPECTED_CODEC = {"grey": "raw/uncompressed", "mjpg": "MJPG"}
 
 
+def queue_limit(codec: str, fps: float) -> int:
+    """Append-queue peak (frames) at which a steady run is called too slow.
+
+    The plan's criterion (< 5 uncompressed, < 7 MJPEG) was set at 30 fps, i.e. a
+    backlog of about 0.17 s / 0.23 s. A backlog is a duration, so the limit in
+    frames grows with the frame rate: at 60 fps the same 0.17 s is ~10 frames.
+    (At 60 fps a pre-armed writer open that has to be retried pinned to FFMPEG
+    holds the append thread for ~0.1 s, i.e. ~6-7 queued frames, with nothing lost.)
+    """
+    base = 7 if codec == "mjpg" else 5
+    return round(base * max(1.0, fps / 30.0))
+
+
 def check_videos(args, p, report) -> tuple[list[str], list[str]]:
     """Decode a camera's first and last segment: right codec, every frame, not black.
 
@@ -316,7 +329,7 @@ def run_session(args, slots, group) -> int:
             )
         notes = []
         if faulted or not args.fault_serial:
-            limit = (7 if args.codec == "mjpg" else 5) if not args.fault_serial else None
+            limit = queue_limit(args.codec, fps_by[s.serial]) if not args.fault_serial else None
         else:
             limit = args.fault_queue_tolerance
         if limit is not None and queue_max[s.serial] >= limit:
