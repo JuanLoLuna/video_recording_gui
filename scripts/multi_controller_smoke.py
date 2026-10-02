@@ -27,7 +27,9 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import threading
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -124,6 +126,48 @@ def check_videos(args, p, report) -> tuple[list[str], list[str]]:
     return problems, lines
 
 
+class StopHeartbeat:
+    """While the cameras are being stopped, say what each one is waiting for.
+
+    Stopping closes the last segment of every camera and can take a while (a
+    grey 60 fps run leaves ~30 GB to close); a rig run once printed nothing
+    after the last progress line and there was no way to tell where it was.
+    This prints, every few seconds, whether each camera is still recording and
+    how many frames/segments are still queued, so a hang names its own cause.
+    """
+
+    def __init__(self, slots, interval_s: float = 5.0, out=None) -> None:
+        self.slots = slots
+        self.interval_s = interval_s
+        self.out = out or (lambda message: print(message, flush=True))
+        self._done = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._started_at = time.monotonic()
+
+    def start(self) -> "StopHeartbeat":
+        self._started_at = time.monotonic()
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._done.set()
+        self._thread.join(timeout=2.0)
+
+    def snapshot(self) -> str:
+        parts = []
+        for slot in self.slots:
+            c = slot.controller
+            parts.append(
+                f"#{slot.serial}: recording={c.recording_active} acquiring={c.acquiring} "
+                f"appendQ={c._append_queue.qsize()} closerQ={c._closer_queue.unfinished_tasks}"
+            )
+        return " | ".join(parts)
+
+    def _run(self) -> None:
+        while not self._done.wait(self.interval_s):
+            self.out(f"  ...still stopping after {time.monotonic() - self._started_at:.0f}s: {self.snapshot()}")
+
+
 class _Tee:
     """Write to the console and to a log file, so a run can be shared as text."""
 
@@ -169,13 +213,20 @@ def main() -> int:
     # killed, hangs or crashes still leaves everything it said (a block-buffered
     # file loses the final results exactly when they matter most).
     with open(log_path, "w", encoding="utf-8", buffering=1) as log_file:
-        real_stdout = sys.stdout
+        real_stdout, real_stderr = sys.stdout, sys.stderr
         sys.stdout = _Tee(real_stdout, log_file)
+        sys.stderr = _Tee(real_stderr, log_file)
         try:
             print(f"(saving this output to {log_path})")
-            return _main_with_args(args)
+            try:
+                return _main_with_args(args)
+            except Exception:
+                # Into the log as well as the console: a crash must not leave a
+                # log that simply stops.
+                traceback.print_exc()
+                return 1
         finally:
-            sys.stdout = real_stdout
+            sys.stdout, sys.stderr = real_stdout, real_stderr
 
 
 def _main_with_args(args) -> int:
@@ -288,15 +339,21 @@ def run_session(args, slots, group) -> int:
     # stop_all() always joins the writer queue, so the depth must be read first:
     # a queue that never drained would otherwise look like 0 here.
     depth_at_end = {s.serial: s.controller._append_queue.qsize() for s in slots}
+    print("capture finished; stopping the cameras (this closes the last segments)...", flush=True)
     t_stop = time.monotonic()
-    stopped = group.stop_all()
-    print(f"stop_all: ok={stopped.ok} in {time.monotonic() - t_stop:.1f}s {stopped.message}")
+    heartbeat = StopHeartbeat(slots).start()
+    try:
+        stopped = group.stop_all()
+    finally:
+        heartbeat.stop()
+    print(f"stop_all: ok={stopped.ok} in {time.monotonic() - t_stop:.1f}s {stopped.message}", flush=True)
     final_stats = {s.serial: s.controller.get_acquisition_stats() for s in slots}
 
     print("\n" + "=" * 90)
     all_ok = stopped.ok
     for s in slots:
         p = paths[s.serial]
+        print(f"verifying #{s.serial} (decoding its video)...", flush=True)
         report = verify_camera_outputs(
             p.metadata_csv, p.segments_csv, p.events_jsonl,
             expect_stem=p.stem, expect_serial=s.serial, expected_fps=fps_by[s.serial],

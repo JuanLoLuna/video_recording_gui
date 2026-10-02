@@ -94,6 +94,26 @@ class SmokeScriptTests(unittest.TestCase):
         self.assertEqual(code, 2, text)
         self.assertIn("refusing to run", text)
 
+    def test_a_crash_is_written_to_the_log_file_with_the_phase_markers(self):
+        # A crash after the cameras started must leave its traceback in the log.
+        module = load_smoke()
+        module.check_videos = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("decode exploded"))
+        out = io.StringIO()
+        old_argv = sys.argv
+        sys.argv = ["x", "--seconds", "2.0", "--segment-seconds", "1", "--output-dir", self.tmp.name,
+                    "--codec", "grey"]
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                code = module.main()
+        finally:
+            sys.argv = old_argv
+        self.assertEqual(code, 1)
+        log = sorted(Path(self.tmp.name).glob("smoke_log_*.txt"))[0].read_text(encoding="utf-8")
+        self.assertIn("Traceback", log)
+        self.assertIn("decode exploded", log)
+        self.assertIn("capture finished; stopping the cameras", log)
+        self.assertIn("verifying #", log)
+
     def test_the_log_file_holds_the_final_result_and_is_written_line_by_line(self):
         code, text = self.run_script("--codec", "grey")
         logs = sorted(Path(self.tmp.name).glob("smoke_log_*.txt"))
@@ -184,6 +204,51 @@ class QueueLimitTests(unittest.TestCase):
         # Run 150639: a retried writer open queued 7 frames at 60 fps (~0.12 s), nothing lost.
         module = load_smoke()
         self.assertLess(7, module.queue_limit("mjpg", 59.98))
+
+
+class StopHeartbeatTests(unittest.TestCase):
+    class Controller:
+        recording_active = True
+        acquiring = True
+
+        class _Q:
+            def __init__(self, n):
+                self.n = n
+                self.unfinished_tasks = n
+
+            def qsize(self):
+                return self.n
+
+        def __init__(self):
+            self._append_queue = self._Q(3)
+            self._closer_queue = self._Q(1)
+
+    def test_it_names_what_each_camera_is_waiting_for(self):
+        from types import SimpleNamespace
+
+        module = load_smoke()
+        lines = []
+        beat = module.StopHeartbeat(
+            [SimpleNamespace(serial="111", controller=self.Controller())], interval_s=0.05, out=lines.append
+        ).start()
+        import time
+
+        time.sleep(0.3)
+        beat.stop()
+        self.assertGreaterEqual(len(lines), 2)
+        self.assertIn("still stopping after", lines[0])
+        self.assertIn("#111: recording=True acquiring=True appendQ=3 closerQ=1", lines[0])
+
+    def test_it_stays_silent_when_the_stop_is_quick(self):
+        from types import SimpleNamespace
+
+        module = load_smoke()
+        lines = []
+        beat = module.StopHeartbeat(
+            [SimpleNamespace(serial="111", controller=self.Controller())], interval_s=5.0, out=lines.append
+        ).start()
+        beat.stop()
+        self.assertEqual(lines, [])
 
 
 if __name__ == "__main__":

@@ -2,21 +2,23 @@
 
 The box is only a suggestion; the user can always change it before recording.
 
-  - One camera: MJPEG at or below 30 fps, uncompressed above that. Measured on
-    the rig (plain FFMPEG MJPG, ~42 dB PSNR, 3-8 ms/frame); the study's existing
-    video is MJPEG as well.
-  - Several cameras: uncompressed (GREY) at every rate by default. Two cameras
-    with MJPEG passed the writer-stage probe at 30 and 60 fps, but the full
-    recording stack (controllers, rotation, fault recovery, GUI) has so far only
-    been run on the rig with uncompressed video. Raise
-    MULTI_CAMERA_MJPEG_MAX_FPS (e.g. to 30.0) once that run has passed.
+  - MJPEG at or below 30 fps, uncompressed above that, for one camera AND for
+    several. Measured on the rig (plain FFMPEG MJPG, ~42 dB PSNR, 3-8 ms/frame;
+    the study's existing video is MJPEG as well).
+  - Several cameras were held back at "uncompressed" until MJPEG passed the full
+    recorder (controllers, rotation, fault recovery, GUI) with two cameras. It
+    did on 2026-10-02: 10 min at 30 fps, 5 min at 60 fps, and an unplug/replug
+    fault run, all with the video decoded and checked afterwards. Set
+    MULTI_CAMERA_MJPEG_MAX_FPS back to None to make "uncompressed" the default
+    again for several cameras.
 """
 
 from __future__ import annotations
 
 ONE_CAMERA_MJPEG_MAX_FPS = 30.0
 # None = never suggest MJPEG when several cameras record (it can still be ticked).
-MULTI_CAMERA_MJPEG_MAX_FPS: float | None = None
+# 30.0 since the two-camera MJPEG validation of 2026-10-02.
+MULTI_CAMERA_MJPEG_MAX_FPS: float | None = 30.0
 
 
 def mjpeg_max_fps(camera_count: int) -> float | None:
@@ -34,8 +36,7 @@ def describe_policy(camera_count: int) -> str:
     limit = mjpeg_max_fps(camera_count)
     if limit is None:
         return (
-            "With several cameras the default is uncompressed at every frame rate "
-            "(MJPEG has not yet been validated for them in the full recorder). "
+            "With several cameras the default is uncompressed at every frame rate. "
             "Tick the box to use MJPEG: much smaller files, fixed quality. "
             "Locked while recording."
         )
