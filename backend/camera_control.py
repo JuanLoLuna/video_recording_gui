@@ -379,10 +379,6 @@ class CameraController:
         # this be turned on deliberately, with a live append_ms-based
         # warning if it turns out too slow for the chosen fps.
         self._use_compression = False
-        # cv2.VIDEOWRITER_PROP_QUALITY (0-100); matches PySpin's old
-        # MJPGOption.quality default. Only meaningful while _use_compression
-        # is True -- see _open_segment_writer.
-        self._compression_quality = 75
         self.recording_fps = 30.0
         # Target acquisition frame rate (fps). Applied in start(); can be changed
         # live via set_frame_rate(). recording_fps follows it so AVI playback
@@ -1011,9 +1007,10 @@ class CameraController:
         constructor stays on FFMPEG. See scripts/multi_camera_probe.py
         (--no-quality-param) for the comparison.
 
-        Consequence: `_compression_quality` is not applied to the encoder
-        right now -- MJPEG quality is FFMPEG's default until a way to set it
-        that keeps the FFMPEG backend is found.
+        MJPEG quality is therefore FFMPEG's fixed default. It cannot be set on
+        this path (writer.set(VIDEOWRITER_PROP_QUALITY) returns False and the
+        file size is unchanged), so the app has no quality control. Measured on
+        these cameras: about 42 dB PSNR, 10-14x smaller than raw.
         """
         writer = cv2.VideoWriter(
             str(path), fourcc, self.recording_fps, (width, height), isColor=is_color
@@ -2198,20 +2195,6 @@ class CameraController:
         if self.recording_active:
             return False
         self._use_compression = bool(enabled)
-        return True
-
-    def get_compression_quality(self) -> int:
-        return self._compression_quality
-
-    def set_compression_quality(self, quality: int) -> bool:
-        """MJPEG quality (0-100, higher = larger/better). Same timing and
-        refusal-while-recording as set_compression_enabled -- it only
-        takes effect on the next segment writer opened, and changing the
-        currently-open one isn't possible.
-        """
-        if self.recording_active:
-            return False
-        self._compression_quality = max(0, min(100, int(quality)))
         return True
 
     def get_device_link_throughput_limit(self) -> tuple[int, int] | None:

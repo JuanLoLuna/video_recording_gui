@@ -51,11 +51,24 @@ def check_videos(args, p, report) -> tuple[list[str], list[str]]:
     with open(p.segments_csv, newline="", encoding="utf-8") as handle:
         manifest = {row["segment_file"]: int(row["frame_count"]) for row in csv.DictReader(handle)}
     problems, lines = [], []
-    for index in sorted({0, max(0, report.segment_count - 1)}):
+    # A run that stops exactly on a rotation boundary leaves a final segment with
+    # no frames (e.g. 5400 frames at 600 per segment = 9 full segments + an empty
+    # 10th). That is legitimate, so check the first and last NON-EMPTY segment.
+    non_empty = [i for i in range(report.segment_count) if manifest.get(p.video_final(i).name, 0) > 0]
+    empty = report.segment_count - len(non_empty)
+    if empty:
+        lines.append(f"{empty} empty segment(s) with 0 frames (stopped on a rotation boundary) -- not decoded")
+    if not non_empty:
+        problems.append("no segment contains any frames")
+        return problems, lines
+    for index in sorted({non_empty[0], non_empty[-1]}):
         path = p.video_final(index)
         info = verify_avi.scan_video(str(path), stride=args.video_stride)
         if not info["opened"]:
             problems.append(f"{path.name} cannot be opened/decoded")
+            continue
+        if not info["checked"]:
+            problems.append(f"{path.name} decoded no frames (segments.csv says {manifest.get(path.name)})")
             continue
         per_frame = info["file_size"] / max(1, info["decoded"]) / 1024
         lines.append(

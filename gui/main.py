@@ -26,7 +26,6 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSlider,
     QDoubleSpinBox,
-    QSpinBox,
     QFrame,
     QMessageBox,
     QFileDialog,
@@ -84,18 +83,15 @@ from backend.power_keepalive import (
     release_keep_awake,
 )
 
+from backend.compression_policy import describe_policy, suggested_compression
 from backend.sustained import SustainedCondition
 from gui.camera_preview import CameraPreviewTile, frame_to_qimage
 
 SYNC_WIDTH_RECORD = 0.100  # 100 ms
 
-# Suggested default for the "Compress recordings (MJPEG)" checkbox: fps at
-# or below this defaults it ON. Chosen with margin over the ~21-22ms/frame
-# MJPEG cost profiled for cv2.VideoWriter's MJPG codec on one test machine
-# (33.3ms period at 30fps vs. that ~22ms) -- a starting suggestion, not an
-# enforced limit, since actual cost is hardware-dependent (see
-# _apply_compression_default_for_fps / the live append_queue_depth warning).
-COMPRESSION_DEFAULT_MAX_FPS = 30.0
+# The "Compress recordings (MJPEG)" checkbox is pre-selected by
+# backend/compression_policy.py (one camera: MJPEG up to 30 fps; several cameras:
+# uncompressed until MJPEG is validated for them). A suggestion, never a limit.
 
 # append_queue_depth at/above which the live compression warning fires
 # (see _sample_preview_diagnostics). Chosen over an append_ms-percentile
@@ -437,22 +433,15 @@ class MainWindow(QWidget):
         # see _apply_exposure_auto_lock_for_fps.
         self._exposure_auto_locked = False
         self.compression_checkbox = QCheckBox("Compress recordings (MJPEG)")
+        self.compression_checkbox.setToolTip(
+            "MJPEG at a fixed quality (about 42 dB PSNR measured on these cameras; the "
+            "study's existing video is MJPEG too). Unticked = uncompressed 8-bit "
+            "grayscale: lossless, but roughly 10-14x larger and needs a fast disk."
+        )
         self.compression_checkbox.setEnabled(False)
         self.compression_checkbox.toggled.connect(self._on_compression_toggled)
         fps_row.addWidget(self.compression_checkbox)
 
-        # Quality only means anything for MJPEG -- enabled alongside the
-        # checkbox, not independently of it.
-        self.compression_quality_spin = QSpinBox()
-        self.compression_quality_spin.setRange(1, 100)
-        self.compression_quality_spin.setValue(75)
-        self.compression_quality_spin.setSuffix("%")
-        self.compression_quality_spin.setEnabled(False)
-        self.compression_quality_spin.setToolTip(
-            "MJPEG quality -- higher means larger files and less compression artifacting."
-        )
-        self.compression_quality_spin.valueChanged.connect(self._on_compression_quality_changed)
-        fps_row.addWidget(self.compression_quality_spin)
         fps_row.addStretch(1)
         setup_inner.addLayout(fps_row)
 
@@ -463,11 +452,7 @@ class MainWindow(QWidget):
         self.frame_rate_hint.setStyleSheet("color: #555; font-size: 11px;")
         setup_inner.addWidget(self.frame_rate_hint)
 
-        self.compression_hint = QLabel(
-            f"Suggested on below ~{COMPRESSION_DEFAULT_MAX_FPS:.0f} fps: much "
-            "smaller files, but the encoding cost can cap achievable frame "
-            "rate on slower hardware. Locked while recording."
-        )
+        self.compression_hint = QLabel(describe_policy(1))
         self.compression_hint.setWordWrap(True)
         self.compression_hint.setStyleSheet("color: #555; font-size: 11px;")
         setup_inner.addWidget(self.compression_hint)
@@ -1296,17 +1281,6 @@ class MainWindow(QWidget):
             self.compression_checkbox.blockSignals(True)
             self.compression_checkbox.setChecked(not checked)
             self.compression_checkbox.blockSignals(False)
-        self._update_compression_quality_spin_enabled()
-
-    def _on_compression_quality_changed(self, value: int) -> None:
-        if not self.compression_quality_spin.isEnabled():
-            return
-        self._call_on_all_cameras("set_compression_quality", value)
-
-    def _update_compression_quality_spin_enabled(self) -> None:
-        self.compression_quality_spin.setEnabled(
-            self.compression_checkbox.isEnabled() and self.compression_checkbox.isChecked()
-        )
 
     def _apply_compression_default_for_fps(self, fps: float) -> None:
         """Suggest compression on/off based on fps -- a starting point
@@ -1314,15 +1288,13 @@ class MainWindow(QWidget):
         session, their choice sticks and this stops overriding it.
         """
         if self._compression_manually_set:
-            self._update_compression_quality_spin_enabled()
             return
-        desired = fps <= COMPRESSION_DEFAULT_MAX_FPS
+        desired = suggested_compression(max(1, len(self._slots())), fps)
         if self.compression_checkbox.isChecked() != desired:
             if self._set_compression_on_all(desired):
                 self.compression_checkbox.blockSignals(True)
                 self.compression_checkbox.setChecked(desired)
                 self.compression_checkbox.blockSignals(False)
-        self._update_compression_quality_spin_enabled()
 
     def _apply_exposure_auto_lock_for_fps(self, fps: float) -> None:
         """Force Exposure mode to Off and lock the dropdown at/above
@@ -1364,7 +1336,6 @@ class MainWindow(QWidget):
         # the next segment writer opens, not mid-recording.
         if hasattr(self, "compression_checkbox"):
             self.compression_checkbox.setEnabled(self.state == AppState.PREVIEWING)
-            self._update_compression_quality_spin_enabled()
 
     def _update_camera_tuning_widgets_enabled(self) -> None:
         if not self._slider_meta:
@@ -1574,12 +1545,16 @@ class MainWindow(QWidget):
                 r.slot.controller.set_compression_enabled(previous[r.slot.serial])
         return False
 
+    def _refresh_compression_hint(self) -> None:
+        self.compression_hint.setText(describe_policy(max(1, len(self._slots()))))
+
     def _clear_camera_group(self) -> None:
         self.cameras = None
         self._slot_rt = {}
         self._tuning_serial = None
         self.tuning_camera_row.setVisible(False)
         self._rebuild_preview_tiles()
+        self._refresh_compression_hint()
 
     def _install_camera_group(self, selection) -> None:
         slots = [
@@ -1604,6 +1579,7 @@ class MainWindow(QWidget):
         )
         self.tuning_camera_combo.blockSignals(False)
         self.tuning_camera_row.setVisible(len(slots) > 1)
+        self._refresh_compression_hint()
 
     def _rebuild_preview_tiles(self) -> None:
         """One tile (and one diagnostics accumulator + logger) per camera."""
@@ -1817,9 +1793,6 @@ class MainWindow(QWidget):
             # Fresh session: let the fps-based default pick the checkbox
             # again rather than carrying over a manual choice from before.
             self._compression_manually_set = False
-            self.compression_quality_spin.blockSignals(True)
-            self.compression_quality_spin.setValue(self.camera.get_compression_quality())
-            self.compression_quality_spin.blockSignals(False)
             self._sync_auto_mode_combos_from_camera()
             self._sync_image_sliders_from_camera()
             self._sync_frame_rate_from_camera()

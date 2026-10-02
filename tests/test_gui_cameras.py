@@ -232,6 +232,40 @@ class MainWindowCameraTests(unittest.TestCase):
         window._on_compression_toggled(False)
         self.assertFalse(any(s.controller.get_compression_enabled() for s in window.cameras.slots))
 
+    def test_one_camera_defaults_to_mjpeg_at_30_fps(self):
+        window = self.previewing(FIREFLY)
+        self.assertTrue(window.compression_checkbox.isChecked())
+        self.assertTrue(window.camera.get_compression_enabled())
+        self.assertIn("30 fps", window.compression_hint.text())
+
+    def test_two_cameras_default_to_uncompressed_even_at_30_fps(self):
+        window = self.previewing(BLACKFLY, FIREFLY)
+        self.assertFalse(window.compression_checkbox.isChecked())
+        self.assertFalse(any(s.controller.get_compression_enabled() for s in window.cameras.slots))
+        self.assertIn("several cameras", window.compression_hint.text())
+
+    def test_the_user_can_still_choose_mjpeg_with_two_cameras_and_it_sticks(self):
+        window = self.previewing(BLACKFLY, FIREFLY)
+        window.compression_checkbox.setChecked(True)  # a real click path -> toggled signal
+        self.assertTrue(all(s.controller.get_compression_enabled() for s in window.cameras.slots))
+        # A later frame-rate change must not override the user's choice.
+        window.frame_rate_spin.setValue(25.0)
+        self.assertTrue(all(s.controller.get_compression_enabled() for s in window.cameras.slots))
+
+    def test_there_is_no_quality_control_because_it_never_did_anything(self):
+        window = self.window(FIREFLY)
+        self.assertFalse(hasattr(window, "compression_quality_spin"))
+        self.assertFalse(hasattr(window.camera, "set_compression_quality"))
+
+    def test_the_two_camera_default_can_be_raised_without_touching_the_gui(self):
+        import backend.compression_policy as policy
+
+        previous = policy.MULTI_CAMERA_MJPEG_MAX_FPS
+        self.addCleanup(lambda: setattr(policy, "MULTI_CAMERA_MJPEG_MAX_FPS", previous))
+        policy.MULTI_CAMERA_MJPEG_MAX_FPS = 30.0
+        window = self.previewing(BLACKFLY, FIREFLY)
+        self.assertTrue(window.compression_checkbox.isChecked())
+
     def test_a_codec_change_one_camera_refuses_is_undone_on_the_others(self):
         window = self.previewing(BLACKFLY, FIREFLY)
         window._on_compression_toggled(False)

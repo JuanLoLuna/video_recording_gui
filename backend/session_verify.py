@@ -248,12 +248,16 @@ def verify_camera_outputs(
             report.max_capture_gap_row = frame_index  # the first frame after the pause
     if len(times) > 1 and times[-1] > times[0]:
         report.effective_fps = (len(times) - 1) / (times[-1] - times[0])
+        # Allow two frames of end effect on top of the stated tolerance: over a
+        # 180 s run that is ~0.04% (the tolerance dominates), but a 2 s run is
+        # +-1 frame = 1.5% by construction and must not fail on rounding.
+        tolerance = max(fps_tolerance, 2.0 / len(times))
         if (
             expected_fps
             and report.timeline_breaks == 0
-            and report.effective_fps < expected_fps * (1.0 - fps_tolerance)
+            and report.effective_fps < expected_fps * (1.0 - tolerance)
         ):
             problems.append(
-                f"effective {report.effective_fps:.3f} fps < {expected_fps:.3f} fps (-{fps_tolerance * 100:.1f}%)"
+                f"effective {report.effective_fps:.3f} fps < {expected_fps:.3f} fps (-{tolerance * 100:.1f}%)"
             )
     return report

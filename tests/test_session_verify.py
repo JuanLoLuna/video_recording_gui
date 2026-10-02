@@ -212,11 +212,19 @@ class VerifyCameraOutputsTests(unittest.TestCase):
         self.assertTrue(any("does not belong to stem" in p for p in report.problems))
 
     def test_a_slow_effective_rate_is_flagged_only_without_a_fault(self):
-        slow = self.verify(fps=29.0, expected_fps=30.0)
+        slow = self.verify(frames_per_segment=(300, 300), fps=29.0, expected_fps=30.0)
         self.assertTrue(any("fps" in p for p in slow.problems))
         # A timeline break legitimately explains a lower average rate.
-        faulted = self.verify(fps=29.0, expected_fps=30.0, break_after_row=2)
+        faulted = self.verify(frames_per_segment=(300, 300), fps=29.0, expected_fps=30.0, break_after_row=2)
         self.assertFalse(any("effective" in p for p in faulted.problems))
+
+    def test_a_very_short_run_gets_two_frames_of_slack(self):
+        # 76 frames in 2.5 s: one frame short is -1.3%, which is rounding, not a fault.
+        ok = self.verify(frames_per_segment=(38, 38), fps=29.6, expected_fps=30.0)
+        self.assertFalse(any("effective" in p for p in ok.problems), ok.problems)
+        # ...but a genuinely slow short run is still caught.
+        slow = self.verify(frames_per_segment=(38, 38), fps=24.0, expected_fps=30.0)
+        self.assertTrue(any("effective" in p for p in slow.problems))
 
 
 if __name__ == "__main__":
