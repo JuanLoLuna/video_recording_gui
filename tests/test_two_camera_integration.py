@@ -199,7 +199,11 @@ class TwoCameraRecordingTests(unittest.TestCase):
             self.assertEqual(report.timeline_breaks, 0)
             for index in range(report.segment_count):
                 self.assertTrue(p.video_final(index).exists(), p.video_final(index).name)
-            self.assertEqual(list(p.incomplete_dir.glob("*")), [])
+            self.assertEqual([f for f in p.incomplete_dir.glob("*") if f.is_file()], [])
+        # Each camera staged in its own folder: the second one inside .incomplete.
+        other = paths["26134271"]
+        self.assertTrue(other.incomplete_dir.is_dir())
+        self.assertNotEqual(other.incomplete_dir, paths["23227865"].incomplete_dir)
 
     def test_each_camera_writes_only_its_own_files_with_its_own_names(self):
         paths = self.record(1.5)
