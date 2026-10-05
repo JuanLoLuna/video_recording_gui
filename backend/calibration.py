@@ -733,6 +733,42 @@ def check_reference(saved_R, saved_t, saved_rms_px: float, live: BoardPose, cfg:
                           suspect=live.rms_px > limit)
 
 
+def diagnose_frame(frame: np.ndarray, boards: dict) -> dict:
+    """Why a board is (not) detected in one frame: plain numbers for a support report.
+
+    boards: name -> BoardConfig. Per board: markers of its dictionary found
+    (all, and those that belong to this board), their median side in pixels,
+    square-ish candidates the marker decoder rejected (many = markers seen but
+    too small/blurred/oblique to read), and ChArUco corners found. Per frame:
+    brightness and the fraction of saturated pixels (glare).
+    """
+    gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    out = {
+        "image_size": [int(gray.shape[1]), int(gray.shape[0])],
+        "mean_brightness": round(float(gray.mean()), 1),
+        "saturated_fraction": round(float((gray >= 250).mean()), 4),
+        "boards": {},
+    }
+    for name, cfg in boards.items():
+        dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, cfg.dictionary))
+        corners, ids, rejected = cv2.aruco.ArucoDetector(dictionary).detectMarkers(gray)
+        ids = [] if ids is None else [int(i) for i in ids.reshape(-1)]
+        own = set(range(cfg.first_marker_id, cfg.first_marker_id + cfg.marker_count))
+        sides = [float(np.mean(np.linalg.norm(c.reshape(4, 2) - np.roll(c.reshape(4, 2), 1, axis=0), axis=1)))
+                 for c, i in zip(corners, ids) if i in own]
+        det = BoardDetector(cfg).detect(gray)
+        out["boards"][name] = {
+            "markers_of_this_dictionary": len(ids),
+            "markers_of_this_board": sum(i in own for i in ids),
+            "board_markers_total": cfg.marker_count,
+            "median_marker_side_px": round(float(np.median(sides)), 1) if sides else None,
+            "rejected_candidates": 0 if rejected is None else len(rejected),
+            "charuco_corners": int(len(det.ids)),
+            "usable": bool(det.ok),
+        }
+    return out
+
+
 def best_detection(dets: dict) -> tuple[str, Detection] | None:
     """(name, detection) of the usable detection with the most corners, e.g. which reference board a camera sees."""
     usable = [(name, d) for name, d in dets.items() if d is not None and d.ok]

@@ -226,6 +226,26 @@ class SessionSetupTests(unittest.TestCase):
             box.setChecked(True)
         self.assertFalse(cw.setup_check_next.isEnabled())
 
+    def test_diagnosis_snapshot_writes_frames_and_a_report(self):
+        import json
+        window = self.main_window()
+        window._open_calibration_window()
+        cw = window._calibration_window
+        cw.setup_button.click()
+        for box in cw.setup_checks:
+            box.setChecked(True)
+        cw.setup_check_next.click()
+        self.assertTrue(pump_until(cw.setup_capture_button.isEnabled, timeout=10))
+        cw.setup_snapshot_button.click()
+        folders = list((window._calibration_store.root / "diagnostics").iterdir())
+        self.assertEqual(len(folders), 1)
+        names = sorted(p.name for p in folders[0].iterdir())
+        self.assertEqual(names, sorted([f"{FIREFLY[0]}.png", f"{BLACKFLY[0]}.png", "report.json", "report.txt"]))
+        report = json.loads((folders[0] / "report.json").read_text())
+        self.assertTrue(report["cameras"][FIREFLY[0]]["boards"]["A"]["usable"])
+        self.assertIn("Snapshot saved", cw.setup_text.text())
+        self.assertIn("A: markers", (folders[0] / "report.txt").read_text())
+
     def test_closing_during_setup_stops_the_workers(self):
         window = self.main_window()
         window._open_calibration_window()

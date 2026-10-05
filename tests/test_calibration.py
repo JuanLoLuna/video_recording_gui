@@ -538,5 +538,22 @@ class ReferenceCheckTest(unittest.TestCase):
         self.assertTrue(check.suspect or check.moved, (check.rms_px, check.move))
 
 
+class DiagnoseFrameTest(unittest.TestCase):
+    def test_reports_why_a_board_is_or_is_not_usable(self):
+        A = cal.BOARD_PRESETS[cal.HANDHELD_PRESET]
+        B1 = cal.BOARD_PRESETS[cal.REFERENCE_PRESETS[0]]
+        near = render_scene([(A, *pose_looking_at_board(0.6, (10, 0, 0), cfg=A))], D=np.zeros(5))
+        report = cal.diagnose_frame(near, {"A": A, "B1": B1})
+        a = report["boards"]["A"]
+        self.assertTrue(a["usable"])
+        self.assertEqual(a["markers_of_this_board"], A.marker_count)
+        self.assertAlmostEqual(a["median_marker_side_px"], K_TRUE[0, 0] * A.marker_length_m / 0.6, delta=4)
+        self.assertEqual(report["boards"]["B1"]["markers_of_this_board"], 0)
+        self.assertEqual(report["image_size"], [720, 540])
+        # Far and nearly edge-on: markers too small to read.
+        far = render_scene([(A, *pose_looking_at_board(2.2, (72, 0, 0), cfg=A))], D=np.zeros(5))
+        self.assertFalse(cal.diagnose_frame(far, {"A": A})["boards"]["A"]["usable"])
+
+
 if __name__ == "__main__":
     unittest.main()

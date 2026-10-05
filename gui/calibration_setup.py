@@ -16,8 +16,11 @@ _go() and _detector bookkeeping conventions.
 
 from __future__ import annotations
 
+import json
 import time
+from datetime import datetime
 
+import cv2
 import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap
@@ -57,6 +60,7 @@ class SetupTaskMixin:
         self._setup_detectors: dict[str, _Detector] = {}
         self._setup_last_seq: dict[str, int] = {}
         self._setup_latest: dict[str, dict] = {}       # serial -> {name: Detection} of the newest frame
+        self._setup_frames: dict = {}                   # serial -> newest full-resolution frame (diagnosis)
         self._setup_collect: dict[str, list] | None = None  # serial -> [{name: Detection}] while capturing
         self._setup_collect_until = 0.0
         self._setup_collect_for = ""                    # "setup" | "verify"
@@ -172,6 +176,11 @@ class SetupTaskMixin:
         self.setup_back = QPushButton("Back")
         self.setup_back.clicked.connect(self._setup_go_back)
         nav.addWidget(self.setup_back)
+        self.setup_snapshot_button = QPushButton("Save snapshot for diagnosis")
+        self.setup_snapshot_button.setToolTip(
+            "Saves each camera's current frame and a report of what was detected, to send for help")
+        self.setup_snapshot_button.clicked.connect(self._save_setup_snapshot)
+        nav.addWidget(self.setup_snapshot_button)
         nav.addStretch(1)
         self.setup_capture_button = QPushButton("Capture setup")
         self.setup_capture_button.clicked.connect(lambda: self._setup_begin_collect("setup"))
@@ -305,6 +314,7 @@ class SetupTaskMixin:
             seq, frame, dets = latest
             self._setup_last_seq[slot.serial] = seq
             self._setup_latest[slot.serial] = dets
+            self._setup_frames[slot.serial] = frame
             changed = True
             if self._setup_collect is not None:
                 self._setup_collect[slot.serial].append(dets)
@@ -425,6 +435,40 @@ class SetupTaskMixin:
             lines.append("If it is high enough and still fails: go Back and capture the setup again; if it "
                          "keeps failing, recalibrate the cameras (a lens may have been touched).")
         self.setup_text.setText("\n".join(lines))
+
+    def _save_setup_snapshot(self) -> None:
+        """Full-resolution frame + detection report per camera, in <calibration dir>/diagnostics/<time>/."""
+        folder = self.store.root / "diagnostics" / datetime.now().strftime("%Y%m%d_%H%M%S")
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            report = {"created_at": datetime.now().isoformat(timespec="seconds"),
+                      "boards": {name: cfg.to_dict() for name, cfg in self._setup_boards.items()},
+                      "cameras": {}}
+            lines = []
+            for slot in self.slots:
+                frame = self._setup_frames.get(slot.serial)
+                if frame is None:
+                    report["cameras"][slot.serial] = {"label": slot.label, "frame": None}
+                    lines.append(f"{slot.label}: no frame yet")
+                    continue
+                image_name = f"{slot.serial}.png"
+                cv2.imwrite(str(folder / image_name), frame)
+                diag = cal.diagnose_frame(frame, self._setup_boards)
+                report["cameras"][slot.serial] = {"label": slot.label, "frame": image_name, **diag}
+                lines.append(f"{slot.label}: {diag['image_size'][0]}x{diag['image_size'][1]}, brightness "
+                             f"{diag['mean_brightness']}, saturated {diag['saturated_fraction'] * 100:.1f} %")
+                for name, b in diag["boards"].items():
+                    lines.append(
+                        f"  {_ref_label(name) if name != 'A' else 'A'}: markers {b['markers_of_this_board']}"
+                        f"/{b['board_markers_total']}, side {b['median_marker_side_px']} px, "
+                        f"rejected {b['rejected_candidates']}, corners {b['charuco_corners']}, "
+                        f"{'usable' if b['usable'] else 'NOT usable'}")
+            (folder / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+            (folder / "report.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except Exception as exc:
+            self.setup_text.setText(f"Could not save the snapshot: {exc}")
+            return
+        self.setup_text.setText(f"Snapshot saved to {folder} (send the whole folder).\n" + "\n".join(lines))
 
     # ------------------------------------------------------------------- save
     def _save_setup(self) -> None:
