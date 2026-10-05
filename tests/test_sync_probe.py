@@ -101,12 +101,26 @@ class AnalyseTest(unittest.TestCase):
         self.assertAlmostEqual(a["clock_drift_ppm_vs_laptop"], 10.0, delta=1.5)
         self.assertAlmostEqual(b["clock_drift_ppm_vs_laptop"], -20.0, delta=1.5)
         self.assertLess(a["arrival"]["latency_ms_p99"], 4.5)
+        self.assertAlmostEqual(a["achieved_fps"], fps / (1 + 10e-6), delta=1e-3)
 
         pair = result["pair"]
         self.assertAlmostEqual(pair["gap_ms_start"], 4.0, delta=0.3)
         # B runs 30 ppm faster than A on the host timeline: -1.8 ms/min.
         self.assertAlmostEqual(pair["drift_ms_per_min"], -1.8, delta=0.1)
         self.assertEqual(len(result["_offsets"]), len(fb))
+
+    def test_start_burst_does_not_skew_rate_or_jitter(self):
+        # Frames queued before the grab thread starts arrive together.
+        rng = random.Random(11)
+        fa, la = camera(30.0, 0.0, 10.0, 120, 0, rng)
+        burst_end = fa[15][0]
+        fa = [(max(h, burst_end), fid, t) for h, fid, t in fa]
+        result = sp.analyse([make_run("A", 30.0, fa, la), make_run("B", 30.0, fa, la)], 30.0)
+        cam = result["cameras"]["A"]
+        self.assertAlmostEqual(cam["achieved_fps"], 30.0, delta=1e-3)
+        self.assertLess(cam["arrival"]["latency_ms_max"], 5.0)
+        self.assertGreater(cam["arrival"]["start_burst_ms_max"], 400.0)
+
 
     def test_without_latch_falls_back_to_arrival(self):
         rng = random.Random(3)

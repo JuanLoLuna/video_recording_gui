@@ -190,17 +190,29 @@ def summarize_phase(offsets: list[tuple[float, float]], period_s: float) -> dict
     }
 
 
-def arrival_jitter_ms(host_arrivals: list[float], mapped: list[float]) -> dict:
+# Frames queued between BeginAcquisition and the grab thread starting arrive
+# in a burst; they say nothing about steady-state jitter, so they are reported
+# separately instead of setting the max.
+START_BURST_S = 2.0
+
+
+def arrival_jitter_ms(host_arrivals: list[float], mapped: list[float],
+                      start_burst_s: float = START_BURST_S) -> dict:
     """Host arrival minus exposure time (mapped camera clock): the pipeline latency."""
     lat = [(h - m) * 1e3 for h, m in zip(host_arrivals, mapped)]
     if not lat:
         return {}
-    base = min(lat)
+    t0 = host_arrivals[0]
+    steady = [x for x, h in zip(lat, host_arrivals) if h - t0 >= start_burst_s] or lat
+    base = min(steady)
+    burst = [x for x, h in zip(lat, host_arrivals) if h - t0 < start_burst_s]
     return {
-        "latency_ms_p50": percentile(lat, 0.5) - base,
-        "latency_ms_p99": percentile(lat, 0.99) - base,
-        "latency_ms_max": max(lat) - base,
-        "note": "relative to the fastest frame; spread = how noisy system_time is as a clock",
+        "latency_ms_p50": percentile(steady, 0.5) - base,
+        "latency_ms_p99": percentile(steady, 0.99) - base,
+        "latency_ms_max": max(steady) - base,
+        "start_burst_ms_max": (max(burst) - base) if burst else None,
+        "note": f"relative to the fastest frame, after the first {start_burst_s:g} s; "
+                "spread = how noisy system_time is as a clock",
     }
 
 
@@ -449,7 +461,12 @@ def analyse(runs: list[CamRun], fps: float) -> dict:
             "tick_ns_from_frames": tick_ns_from_frames(ticks, run.applied_fps),
             "last_error": run.last_error,
         }
-        if run.frames:
+        # Camera timestamps, not host arrival: the start burst shortens the
+        # host span and overstated the rate (Firefly read 30.003 at a real 29.989).
+        if len(ticks) >= 2 and ticks[-1] > ticks[0]:
+            tick_s = fit.slope if fit is not None else 1e-9
+            cam["achieved_fps"] = (len(ticks) - 1) / ((ticks[-1] - ticks[0]) * tick_s)
+        elif run.frames:
             span = run.frames[-1][0] - run.frames[0][0]
             cam["achieved_fps"] = (len(run.frames) - 1) / span if span > 0 else None
         if fit is not None:
@@ -581,7 +598,8 @@ def print_skew(result: dict) -> None:
         arr = cam.get("arrival") or {}
         if arr:
             print(f"    host arrival jitter (system_time as a clock): p50 {fmt(arr['latency_ms_p50'])} ms, "
-                  f"p99 {fmt(arr['latency_ms_p99'])} ms, max {fmt(arr['latency_ms_max'])} ms")
+                  f"p99 {fmt(arr['latency_ms_p99'])} ms, max {fmt(arr['latency_ms_max'])} ms; "
+                  f"start burst up to {fmt(arr.get('start_burst_ms_max'))} ms")
         if cam.get("latch_errors"):
             print(f"    !! {cam['latch_errors']} latch errors: {cam['last_error']}")
     pair = result.get("pair") or {}

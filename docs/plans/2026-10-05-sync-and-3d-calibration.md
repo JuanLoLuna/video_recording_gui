@@ -23,7 +23,7 @@ Two parts, done in this order: **A. Sync** (needed first; it also lets the per-s
 - **Q1 (blocks A3/A7):** wiring — primary/secondary cable (H1) or external pulse generator (H2)? Is the NI DAQ present in the kitchenette setup, and does it have a counter output? Would a small microcontroller (e.g. Pi Pico) be acceptable?
 - ~~Q2~~ answered: fixed board. Still open: where it goes (must be in both views, out of the hands' way, LED beside it).
 - **Q3 (blocks A1):** which GPIO cables do we have for the Firefly and the Blackfly S?
-- **Q4 (blocks A2):** is the LED-only result (frames aligned, exposures up to half a period apart, keypoints interpolated) good enough for the 3D hand analysis, or are simultaneous exposures required? Step 1 measures the numbers to decide.
+- **Q4 (blocks A2) — data in (see skew evidence):** is the LED-only result (frames aligned, exposures up to half a period apart, keypoints interpolated) good enough for the 3D hand analysis, or are simultaneous exposures required? Step 1 measures the numbers to decide.
 
 ## Facts from the code (relevant to this plan)
 
@@ -53,6 +53,28 @@ Consequences:
 - For H2 (external generator) both cameras can take an input: Blackfly Line0 (opto, tolerant of 5 V signals) or Line3; Firefly any of Line0–3 (check its input voltage range).
 - Firefly as a secondary has no overlap: exposure + readout must fit the period (fine at 60 fps with exposure ≤ ~14 ms).
 - `TimestampIncrement` differs (480 vs 1000); the `skew` run measures each camera's real tick length directly.
+
+## Rig evidence — `sync_probe.py skew`, 2026-10-05
+
+Both cameras free-running together, 10 min at 30 fps then 10 min at 60 fps. Raw data: Box `SmartSleeve/RawData/temp/sync_probe_20261005_131323/`. Numbers below are re-analysed with the corrected probe (achieved rate from camera timestamps, start burst excluded from jitter).
+
+| | 30 fps | 60 fps |
+|---|---|---|
+| Frame gaps / incomplete / errors (both cameras) | 0 / 0 / 0 | 0 / 0 / 0 |
+| Real frame rate, Firefly / Blackfly | 29.9887 / 29.9992 | 59.9774 / 59.9940 |
+| Gap between the cameras, median / p99 / max | 7.96 / 16.50 / 16.66 ms | 4.15 / 8.25 / 8.33 ms |
+| Gap drift | −20.9 ms/min: every possible gap every **1.6 min** | −16.6 ms/min: every gap every **1.0 min** |
+| Camera clock vs laptop (latch fit residual) | +4.7 / +5.1 ppm (59 / 116 µs) | +5.1 / +5.7 ppm (41 / 62 µs) |
+| `system_time` arrival jitter p50 / p99, Firefly / Blackfly | 1.9 / 3.8 ms, 1.7 / 2.2 ms | 1.8 / 3.7 ms, 1.8 / 2.3 ms |
+
+Findings:
+- **Acquisition is stable at 60 fps** for both cameras together (10 min, no gaps). The 60 min recorder runs with video writing are still to do.
+- **Timestamps are nanoseconds** (1.000005 ns per tick from the latch fit, 1.0000 from frame steps), confirming `timestamp_us` holds ns.
+- **The gap between the cameras is uniformly spread over the whole possible range** (median ≈ quarter period, max = half period). It is **not** crystal drift: the two camera clocks agree to < 1 ppm. It is the **Firefly's frame-rate setting**: it cannot hit 30.000 / 60.000 and runs ~0.035 % slow (29.988 / 59.976 applied), so the Blackfly slides through every phase every 1–1.6 min. Every recording therefore contains long stretches at the worst case.
+- **`system_time` is a poor clock for pairing** (ms-level jitter plus a 170–300 ms burst at start while queued frames arrive). Camera timestamps mapped through the latch fit (or the LED fit) are 40–120 µs.
+- **Q4 answer from the data:** without a trigger, half of all frame pairs are ≥ 8 ms apart at 30 fps (≥ 4 ms at 60 fps). Keypoints must be interpolated to common times, and fast hand motion between frames is the limit.
+
+New option this suggests (software, no wiring) — **S3, software phase lock:** because the camera clocks agree to < 1 ppm, the drift comes only from unequal rate settings. Periodically nudging the Blackfly's `AcquisitionFrameRate` (it has finer steps) using latch-mapped timestamps could hold the gap near 0. Expected accuracy is bounded by the Blackfly's rate step size and how cleanly it accepts live rate changes. Both are unmeasured: a rate change might drop or stretch a frame. It is still not simultaneous capture, and it adds a control loop to the recorder. Worth a short rig test only if wiring a trigger turns out to be impractical.
 
 ---
 
