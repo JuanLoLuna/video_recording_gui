@@ -1621,6 +1621,11 @@ class MainWindow(QWidget):
             self.calibration_status = None
             self.calibration_bar.show_idle()
             return
+        if len(slots) < 2:
+            # A one-camera setup behaves exactly as before 3D existed: neutral line, no snapshot file.
+            self.calibration_status = None
+            self.calibration_bar.show_idle("3D pose: needs two cameras")
+            return
         try:
             now = datetime.now()
             statuses = {}
@@ -1689,8 +1694,9 @@ class MainWindow(QWidget):
         window.activateWindow()
 
     def _calibration_window_finished(self, window) -> None:
-        if self._calibration_window is window:
-            self._calibration_window = None
+        if self._calibration_window is not window:
+            return  # closed by the app (Detect, recording start, replaced): the caller refreshes if it needs to
+        self._calibration_window = None
         self._refresh_calibration_status()
 
     def _close_calibration_window(self) -> None:
@@ -2036,9 +2042,6 @@ class MainWindow(QWidget):
             self._apply_state()
             return False
 
-        self._refresh_calibration_status()
-        self._write_calibration_snapshot(session_paths.output_dir / session_paths.basename)
-
         self._recording_warnings.reset(now_s=time.monotonic())
         self._update_recording_warning_banner()
         # (A camera that did not start is reported on every diagnostics tick by
@@ -2101,6 +2104,14 @@ class MainWindow(QWidget):
 
         self.state = AppState.RECORDING
         self._apply_state()
+
+        # Last, so the validated start path (start, diagnostics, mic, sync pulse) runs
+        # exactly as before: the status read touches the camera locks and the snapshot fsyncs.
+        try:
+            self._refresh_calibration_status()
+            self._write_calibration_snapshot(session_paths.output_dir / session_paths.basename)
+        except Exception as exc:  # informational only; the recording is already running
+            print(f"[calibration] status/snapshot at recording start failed: {exc}")
         return True
 
     def _stop_recording_session(self, status_message: str) -> None:

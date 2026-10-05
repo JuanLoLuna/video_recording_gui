@@ -115,10 +115,43 @@ class CalibrationStatusTests(unittest.TestCase):
         self.assertIn(cs.NO_SETUP, text)
         self.assertTrue(window.calibration_bar.calibrate_button.isEnabled())
 
-    def test_one_camera_needs_two(self):
+    def test_one_camera_is_neutral_and_writes_no_snapshot(self):
         window = self.window(FIREFLY)
         window.on_detect_clicked()
-        self.assertIn("needs two cameras", window.calibration_bar.label.text())
+        bar = window.calibration_bar
+        self.assertEqual(bar.label.text(), "3D pose: needs two cameras")
+        self.assertIn("#f7f7f7", bar.styleSheet())   # the grey idle style, not amber
+        self.assertNotIn("#fff3e0", bar.styleSheet())
+        self.preview(window)
+        pump(0.4)
+        self.assertTrue(window._begin_recording_session(bypass_confirmation=True))
+        pump(0.4)
+        window._stop_recording_session("stopped")
+        self.assertEqual(list(self.out_dir.glob("*_calibration.json")), [])
+        self.assertEqual(bar.label.text(), "3D pose: needs two cameras")
+
+    def test_status_and_snapshot_come_after_the_recording_has_started(self):
+        window = self.window(BLACKFLY, FIREFLY)
+        self.preview(window)
+        seen = []
+        refresh, write = window._refresh_calibration_status, window._write_calibration_snapshot
+        window._refresh_calibration_status = lambda: (seen.append(("refresh", window.state)), refresh())
+        window._write_calibration_snapshot = lambda p: (seen.append(("snapshot", window.state)), write(p))
+        pump(0.4)
+        self.assertTrue(window._begin_recording_session(bypass_confirmation=True))
+        self.assertEqual(seen, [("refresh", AppState.RECORDING), ("snapshot", AppState.RECORDING)])
+        pump(0.3)
+        window._stop_recording_session("stopped")
+
+    def test_a_failing_status_read_cannot_break_the_start(self):
+        window = self.window(BLACKFLY, FIREFLY)
+        self.preview(window)
+        window._refresh_calibration_status = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        pump(0.4)
+        self.assertTrue(window._begin_recording_session(bypass_confirmation=True))
+        self.assertEqual(window.state, AppState.RECORDING)
+        pump(0.3)
+        window._stop_recording_session("stopped")
 
     def test_ready_then_recording_carries_the_snapshot(self):
         window = self.window(BLACKFLY, FIREFLY)
