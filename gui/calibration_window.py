@@ -40,67 +40,16 @@ from PySide6.QtWidgets import (
 
 from backend import calibration as cal
 from backend.calibration_store import CalibrationStore, IntrinsicsRecord
+from gui.calibration_common import LIVE_VIEW_SIZE, _Detector, draw_overlay  # noqa: F401 (re-exported)
+from gui.calibration_setup import SetupTaskMixin
 from gui.camera_preview import frame_to_qimage
 
-DETECT_INTERVAL_S = 0.2       # worker: ~5 detections per second
 UI_INTERVAL_MS = 120
 NO_FRAMES_S = 1.5             # no new detection for this long while capturing = Preview stopped
-LIVE_VIEW_SIZE = (720, 540)
 
 _BIG = "font-size: 16px; font-weight: 600;"
 _HINT = "color: #555;"
 _ERROR = "color: #c62828; font-weight: 600;"
-
-
-class _Detector:
-    """Worker thread: latest frame of one camera -> board detection, a few times per second."""
-
-    def __init__(self, controller, detector: cal.BoardDetector) -> None:
-        self.controller = controller
-        self.detector = detector
-        self._lock = threading.Lock()
-        self._latest: tuple[int, np.ndarray, cal.Detection] | None = None
-        self._seq = 0
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, name="calibration-detector", daemon=True)
-        self._thread.start()
-
-    def _run(self) -> None:
-        while not self._stop.is_set():
-            started = time.monotonic()
-            frame = self.controller.get_latest_frame()
-            if frame is not None:
-                try:
-                    det = self.detector.detect(frame)
-                except Exception as exc:  # never let a bad frame kill the worker
-                    print(f"[calibration] detection failed: {exc}")
-                else:
-                    with self._lock:
-                        self._seq += 1
-                        self._latest = (self._seq, frame, det)
-            self._stop.wait(max(0.0, DETECT_INTERVAL_S - (time.monotonic() - started)))
-
-    def latest(self):
-        with self._lock:
-            return self._latest
-
-    def stop(self) -> None:
-        self._stop.set()
-        self._thread.join(timeout=2.0)
-
-
-def draw_overlay(frame: np.ndarray, det: cal.Detection | None, max_size=LIVE_VIEW_SIZE) -> np.ndarray:
-    """Downscaled BGR copy of the frame with the detected corners drawn."""
-    h, w = frame.shape[:2]
-    scale = min(max_size[0] / w, max_size[1] / h, 1.0)
-    small = cv2.resize(frame, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
-    if small.ndim == 2:
-        small = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
-    if det is not None and len(det.ids):
-        colour = (60, 200, 60) if det.ok else (0, 160, 255)
-        for x, y in det.corners * scale:
-            cv2.circle(small, (int(x), int(y)), 4, colour, -1, cv2.LINE_AA)
-    return small
 
 
 def write_board_pdf(path: str, cfg: cal.BoardConfig, label: str, dpi: int = 600) -> None:
@@ -145,7 +94,7 @@ def write_board_pdf(path: str, cfg: cal.BoardConfig, label: str, dpi: int = 600)
         raise OSError(f"{path} was not written")
 
 
-class CalibrationWindow(QDialog):
+class CalibrationWindow(SetupTaskMixin, QDialog):
     """Non-modal. `slots`: the main window's camera slots (serial, model, label, controller)."""
 
     def __init__(self, parent, slots: Sequence, store: CalibrationStore,
@@ -181,7 +130,8 @@ class CalibrationWindow(QDialog):
         self.page_check = self._build_checklist()
         self.page_capture = self._build_capture()
         self.page_result = self._build_result()
-        for page in (self.page_home, self.page_check, self.page_capture, self.page_result):
+        for page in (self.page_home, self.page_check, self.page_capture, self.page_result,
+                     *self._build_setup_pages()):
             self.stack.addWidget(page)
 
         self.ui_timer = QTimer(self)
@@ -202,8 +152,9 @@ class CalibrationWindow(QDialog):
             "3D pose needs two things:\n"
             "1. Each camera calibrated (lens and sensor). Once per camera, and again after anyone "
             "touches the lens or changes the camera's resolution.\n"
-            "2. The cameras set up for the session: where they are relative to the fixed board. "
-            "Every time a camera is moved.")
+            "2. The cameras set up for the session: where they are relative to each other, measured "
+            "from board A resting at its marked spot, and checked with board A raised on a box. "
+            "Every time a camera is moved; the reference boards B1/B2 tell the app whether one was.")
         intro.setWordWrap(True)
         v.addWidget(intro)
 
@@ -226,8 +177,7 @@ class CalibrationWindow(QDialog):
         v.addWidget(self.calibrate_camera_button)
         self.setup_button = QPushButton("2. Set up for this session…")
         self.setup_button.setMinimumHeight(40)
-        self.setup_button.setEnabled(False)
-        self.setup_button.setToolTip("Coming in the next step (fixed board setup and verification).")
+        self.setup_button.clicked.connect(self._open_setup)
         v.addWidget(self.setup_button)
 
         row = QHBoxLayout()
@@ -473,6 +423,9 @@ class CalibrationWindow(QDialog):
 
     def _tick(self) -> None:
         """GUI thread: take the newest detection, feed the capture session, redraw."""
+        if self.stack.currentWidget() is self.page_setup_live:
+            self._setup_tick()
+            return
         if self._detector is None or self._session is None:
             return
         latest = self._detector.latest()
@@ -690,6 +643,7 @@ class CalibrationWindow(QDialog):
         self.ui_timer.stop()
         self.compute_timer.stop()
         self._stop_detector()
+        self._stop_setup_detectors()
         self._pool.shutdown(wait=False, cancel_futures=True)
 
     def done(self, result: int) -> None:  # accept(), reject() and Esc all end here

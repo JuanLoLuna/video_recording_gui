@@ -61,6 +61,39 @@ def render_view_a4(cfg, R, t, K=K_TRUE, size=IMAGE_SIZE, ppm=BOARD_PX_PER_M):
     return img
 
 
+_BOARD_CACHE: dict = {}
+
+
+def render_scene(items, K=K_TRUE, D=D_TRUE, size=IMAGE_SIZE, background=90, ppm=2500.0):
+    """One camera image showing several boards: items = [(cfg, R, t)], board -> camera poses.
+
+    Later items are drawn over earlier ones; distortion is applied once to the
+    whole image, as a real lens would.
+    """
+    ideal = np.full((size[1], size[0]), background, np.uint8)
+    S = np.array([[1 / ppm, 0, 0.5 / ppm], [0, 1 / ppm, 0.5 / ppm], [0, 0, 1]])
+    for cfg, R, t in items:
+        if cfg not in _BOARD_CACHE:
+            _BOARD_CACHE[cfg] = np.where(cal.render_board(cfg, ppm) > 127, 230, 25).astype(np.uint8)
+        board = _BOARD_CACHE[cfg]
+        H = K @ np.column_stack([R[:, 0], R[:, 1], t]) @ S
+        warped = cv2.warpPerspective(board, H, size, flags=cv2.INTER_LINEAR, borderValue=background)
+        mask = cv2.warpPerspective(np.full_like(board, 255), H, size, flags=cv2.INTER_NEAREST, borderValue=0)
+        ideal[mask > 0] = warped[mask > 0]
+    if not np.any(D):
+        return ideal
+    w, h = size
+    grid = np.stack(np.meshgrid(np.arange(w), np.arange(h)), -1).reshape(-1, 1, 2).astype(np.float32)
+    und = cv2.undistortPoints(grid, K, D, P=K).reshape(h, w, 2)
+    return cv2.remap(ideal, und[..., 0], und[..., 1], cv2.INTER_LINEAR, borderValue=background)
+
+
+def in_camera(R_cam, t_cam, R_obj, t_obj):
+    """Pose of an object placed at (R_obj, t_obj) in the world (board A) frame, seen from a camera
+    whose world -> camera pose is (R_cam, t_cam)."""
+    return R_cam @ R_obj, R_cam @ t_obj + t_cam
+
+
 def varied_views(n=18, seed=0):
     rng = np.random.default_rng(seed)
     out = []
@@ -443,6 +476,66 @@ class CaptureSessionTest(unittest.TestCase):
     def test_outlier_views(self):
         self.assertEqual(cal.outlier_views([0.2, 0.25, 0.22, 0.9]), [3])
         self.assertEqual(cal.outlier_views([0.2, 0.9]), [])
+
+
+class MarkerIdRangeTest(unittest.TestCase):
+    def test_reference_boards_share_a_dictionary_but_not_ids(self):
+        b1, b2 = (cal.BOARD_PRESETS[n] for n in cal.REFERENCE_PRESETS)
+        self.assertEqual(b1.dictionary, b2.dictionary)
+        self.assertEqual((b1.first_marker_id, b2.first_marker_id), (0, 17))
+        self.assertEqual(cal.with_measured_square(b2, 35.0).first_marker_id, 17)
+        self.assertEqual(cal.BoardConfig.from_dict(b2.to_dict()), b2)
+        # A record saved before first_marker_id existed reads as ids from 0.
+        legacy = {k: v for k, v in b1.to_dict().items() if k != "first_marker_id"}
+        self.assertEqual(cal.BoardConfig.from_dict(legacy), b1)
+
+    def test_ids_must_fit_the_dictionary(self):
+        with self.assertRaises(ValueError):
+            cal.BoardConfig(7, 5, 0.036, 0.027, "DICT_4X4_50", 40)  # 40..56 > 49
+        with self.assertRaises(ValueError):
+            cal.BoardConfig(7, 5, 0.036, 0.027, "DICT_4X4_50", -1)
+
+    def test_each_reference_detector_sees_only_its_own_board(self):
+        b1, b2 = (cal.BOARD_PRESETS[n] for n in cal.REFERENCE_PRESETS)
+        img = render_scene([(b1, *pose_looking_at_board(0.9, (0, 0, 0), (-0.15, 0), b1)),
+                            (b2, *pose_looking_at_board(0.9, (0, 0, 0), (0.15, 0), b2))], D=np.zeros(5))
+        d1, d2 = cal.BoardDetector(b1).detect(img), cal.BoardDetector(b2).detect(img)
+        self.assertTrue(d1.ok and d2.ok)
+        self.assertLess(d1.corners[:, 0].max(), IMAGE_SIZE[0] / 2)
+        self.assertGreater(d2.corners[:, 0].min(), IMAGE_SIZE[0] / 2)
+        self.assertEqual(cal.best_detection({"B1": d1, "B2": None, "x": cal.Detection(
+            np.zeros((0, 2), np.float32), np.zeros(0, np.int32), 0, IMAGE_SIZE)})[0], "B1")
+        self.assertIsNone(cal.best_detection({"B1": None}))
+
+
+class ReferenceCheckTest(unittest.TestCase):
+    def setUp(self):
+        self.cfg = cal.BOARD_PRESETS[cal.REFERENCE_PRESETS[0]]
+        self.det = cal.BoardDetector(self.cfg)
+        self.R, self.t = pose_looking_at_board(0.9, (25, -10, 5), (0.05, 0.02), self.cfg)
+        self.saved = cal.solve_board_pose(self.det.detect(render_scene([(self.cfg, self.R, self.t)])),
+                                          self.det.board, K_TRUE, D_TRUE)
+
+    def live(self, R, t, K=K_TRUE):
+        return cal.solve_board_pose(self.det.detect(render_scene([(self.cfg, R, t)], K=K)), self.det.board, K_TRUE, D_TRUE)
+
+    def test_still_camera(self):
+        check = cal.check_reference(self.saved.R, self.saved.t, self.saved.rms_px, self.live(self.R, self.t), self.cfg)
+        self.assertFalse(check.moved)
+        self.assertFalse(check.suspect)
+
+    def test_turned_camera(self):
+        turn, _ = cv2.Rodrigues(np.radians([0, 2.0, 0]))  # the camera turned 2 degrees
+        check = cal.check_reference(self.saved.R, self.saved.t, self.saved.rms_px,
+                                    self.live(turn @ self.R, turn @ self.t), self.cfg)
+        self.assertTrue(check.moved)
+        self.assertAlmostEqual(check.move.rotation_deg, 2.0, delta=0.3)
+
+    def test_touched_lens_is_suspect(self):
+        zoomed = K_TRUE * np.array([[1.15], [1.15], [1]])  # focal changed, intrinsics not updated
+        check = cal.check_reference(self.saved.R, self.saved.t, self.saved.rms_px,
+                                    self.live(self.R, self.t, K=zoomed), self.cfg)
+        self.assertTrue(check.suspect or check.moved, (check.rms_px, check.move))
 
 
 if __name__ == "__main__":

@@ -68,6 +68,9 @@ class BoardConfig:
     square_length_m: float = 0.04
     marker_length_m: float = 0.03
     dictionary: str = "DICT_5X5_50"
+    # Boards sharing a dictionary must not share marker ids, or a camera that
+    # sees both cannot tell them apart (B1 uses ids 0-16, B2 17-33).
+    first_marker_id: int = 0
 
     def __post_init__(self) -> None:
         if self.squares_x < 2 or self.squares_y < 2:
@@ -76,6 +79,10 @@ class BoardConfig:
             raise ValueError("marker_length_m must be > 0 and smaller than square_length_m")
         if not hasattr(cv2.aruco, self.dictionary):
             raise ValueError(f"unknown ArUco dictionary {self.dictionary!r}")
+        size = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, self.dictionary)).bytesList.shape[0]
+        if self.first_marker_id < 0 or self.first_marker_id + self.marker_count > size:
+            raise ValueError(f"marker ids {self.first_marker_id}..{self.first_marker_id + self.marker_count - 1} "
+                             f"do not fit in {self.dictionary} ({size} markers)")
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -93,6 +100,10 @@ class BoardConfig:
         return (self.squares_x - 1) * (self.squares_y - 1)
 
     @property
+    def marker_count(self) -> int:
+        return (self.squares_x * self.squares_y) // 2
+
+    @property
     def centre_m(self) -> tuple[float, float, float]:
         """Centre of the board in its own frame (the origin is a corner)."""
         return self.squares_x * self.square_length_m / 2, self.squares_y * self.square_length_m / 2, 0.0
@@ -102,24 +113,28 @@ class BoardConfig:
 # sizes; with_measured_square() rescales both to what the printer produced.
 BOARD_PRESETS: dict[str, BoardConfig] = {
     "A4 board A - handheld (5x5 markers)": BoardConfig(7, 5, 0.036, 0.027, "DICT_5X5_50"),
-    "A4 board B - fixed (4x4 markers)": BoardConfig(7, 5, 0.036, 0.027, "DICT_4X4_50"),
+    "A4 board B1 - camera 1 reference (4x4, ids 0-16)": BoardConfig(7, 5, 0.036, 0.027, "DICT_4X4_50", 0),
+    "A4 board B2 - camera 2 reference (4x4, ids 17-33)": BoardConfig(7, 5, 0.036, 0.027, "DICT_4X4_50", 17),
     "Lab 5x5 board, 40 mm squares": BoardConfig(),
 }
 HANDHELD_PRESET = "A4 board A - handheld (5x5 markers)"
-FIXED_PRESET = "A4 board B - fixed (4x4 markers)"
+REFERENCE_PRESETS = ("A4 board B1 - camera 1 reference (4x4, ids 0-16)",
+                     "A4 board B2 - camera 2 reference (4x4, ids 17-33)")
+FIXED_PRESET = REFERENCE_PRESETS[0]  # the first fixed board printed ("B") is B1
 
 
 def with_measured_square(cfg: BoardConfig, measured_square_mm: float) -> BoardConfig:
     """The board as actually printed: a printer scales squares and markers by the same factor."""
     scale = (measured_square_mm / 1000.0) / cfg.square_length_m
     return BoardConfig(cfg.squares_x, cfg.squares_y, measured_square_mm / 1000.0,
-                       cfg.marker_length_m * scale, cfg.dictionary)
+                       cfg.marker_length_m * scale, cfg.dictionary, cfg.first_marker_id)
 
 
 def make_board(cfg: BoardConfig) -> "cv2.aruco.CharucoBoard":
     dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, cfg.dictionary))
+    ids = np.arange(cfg.first_marker_id, cfg.first_marker_id + cfg.marker_count, dtype=np.int32)
     return cv2.aruco.CharucoBoard(
-        (cfg.squares_x, cfg.squares_y), cfg.square_length_m, cfg.marker_length_m, dictionary
+        (cfg.squares_x, cfg.squares_y), cfg.square_length_m, cfg.marker_length_m, dictionary, ids
     )
 
 
@@ -686,3 +701,41 @@ def compare_poses(saved: BoardPose, live: BoardPose, board_centre_m: Sequence[fl
         translation_mm=float(np.linalg.norm(shift) * 1000.0),
         rotation_deg=rotation_angle_deg(saved.R, live.R),
     )
+
+
+# --------------------------------------------------------------------------
+# Reference boards (plan decision 11): has a camera moved since the setup?
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ReferenceCheck:
+    move: MoveCheck
+    rms_px: float               # reprojection of the reference board with the stored intrinsics
+    suspect: bool               # fits much worse than at setup: lens touched?
+
+    @property
+    def moved(self) -> bool:
+        return self.move.moved
+
+
+def check_reference(saved_R, saved_t, saved_rms_px: float, live: BoardPose, cfg: BoardConfig) -> ReferenceCheck:
+    """Compare a camera's live pose to its reference board with the pose saved at setup.
+
+    `live` should come from several averaged frames (average_detections): one
+    frame's corner noise alone can exceed the rotation limit a few % of the time.
+    "Suspect" uses the setup's own fit as the baseline, because a far or oblique
+    reference board fits less tightly than the calibration board did.
+    """
+    saved = BoardPose(R=np.asarray(saved_R, dtype=float), t=np.asarray(saved_t, dtype=float).reshape(3),
+                      rms_px=float(saved_rms_px), n_corners=0)
+    limit = max(SUSPECT_REPROJECTION_RMS_PX, 2.0 * float(saved_rms_px))
+    return ReferenceCheck(move=compare_poses(saved, live, cfg.centre_m), rms_px=live.rms_px,
+                          suspect=live.rms_px > limit)
+
+
+def best_detection(dets: dict) -> tuple[str, Detection] | None:
+    """(name, detection) of the usable detection with the most corners, e.g. which reference board a camera sees."""
+    usable = [(name, d) for name, d in dets.items() if d is not None and d.ok]
+    if not usable:
+        return None
+    return max(usable, key=lambda item: len(item[1].ids))

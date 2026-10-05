@@ -1,6 +1,7 @@
 import atexit
 import sys
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -92,6 +93,12 @@ from backend.calibration_store import (
     failed_snapshot,
     session_snapshot,
     write_session_snapshot,
+)
+from backend.reference_monitor import (
+    CHECK_INTERVAL_S as REFERENCE_CHECK_INTERVAL_S,
+    MoveHysteresis,
+    measure_references,
+    targets_from,
 )
 from backend.sustained import SustainedCondition
 from gui.calibration_status import CalibrationStatusBar
@@ -625,6 +632,14 @@ class MainWindow(QWidget):
         self.calibration_status = None
         self._calibration_error: str | None = None  # why the status could not be computed
         self._calibration_window: CalibrationWindow | None = None
+        # Live "has a camera moved?" check against the reference boards (plan
+        # decision 11): every few seconds, in a worker, also while recording.
+        self._move_hysteresis = MoveHysteresis()
+        self._reference_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="reference-check")
+        self._reference_job: Future | None = None
+        self.reference_timer = QTimer(self)
+        self.reference_timer.timeout.connect(self._reference_check_tick)
+        self.reference_timer.start(int(REFERENCE_CHECK_INTERVAL_S * 1000))
         self.calibration_bar = CalibrationStatusBar()
         self.calibration_bar.calibrate_button.clicked.connect(self._open_calibration_window)
         layout.addWidget(self.calibration_bar)
@@ -1685,13 +1700,62 @@ class MainWindow(QWidget):
                 self._slots(),
                 self._calibration_store,
                 ensure_preview=self._ensure_preview_for_calibration,
-                on_saved=self._refresh_calibration_status,
+                on_saved=self._on_calibration_saved,
             )
             window.finished.connect(lambda _result, w=window: self._calibration_window_finished(w))
             self._calibration_window = window
         window.show()
         window.raise_()
         window.activateWindow()
+
+    def _on_calibration_saved(self) -> None:
+        """A calibration or setup was just saved: earlier live results refer to the old records."""
+        self._move_hysteresis.reset()
+        self._calibration_moved = {}
+        self._calibration_live_rms = {}
+        self._refresh_calibration_status()
+
+    # -- live reference-board check ------------------------------------------
+    def _reference_targets(self):
+        slots = self._slots()
+        if len(slots) < 2 or not self.preview_running:
+            return []
+        setup = self._calibration_store.current_setup()
+        intrinsics = {slot.serial: self._calibration_store.current_intrinsics(slot.serial) for slot in slots}
+        return targets_from(setup, intrinsics)
+
+    def _measure_reference_boards(self) -> dict:
+        """Blocking (~0.5 s): average a few frames of each camera's reference board. Worker thread."""
+        controllers = {slot.serial: slot.controller for slot in self._slots()}
+        targets = [t for t in self._reference_targets() if t.serial in controllers]
+        return measure_references(targets, lambda serial: controllers[serial].get_latest_frame())
+
+    def _apply_reference_results(self, results: dict) -> None:
+        """GUI thread: fold one round of results into the moved/suspect state and the status line."""
+        if self._move_hysteresis.update(results):
+            self._calibration_moved = dict(self._move_hysteresis.state)
+            self._calibration_live_rms = dict(self._move_hysteresis.suspect_rms)
+            moved = [slot.label for slot in self._slots() if self._calibration_moved.get(slot.serial)]
+            if moved:
+                print(f"[calibration] camera moved since the setup: {', '.join(moved)}")
+            self._refresh_calibration_status()
+
+    def _reference_check_tick(self) -> None:
+        job = self._reference_job
+        if job is not None:
+            if not job.done():
+                return
+            self._reference_job = None
+            try:
+                self._apply_reference_results(job.result())
+            except Exception as exc:  # informational only: never disturb preview or recording
+                print(f"[calibration] reference check failed: {exc}")
+        if len(self._slots()) < 2 or not self.preview_running:
+            return
+        try:
+            self._reference_job = self._reference_pool.submit(self._measure_reference_boards)
+        except RuntimeError:  # pool shut down (closing)
+            self._reference_job = None
 
     def _calibration_window_finished(self, window) -> None:
         if self._calibration_window is not window:
@@ -1815,6 +1879,7 @@ class MainWindow(QWidget):
             self.state = AppState.IDLE
         self._calibration_moved = {}
         self._calibration_live_rms = {}
+        self._move_hysteresis.reset()
 
         self._apply_state()
         self._refresh_calibration_status()
@@ -2420,6 +2485,8 @@ class MainWindow(QWidget):
             self._close_calibration_window()
         except Exception as e:
             print("Error closing the calibration window:", e)
+        self.reference_timer.stop()
+        self._reference_pool.shutdown(wait=False, cancel_futures=True)
         try:
             release_keep_awake()
         except Exception as e:
