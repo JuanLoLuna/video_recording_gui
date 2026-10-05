@@ -94,6 +94,76 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(loaded.camera("B")["intrinsics_id"], "y")
 
 
+class UnreadableRecordTest(unittest.TestCase):
+    """Valid JSON that is not a usable record reads as nothing; it never raises."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = cs.CalibrationStore(self.tmp.name)
+        self.folder = self.store.intrinsics_dir("23227865")
+
+    def write(self, name, content, pointer=True):
+        self.folder.mkdir(parents=True, exist_ok=True)
+        (self.folder / name).write_text(content if isinstance(content, str) else json.dumps(content))
+        if pointer:
+            (self.folder / "current.json").write_text(json.dumps({"file": name}))
+
+    def test_missing_required_field(self):
+        data = intrinsics().to_dict()
+        del data["fingerprint"]
+        self.write("20261006_100000.json", data)
+        self.assertIsNone(self.store.current_intrinsics("23227865"))
+        self.assertEqual(self.store.intrinsics_history("23227865"), [])
+
+    def test_wrong_kinds_of_value(self):
+        for field, value in (("fingerprint", None), ("fingerprint", "x"), ("K", 5), ("rms_px", "bad"),
+                             ("created_at", 7), ("schema_version", "1")):
+            with self.subTest(field=field, value=value):
+                self.write("a.json", dict(intrinsics().to_dict(), **{field: value}))
+                self.assertIsNone(self.store.current_intrinsics("23227865"))
+
+    def test_not_a_dict_and_bad_pointers(self):
+        for content in ('["file"]', '"file"', "5", "null"):
+            with self.subTest(content=content):
+                self.write("a.json", content)
+                self.assertIsNone(self.store.current_intrinsics("23227865"))
+        for pointer in ('{"file": 5}', '"current"', '{"file": null}', "[]"):
+            with self.subTest(pointer=pointer):
+                self.write("a.json", intrinsics().to_dict(), pointer=False)
+                (self.folder / "current.json").write_text(pointer)
+                self.assertIsNone(self.store.current_intrinsics("23227865"))
+        (self.store.setups_dir).mkdir(parents=True)
+        (self.store.setups_dir / "current.json").write_text('{"file": "x.json"}')
+        (self.store.setups_dir / "x.json").write_text('{"cameras": [5], "board": {}, "baseline_mm": 1, '
+                                                      '"triangulation_rms_mm": 1, "passed": true}')
+        self.assertIsNone(self.store.current_setup())
+
+    def test_extra_keys_and_missing_optional_keys_are_fine(self):
+        data = intrinsics().to_dict()
+        for optional in ("per_view_rms_px", "coverage", "loose", "created_at", "app_commit", "schema_version"):
+            del data[optional]
+        data["written_by_a_later_version"] = {"x": 1}
+        self.write("20261006_100000.json", data)
+        rec = self.store.current_intrinsics("23227865")
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec.rms_px, 0.3)
+
+    def test_newer_schema_is_skipped(self):
+        self.store.save_intrinsics(intrinsics(), now=NOW)
+        newer = dict(intrinsics().to_dict(), schema_version=cs.SCHEMA_VERSION + 1, id="20261006_110000")
+        self.write("20261006_110000.json", newer)
+        self.assertIsNone(self.store.current_intrinsics("23227865"))
+        self.assertEqual([r.id for r in self.store.intrinsics_history("23227865")], ["20261006_100000"])
+
+    def test_a_damaged_record_does_not_break_the_status(self):
+        data = intrinsics().to_dict()
+        del data["K"]
+        self.write("20261006_100000.json", data)
+        record = self.store.current_intrinsics("23227865")
+        self.assertEqual(cs.assess_camera("23227865", "F", record, FP, NOW).state, cs.MISSING)
+
+
 class FingerprintTest(unittest.TestCase):
     def test_differences_are_listed_and_unreadable_nodes_ignored(self):
         live = dict(FP, Width=1280, ReverseX=None)
@@ -112,6 +182,20 @@ class AssessCameraTest(unittest.TestCase):
         self.assertEqual(cs.assess_camera("s", "F", intrinsics(loose=True, created_at=NOW.isoformat()),
                                           FP, NOW).state, cs.LOOSE)
         self.assertEqual(cs.assess_camera("s", "F", rec, FP, NOW, live_rms_px=2.5).state, cs.SUSPECT)
+
+    def test_stored_image_size_is_compared_with_the_live_resolution(self):
+        # A record saved with an empty fingerprint used to be unable to notice anything.
+        rec = intrinsics(fingerprint={}, created_at=NOW.isoformat())
+        self.assertEqual(cs.assess_camera("s", "F", rec, FP, NOW).state, cs.READY)
+        mism = cs.assess_camera("s", "F", rec, dict(FP, Width=1440, Height=1080), NOW)
+        self.assertEqual(mism.state, cs.MISMATCH)
+        self.assertIn("Width 720 -> 1440", mism.reason)
+        self.assertIn("Height 540 -> 1080", mism.reason)
+        self.assertEqual(cs.assess_camera("s", "F", rec, dict(FP, Width=None, Height=None), NOW).state, cs.READY)
+        self.assertTrue(any("without a record" in n for n in cs.assess_camera("s", "F", rec, FP, NOW).notes))
+        # Not reported twice when the fingerprint already says so.
+        both = cs.assess_camera("s", "F", intrinsics(created_at=NOW.isoformat()), dict(FP, Width=1440), NOW)
+        self.assertEqual(both.reason.count("Width"), 1)
 
     def test_unknown_settings_and_age_are_notes_not_blocks(self):
         old = intrinsics(created_at=(NOW - timedelta(days=400)).isoformat())

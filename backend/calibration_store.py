@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from dataclasses import MISSING as MISSING_DEFAULT
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -70,6 +71,34 @@ def stamp(now: datetime) -> str:
     return now.strftime("%Y%m%d_%H%M%S")
 
 
+def _parse_record(cls, data, container_fields: dict):
+    """cls(**known fields of data), or None if data is not a usable record of this schema.
+
+    Extra keys are ignored (forward compatible) and missing optional ones take
+    their defaults. A record that is valid JSON but lacks a required field, has
+    the wrong kind of value in one, or comes from a newer schema is "unreadable":
+    None, so a damaged file can never stop the window or a recording.
+    """
+    if not isinstance(data, dict):
+        return None
+    version = data.get("schema_version", SCHEMA_VERSION)
+    if not isinstance(version, int) or isinstance(version, bool) or version > SCHEMA_VERSION:
+        return None
+    required = [name for name, f in cls.__dataclass_fields__.items()
+                if f.default is MISSING_DEFAULT and f.default_factory is MISSING_DEFAULT]
+    if any(name not in data for name in required):
+        return None
+    for name, kind in container_fields.items():
+        if name in data and data[name] is not None and not isinstance(data[name], kind):
+            return None
+        if name in required and data[name] is None:
+            return None
+    try:
+        return cls(**{k: data[k] for k in cls.__dataclass_fields__ if k in data})
+    except (TypeError, ValueError):
+        return None
+
+
 def fingerprint_differences(stored: Mapping, live: Mapping) -> list[str]:
     """Settings that differ, as 'Name stored -> live'. A node either side could not read is not a difference."""
     out = []
@@ -109,8 +138,10 @@ class IntrinsicsRecord:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict) -> "IntrinsicsRecord":
-        return cls(**{k: data[k] for k in cls.__dataclass_fields__ if k in data})
+    def from_dict(cls, data: dict) -> "IntrinsicsRecord | None":
+        return _parse_record(cls, data, {"K": list, "D": list, "image_size": list, "fingerprint": dict,
+                                         "board": dict, "per_view_rms_px": list, "coverage": dict,
+                                         "rms_px": (int, float), "created_at": str})
 
 
 @dataclass
@@ -151,8 +182,12 @@ class SetupRecord:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data: dict) -> "SetupRecord":
-        return cls(**{k: data[k] for k in cls.__dataclass_fields__ if k in data})
+    def from_dict(cls, data: dict) -> "SetupRecord | None":
+        record = _parse_record(cls, data, {"cameras": list, "board": dict, "verify": dict,
+                                                  "created_at": str})
+        if record is not None and not all(isinstance(c, dict) and "serial" in c for c in record.cameras):
+            return None
+        return record
 
 
 # --------------------------------------------------------------------------
@@ -172,9 +207,10 @@ def _write_json_atomic(path: Path, data: dict) -> None:
 def _read_json(path: Path) -> dict | None:
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except (OSError, ValueError):
         return None
+    return data if isinstance(data, dict) else None
 
 
 class CalibrationStore:
@@ -195,7 +231,7 @@ class CalibrationStore:
 
     def _current(self, folder: Path) -> dict | None:
         pointer = _read_json(folder / "current.json")
-        if not pointer or "file" not in pointer:
+        if not pointer or not isinstance(pointer.get("file"), str):
             return None
         return _read_json(folder / pointer["file"])
 
@@ -215,9 +251,15 @@ class CalibrationStore:
             self._set_current(folder, record.id)
         return path
 
+    def set_current_intrinsics(self, record: IntrinsicsRecord) -> Path:
+        """Make an already-saved record the active one (the second half of save_intrinsics)."""
+        folder = self.intrinsics_dir(record.serial)
+        self._set_current(folder, record.id)
+        return folder / f"{record.id}.json"
+
     def current_intrinsics(self, serial: str) -> IntrinsicsRecord | None:
         data = self._current(self.intrinsics_dir(serial))
-        return None if data is None else IntrinsicsRecord.from_dict(data)
+        return None if data is None else IntrinsicsRecord.from_dict(data)  # None = unreadable
 
     def intrinsics_history(self, serial: str) -> list[IntrinsicsRecord]:
         folder = self.intrinsics_dir(serial)
@@ -225,9 +267,9 @@ class CalibrationStore:
         for path in sorted(folder.glob("*.json")):
             if path.name == "current.json":
                 continue
-            data = _read_json(path)
-            if data is not None:
-                out.append(IntrinsicsRecord.from_dict(data))
+            record = IntrinsicsRecord.from_dict(_read_json(path))
+            if record is not None:  # unreadable records are skipped
+                out.append(record)
         return out
 
     # -- setups ------------------------------------------------------------
@@ -284,10 +326,19 @@ def assess_camera(serial: str, label: str, record: IntrinsicsRecord | None,
         notes.append("camera settings checked when Preview starts")
     else:
         diffs = fingerprint_differences(record.fingerprint, live_fingerprint)
+        # The stored image size is checked on its own too, so a record whose
+        # fingerprint is empty or lacks Width/Height still notices a resolution change.
+        if len(record.image_size) == 2:
+            for name, stored in zip(("Width", "Height"), record.image_size):
+                live = live_fingerprint.get(name)
+                if live is not None and stored != live and not any(d.startswith(f"{name} ") for d in diffs):
+                    diffs.append(f"{name} {stored} -> {live}")
         if diffs:
             return CameraStatus(serial, label, MISMATCH,
                                 "camera settings changed since calibration (" + "; ".join(diffs) + ")",
                                 notes, record.id)
+    if not record.fingerprint:
+        notes.append("saved without a record of the camera settings: changes to them cannot be detected")
     if record.loose:
         return CameraStatus(serial, label, LOOSE,
                             f"calibration saved although it failed ({record.rms_px:.2f} px)", notes, record.id)
@@ -400,6 +451,17 @@ def session_snapshot(store: CalibrationStore, serials: Sequence[str], status: Se
         "intrinsics": {
             s: (None if (rec := store.current_intrinsics(s)) is None else rec.to_dict()) for s in serials
         },
+    }
+
+
+def failed_snapshot(error: str) -> dict:
+    """The snapshot when the calibration status itself could not be computed: still says so, next to the video."""
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": {"ready": False, "headline": "3D pose: could not read calibrations", "error": error,
+                   "reasons": [error], "cameras": []},
+        "setup": None,
+        "intrinsics": {},
     }
 
 

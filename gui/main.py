@@ -89,6 +89,7 @@ from backend.calibration_store import (
     assess_camera,
     assess_session,
     default_calibration_dir,
+    failed_snapshot,
     session_snapshot,
     write_session_snapshot,
 )
@@ -622,6 +623,7 @@ class MainWindow(QWidget):
         self._calibration_moved: dict[str, bool] = {}
         self._calibration_live_rms: dict[str, float] = {}
         self.calibration_status = None
+        self._calibration_error: str | None = None  # why the status could not be computed
         self._calibration_window: CalibrationWindow | None = None
         self.calibration_bar = CalibrationStatusBar()
         self.calibration_bar.calibrate_button.clicked.connect(self._open_calibration_window)
@@ -1613,6 +1615,7 @@ class MainWindow(QWidget):
     # ------------------------------------------------------------------
     def _refresh_calibration_status(self) -> None:
         """Re-read the stored calibrations and show whether 3D pose is available."""
+        self._calibration_error = None
         slots = self._slots()
         if not slots:
             self.calibration_status = None
@@ -1641,19 +1644,23 @@ class MainWindow(QWidget):
         except Exception as exc:  # a broken calibration folder must never break the recorder
             print(f"[calibration] status check failed: {exc}")
             self.calibration_status = None
+            self._calibration_error = str(exc)
             self.calibration_bar.show_idle(f"3D pose: could not read calibrations ({exc})")
             return
         self.calibration_bar.show_status(self.calibration_status)
 
     def _write_calibration_snapshot(self, basename_path: Path) -> None:
         """<basename>_calibration.json next to the video: the 3D status at start and the records behind it."""
-        if self.calibration_status is None:
+        if self.calibration_status is None and self._calibration_error is None:
             return
         path = basename_path.with_name(f"{basename_path.name}_calibration.json")
         try:
-            snapshot = session_snapshot(
-                self._calibration_store, [slot.serial for slot in self._slots()], self.calibration_status
-            )
+            if self.calibration_status is None:  # the recording still says what went wrong
+                snapshot = failed_snapshot(self._calibration_error)
+            else:
+                snapshot = session_snapshot(
+                    self._calibration_store, [slot.serial for slot in self._slots()], self.calibration_status
+                )
             write_session_snapshot(path, snapshot)
         except Exception as exc:  # recording goes on; the status line already says what is known
             print(f"[calibration] could not write {path}: {exc}")
@@ -1983,6 +1990,10 @@ class MainWindow(QWidget):
             if not self._confirm_power_safe_to_record():
                 return False
         # Calibration reads frames and burns CPU on detection: not during a recording.
+        calibration_window = self._calibration_window
+        if calibration_window is not None and calibration_window.has_unsaved_result():
+            # No dialog: an unattended power-resume must not wait for an answer.
+            print("[calibration] recording started: the calibration result that was not saved yet is discarded")
         self._close_calibration_window()
 
         # SessionPaths is the single place deriving every session

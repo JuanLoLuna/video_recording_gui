@@ -90,9 +90,10 @@ class CalibrationStatusTests(unittest.TestCase):
         """Store intrinsics matching each live camera, and a setup over them."""
         ids = {}
         for slot in window._slots():
+            fingerprint = slot.controller.get_sensor_fingerprint()
             rec = cs.IntrinsicsRecord(
                 serial=slot.serial, model=slot.model, K=[[1, 0, 0], [0, 1, 0], [0, 0, 1]], D=[0] * 5,
-                image_size=[0, 0], fingerprint=slot.controller.get_sensor_fingerprint(), board={},
+                image_size=[fingerprint["Width"], fingerprint["Height"]], fingerprint=fingerprint, board={},
                 rms_px=0.3, n_views=30)
             self.store.save_intrinsics(rec)
             ids[slot.serial] = rec.id
@@ -174,6 +175,41 @@ class CalibrationStatusTests(unittest.TestCase):
         window.on_detect_clicked()
         self.assertIn("could not read calibrations", window.calibration_bar.label.text())
         self.assertEqual(window.state, AppState.CAMERA_DETECTED)
+
+    def record_a_short_session(self, window):
+        pump(0.4)
+        self.assertTrue(window._begin_recording_session(bypass_confirmation=True), window.status_label.text())
+        pump(0.4)
+        window._stop_recording_session("stopped")
+        return json.loads(next(self.out_dir.glob("recording_*_calibration.json")).read_text())
+
+    def test_a_malformed_record_does_not_stop_the_window_or_the_snapshot(self):
+        window = self.window(BLACKFLY, FIREFLY)
+        self.preview(window)
+        self.calibrate_all(window)
+        folder = self.store.intrinsics_dir("23227865")
+        current = folder / json.loads((folder / "current.json").read_text())["file"]
+        data = json.loads(current.read_text())
+        del data["fingerprint"]  # valid JSON, wrong schema
+        current.write_text(json.dumps(data))
+        window._refresh_calibration_status()
+        self.assertIn("[Firefly #23227865] camera not calibrated", window.calibration_bar.label.text())
+        window._open_calibration_window()  # used to raise TypeError: no window, no way to recalibrate
+        self.assertIsNotNone(window._calibration_window)
+        self.assertIn("not calibrated", window._calibration_window.camera_state_label.text())
+        window._close_calibration_window()
+        snap = self.record_a_short_session(window)
+        self.assertFalse(snap["status"]["ready"])
+        self.assertIsNone(snap["intrinsics"]["23227865"])
+        self.assertIsNotNone(snap["intrinsics"]["26134271"])
+
+    def test_snapshot_is_written_even_when_the_status_cannot_be_computed(self):
+        window = self.window(BLACKFLY, FIREFLY)
+        self.preview(window)
+        window._calibration_store.current_setup = lambda: (_ for _ in ()).throw(OSError("disk gone"))
+        snap = self.record_a_short_session(window)
+        self.assertFalse(snap["status"]["ready"])
+        self.assertIn("disk gone", snap["status"]["error"])
 
 
 if __name__ == "__main__":
