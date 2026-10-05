@@ -386,6 +386,27 @@ def assess_session(cameras: Sequence[tuple[str, str]], camera_statuses: Mapping[
                          setup_id=None if setup is None else setup.id, reasons=reasons)
 
 
+def session_snapshot(store: CalibrationStore, serials: Sequence[str], status: SessionStatus) -> dict:
+    """What a recording carries about 3D calibration: the status at start and every record it rests on.
+
+    Written next to the video as <basename>_calibration.json whether or not 3D
+    is ready, so an analysis can always tell what was known at recording time.
+    """
+    setup = store.current_setup()
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "status": status.to_dict(),
+        "setup": None if setup is None else setup.to_dict(),
+        "intrinsics": {
+            s: (None if (rec := store.current_intrinsics(s)) is None else rec.to_dict()) for s in serials
+        },
+    }
+
+
+def write_session_snapshot(path: str | Path, snapshot: dict) -> None:
+    _write_json_atomic(Path(path), snapshot)
+
+
 def _created(setup: SetupRecord) -> datetime:
     try:
         return datetime.fromisoformat(setup.created_at)

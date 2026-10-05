@@ -84,7 +84,16 @@ from backend.power_keepalive import (
 )
 
 from backend.compression_policy import describe_policy, suggested_compression
+from backend.calibration_store import (
+    CalibrationStore,
+    assess_camera,
+    assess_session,
+    default_calibration_dir,
+    session_snapshot,
+    write_session_snapshot,
+)
 from backend.sustained import SustainedCondition
+from gui.calibration_status import CalibrationStatusBar
 from gui.camera_preview import CameraPreviewTile, frame_to_qimage
 
 SYNC_WIDTH_RECORD = 0.100  # 100 ms
@@ -603,6 +612,19 @@ class MainWindow(QWidget):
         self.preview_health_label.setAlignment(Qt.AlignmentFlag.AlignRight)
         layout.addWidget(self.preview_health_label)
 
+        # --- 3D calibration status (informational; never blocks recording) ---
+        self._calibration_store = CalibrationStore(default_calibration_dir())
+        self._cameras_detected_at: datetime | None = None
+        # Filled by the Calibration window's live fixed-board check: serial ->
+        # camera moved since setup (bool) / board reprojection px with the
+        # stored intrinsics. Empty = not measured.
+        self._calibration_moved: dict[str, bool] = {}
+        self._calibration_live_rms: dict[str, float] = {}
+        self.calibration_status = None
+        self.calibration_bar = CalibrationStatusBar()
+        self.calibration_bar.calibrate_button.clicked.connect(self._open_calibration_window)
+        layout.addWidget(self.calibration_bar)
+
         # --- ADL label strip (session bar) ---
         self._label_frame_base_style = (
             "QFrame#labelMarkerFrame { border: 1px solid #bbb; border-radius: 4px; "
@@ -800,6 +822,9 @@ class MainWindow(QWidget):
         self._update_frame_rate_widget_enabled()
         self._update_recording_chrome()
         self._apply_power_safety_to_controls()
+        self.calibration_bar.calibrate_button.setEnabled(
+            self.cameras is not None and self.state in (AppState.CAMERA_DETECTED, AppState.PREVIEWING)
+        )
 
     def _open_power_settings(self) -> None:
         """Open Windows Power & battery settings without changing them."""
@@ -1581,6 +1606,64 @@ class MainWindow(QWidget):
         self.tuning_camera_row.setVisible(len(slots) > 1)
         self._refresh_compression_hint()
 
+    # ------------------------------------------------------------------
+    # 3D calibration status (backend.calibration_store; never blocks recording)
+    # ------------------------------------------------------------------
+    def _refresh_calibration_status(self) -> None:
+        """Re-read the stored calibrations and show whether 3D pose is available."""
+        slots = self._slots()
+        if not slots:
+            self.calibration_status = None
+            self.calibration_bar.show_idle()
+            return
+        try:
+            now = datetime.now()
+            statuses = {}
+            for slot in slots:
+                fingerprint = slot.controller.get_sensor_fingerprint() if self.preview_running else None
+                statuses[slot.serial] = assess_camera(
+                    slot.serial,
+                    slot.label,
+                    self._calibration_store.current_intrinsics(slot.serial),
+                    fingerprint,
+                    now,
+                    live_rms_px=self._calibration_live_rms.get(slot.serial),
+                )
+            self.calibration_status = assess_session(
+                [(slot.serial, slot.label) for slot in slots],
+                statuses,
+                self._calibration_store.current_setup(),
+                setup_valid_since=self._cameras_detected_at,
+                moved=self._calibration_moved or None,
+            )
+        except Exception as exc:  # a broken calibration folder must never break the recorder
+            print(f"[calibration] status check failed: {exc}")
+            self.calibration_status = None
+            self.calibration_bar.show_idle(f"3D pose: could not read calibrations ({exc})")
+            return
+        self.calibration_bar.show_status(self.calibration_status)
+
+    def _write_calibration_snapshot(self, basename_path: Path) -> None:
+        """<basename>_calibration.json next to the video: the 3D status at start and the records behind it."""
+        if self.calibration_status is None:
+            return
+        path = basename_path.with_name(f"{basename_path.name}_calibration.json")
+        try:
+            snapshot = session_snapshot(
+                self._calibration_store, [slot.serial for slot in self._slots()], self.calibration_status
+            )
+            write_session_snapshot(path, snapshot)
+        except Exception as exc:  # recording goes on; the status line already says what is known
+            print(f"[calibration] could not write {path}: {exc}")
+
+    def _open_calibration_window(self) -> None:
+        QMessageBox.information(
+            self,
+            "Calibration",
+            "The calibration window is not built yet (plan steps 13-14).\n\n"
+            f"Calibrations are stored in:\n{self._calibration_store.root}",
+        )
+
     def _rebuild_preview_tiles(self) -> None:
         """One tile (and one diagnostics accumulator + logger) per camera."""
         while self.preview_layout.count():
@@ -1671,10 +1754,16 @@ class MainWindow(QWidget):
 
         if found:
             self.state = AppState.CAMERA_DETECTED
+            # Cameras may have been re-mounted before this Detect: an older setup
+            # only counts again once the live fixed-board check confirms it.
+            self._cameras_detected_at = datetime.now()
         else:
             self.state = AppState.IDLE
+        self._calibration_moved = {}
+        self._calibration_live_rms = {}
 
         self._apply_state()
+        self._refresh_calibration_status()
 
     def on_scan_daq_clicked(self):
         """Scan for connected NI-DAQ devices and populate the dropdown."""
@@ -1800,6 +1889,7 @@ class MainWindow(QWidget):
             self._sync_frame_rate_from_camera()
             self._apply_compression_default_for_fps(self.camera.get_acquisition_frame_rate())
             self._apply_exposure_auto_lock_for_fps(self.camera.get_acquisition_frame_rate())
+            self._refresh_calibration_status()
 
 
         else:
@@ -1891,6 +1981,9 @@ class MainWindow(QWidget):
         if not result.ok:
             self._apply_state()
             return False
+
+        self._refresh_calibration_status()
+        self._write_calibration_snapshot(session_paths.output_dir / session_paths.basename)
 
         self._recording_warnings.reset(now_s=time.monotonic())
         self._update_recording_warning_banner()
