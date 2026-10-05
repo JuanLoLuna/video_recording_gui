@@ -216,7 +216,7 @@ At record start the current status is written to the session, and if a valid set
 `SLEEVE_VIDEO_GUI_CALIBRATION_DIR` (default `%LOCALAPPDATA%\SleeveVideoGUI\calibration`):
 
 ```
-intrinsics/<serial>/<YYYYMMDD_HHMMSS>.npz   K, D, image_size, fingerprint, board, rms, n_views, coverage, loose, app commit
+intrinsics/<serial>/<YYYYMMDD_HHMMSS>.json  K, D, image_size, fingerprint, board, rms, n_views, coverage, loose, app commit
 intrinsics/<serial>/current.json            pointer to the active file (history is never overwritten)
 setups/<YYYYMMDD_HHMMSS>.json               serials, per-camera R/t to the board frame, RMS, baseline, triangulation mm, board, sync mode
 setups/current.json
@@ -251,7 +251,7 @@ Pure-logic steps are unit-tested without cameras; rig steps are marked **[rig]**
 
 **Part B**
 10. ✅ `backend/calibration.py` + synthetic tests (`tests/test_calibration.py`: board images rendered through a known K/D/pose). Thresholds: intrinsics < 0.5 px (lab), setup per-camera reprojection < 1.0 px (lab stereo), setup/verify triangulation < 2.0 mm (lab's 0.5 mm assumes a close rig; at 1–1.5 m one pixel is ~1–2 mm, tune in step 16), verify size error < 1 % with the board ≥ 15 cm off the setup plane. Findings: with a 16-corner board the principal point and distortion trade off (±5–10 px between runs, no bias), so intrinsics are judged on views not used for fitting; the setup triangulation cannot catch wrong intrinsics → step 5 *Verify* above.
-11. `backend/calibration_store.py` + tests; controller fingerprint.
+11. ✅ `backend/calibration_store.py` + tests (`tests/test_calibration_store.py`); `CameraController.get_sensor_fingerprint()`. Records are **JSON** (readable, diffable; the lab `.npz` is the step 15 export), written atomically, history never overwritten. `assess_session()` gives the one-line status. **Setup reuse:** an older setup stays valid when the live fixed-board check confirms neither camera moved; until that check has answered for every camera, a setup older than the last Detect counts as stale. Verification is required for "ready".
 12. Main-window 3D status line + session snapshot/`calibration_status`.
 13. Calibration window: intrinsics task (+ Print board).
 14. Calibration window: setup task + live drift check.

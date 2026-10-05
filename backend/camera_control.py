@@ -11,6 +11,7 @@ import numpy as np
 import PySpin
 
 from backend.async_csv_writer import AsyncCsvWriter
+from backend.calibration_store import FINGERPRINT_NODES
 from backend.camera_registry import CameraDescriptor
 from backend.disk_guard import StreamRate
 from backend.preview_scaling import fit_size
@@ -2289,6 +2290,42 @@ class CameraController:
             fps=float(self.target_frame_rate),
             compressed=bool(self._use_compression),
         )
+
+    def get_sensor_fingerprint(self) -> dict | None:
+        """The camera settings intrinsics depend on (calibration_store.FINGERPRINT_NODES).
+
+        None until the camera is acquiring (or while it is mid-recovery). A
+        node this camera does not have, or cannot read, is None in the dict --
+        never a difference when compared (see fingerprint_differences).
+        """
+        if self.cam is None or not self.acquiring or self._recovering.is_set():
+            return None
+        out: dict = {}
+        with self._camera_lock:
+            if self.cam is None:
+                return None
+            nodemap = self.cam.GetNodeMap()
+            for name, kind in FINGERPRINT_NODES.items():
+                value = None
+                try:
+                    raw = nodemap.GetNode(name)
+                    if raw is not None:
+                        if kind == "enum":
+                            node = PySpin.CEnumerationPtr(raw)
+                            if PySpin.IsReadable(node):
+                                value = node.GetCurrentEntry().GetSymbolic()
+                        elif kind == "bool":
+                            node = PySpin.CBooleanPtr(raw)
+                            if PySpin.IsReadable(node):
+                                value = bool(node.GetValue())
+                        else:
+                            node = PySpin.CIntegerPtr(raw)
+                            if PySpin.IsReadable(node):
+                                value = int(node.GetValue())
+                except Exception:
+                    value = None
+                out[name] = value
+        return out
 
     def get_acquisition_frame_rate(self) -> float:
         """Current acquisition fps, or the last-known target if unreadable."""
