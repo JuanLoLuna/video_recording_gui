@@ -20,11 +20,11 @@ BOARD_PX_PER_M = 5000.0
 _BOARD_IMG = cal.render_board(CFG, BOARD_PX_PER_M)
 
 
-def pose_looking_at_board(distance_m, rot_xyz_deg=(0, 0, 0), offset_m=(0.0, 0.0)):
+def pose_looking_at_board(distance_m, rot_xyz_deg=(0, 0, 0), offset_m=(0.0, 0.0), cfg=CFG):
     """Board -> camera (R, t) with the board centre at (offset, distance) in front of the camera."""
     rvec = np.radians(np.array(rot_xyz_deg, dtype=float))
     R, _ = cv2.Rodrigues(rvec)
-    centre = np.array([CFG.size_m[0] / 2, CFG.size_m[1] / 2, 0.0])
+    centre = np.array([cfg.size_m[0] / 2, cfg.size_m[1] / 2, 0.0])
     t = np.array([offset_m[0], offset_m[1], distance_m]) - R @ centre
     return R, t
 
@@ -47,6 +47,18 @@ def render_view(R, t, K=K_TRUE, D=D_TRUE, size=IMAGE_SIZE, background=90):
     grid = np.stack(np.meshgrid(np.arange(w), np.arange(h)), -1).reshape(-1, 1, 2).astype(np.float32)
     und = cv2.undistortPoints(grid, K, D, P=K).reshape(h, w, 2)
     return cv2.remap(ideal, und[..., 0], und[..., 1], cv2.INTER_LINEAR, borderValue=background)
+
+
+def render_view_a4(cfg, R, t, K=K_TRUE, size=IMAGE_SIZE, ppm=BOARD_PX_PER_M):
+    """Undistorted image of any board config (the module's render_view is fixed to CFG)."""
+    board_img = cal.render_board(cfg, ppm)
+    S = np.array([[1 / ppm, 0, 0.5 / ppm], [0, 1 / ppm, 0.5 / ppm], [0, 0, 1]])
+    H = K @ np.column_stack([R[:, 0], R[:, 1], t]) @ S
+    board = np.where(board_img > 127, 230, 25).astype(np.uint8)
+    img = cv2.warpPerspective(board, H, size, flags=cv2.INTER_LINEAR, borderValue=90)
+    mask = cv2.warpPerspective(np.full_like(board, 255), H, size, flags=cv2.INTER_NEAREST, borderValue=0)
+    img[mask == 0] = 90
+    return img
 
 
 def varied_views(n=18, seed=0):
@@ -112,6 +124,63 @@ class DetectionAndPoseTest(unittest.TestCase):
         avg = cal.average_detections([a, a, b])
         self.assertEqual(len(avg.ids), len(a.ids))
         self.assertAlmostEqual(float(np.mean(avg.corners[:, 0] - a.corners[:, 0])), 1.0, delta=0.1)
+
+
+def keep_ids(det, keep):
+    """The detection restricted to the corners where keep(ids) is True."""
+    m = keep(det.ids)
+    return cal.Detection(det.corners[m], det.ids[m], det.marker_count, det.image_size, det.corners_per_row)
+
+
+class DegenerateViewTest(unittest.TestCase):
+    """A row of corners (a board edge-on or cut off at the image border) has no pose."""
+
+    def setUp(self):
+        # The A4 presets: 6 corners per row = MIN_CORNERS, so one row used to count as ok.
+        self.cfg = cal.BOARD_PRESETS[cal.HANDHELD_PRESET]
+        self.det = cal.BoardDetector(self.cfg)
+        self.full = self.det.detect(render_view_a4(self.cfg, *pose_looking_at_board(0.5, (10, 5, 0), cfg=self.cfg)))
+        self.assertTrue(self.full.ok, len(self.full.ids))
+
+    def test_single_row_or_column_is_not_ok(self):
+        per_row = self.cfg.squares_x - 1
+        one_row = keep_ids(self.full, lambda ids: ids // per_row == 1)
+        one_col = keep_ids(self.full, lambda ids: ids % per_row == 2)
+        self.assertGreaterEqual(len(one_row.ids), cal.MIN_CORNERS)  # enough corners, wrong shape
+        self.assertGreater(one_row.marker_count, cal.MIN_MARKERS)
+        self.assertFalse(one_row.ok)
+        self.assertFalse(one_col.ok)
+        self.assertIsNone(cal.view_signature(one_row, self.det.board))
+        two_rows = keep_ids(self.full, lambda ids: ids // per_row < 2)
+        self.assertTrue(two_rows.ok)
+
+    def test_a_single_row_is_never_auto_captured(self):
+        per_row = self.cfg.squares_x - 1
+        one_row = keep_ids(self.full, lambda ids: ids // per_row == 1)
+        session = cal.CaptureSession(self.det.board, still_s=0.5)
+        states = [session.feed(one_row, t * 0.2).state for t in range(10)]
+        self.assertEqual(set(states), {"no board"})
+        self.assertFalse(session.capture_now(one_row))
+        self.assertEqual(session.views, [])
+
+    def test_unusable_views_are_found_and_calibration_recovers(self):
+        rng = np.random.default_rng(4)
+        views = []
+        for _ in range(14):
+            R, t = pose_looking_at_board(rng.uniform(0.45, 0.7), rng.uniform(-30, 30, 3) * [1, 1, 0.3],
+                                         rng.uniform(-0.04, 0.04, 2), cfg=self.cfg)
+            views.append(self.det.detect(render_view_a4(self.cfg, R, t)))
+        self.assertTrue(all(v.ok for v in views))
+        # A detection whose layout is unknown (corners_per_row None) cannot be judged by `ok`.
+        per_row = self.cfg.squares_x - 1
+        row = keep_ids(self.full, lambda ids: ids // per_row == 1)
+        line = cal.Detection(row.corners, row.ids, row.marker_count, row.image_size)
+        self.assertTrue(line.ok)
+        with self.assertRaises(ValueError):  # not a raw cv2.error
+            cal.calibrate_intrinsics(views + [line], self.det.board)
+        self.assertEqual(cal.unusable_views(views + [line], self.det.board), [len(views)])
+        self.assertEqual(cal.unusable_views(views, self.det.board), [])
+        self.assertIsNotNone(cal.calibrate_intrinsics(views, self.det.board))
 
 
 class IntrinsicsTest(unittest.TestCase):

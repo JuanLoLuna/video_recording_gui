@@ -26,6 +26,7 @@ except ImportError:  # pragma: no cover
     HAVE_QT = False
 
 if HAVE_QT:
+    import numpy as np
     import backend.spinnaker_system as spinnaker_system
     import test_calibration as synth
     from backend import calibration as cal
@@ -196,6 +197,35 @@ class CalibrationWindowTests(unittest.TestCase):
         self.assertFalse(cw.ui_timer.isActive())
         self.assertFalse(cw.compute_timer.isActive())
         self.assertEqual(self.detector_threads(), [])
+
+    def test_a_degenerate_view_is_removed_so_compute_still_works(self):
+        window = self.main_window()
+        cw = self.open(window)
+        cw.calibrate_camera_button.click()
+        cw.camera_combo.setCurrentIndex(cw.camera_combo.findData(FIREFLY[0]))
+        for box in cw.checks:
+            box.setChecked(True)
+        cw.check_next.click()  # the A4 handheld board: 6 corners per row = MIN_CORNERS
+        cfg = cw._board_cfg
+        det = cal.BoardDetector(cfg)
+        rng = np.random.default_rng(4)
+        good = []
+        for _ in range(14):
+            R, t = synth.pose_looking_at_board(rng.uniform(0.45, 0.7), rng.uniform(-30, 30, 3) * [1, 1, 0.3],
+                                               rng.uniform(-0.04, 0.04, 2), cfg=cfg)
+            good.append(det.detect(synth.render_view_a4(cfg, R, t)))
+        row = good[0]
+        m = row.ids // (cfg.squares_x - 1) == 1
+        # One board row, from a Detection that does not know the board layout (so `ok` cannot tell).
+        line = cal.Detection(row.corners[m], row.ids[m], row.marker_count, row.image_size)
+        self.assertTrue(all(v.ok for v in good) and line.ok)
+        cw._session.views[:] = good + [line]
+        cw._session.signatures[:] = [cal.ViewSignature((1, 1), (0, 0), 0.1, 0.0)] * len(cw._session.views)
+        cw._start_compute()
+        self.assertTrue(pump_until(lambda: cw._result is not None, timeout=60), cw.result_text.text())
+        self.assertEqual(len(cw._session.views), len(good))
+        self.assertIn("1 unusable view(s) were removed", cw.result_text.text())
+        self.assertEqual(cw._result.n_views, len(good))
 
     def test_escape_cleans_up(self):
         # Esc reaches reject() -> done() and, in Qt >= 6.3, never a closeEvent.

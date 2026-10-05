@@ -162,6 +162,7 @@ class CalibrationWindow(QDialog):
         self._last_state = ""
         self._compute: Future | None = None
         self._result: cal.IntrinsicsResult | None = None
+        self._removed_note = ""
 
         self.stack = QStackedWidget()
         root = QVBoxLayout(self)
@@ -500,11 +501,19 @@ class CalibrationWindow(QDialog):
             return
         self.ui_timer.stop()
         self._stop_detector()
-        views = list(self._session.views)
         board = self._session.board
+        # A view whose board pose cannot be solved makes calibrateCamera fail, and
+        # adding views cannot cure that: leave such views out and say so.
+        unusable = cal.unusable_views(self._session.views, board)
+        self._removed_note = ""
+        if unusable:
+            self._session.drop(unusable)
+            self._removed_note = (f"{len(unusable)} unusable view(s) were removed (board edge-on or "
+                                  f"cut off by the image border).\n")
+        views = list(self._session.views)
         self._compute = self._pool.submit(cal.calibrate_intrinsics, views, board)
         self.result_verdict.setText("Computing…")
-        self.result_text.setText(f"{len(views)} views.")
+        self.result_text.setText(f"{self._removed_note}{len(views)} views.")
         for b in (self.save_button, self.save_loose_button, self.drop_outliers_button, self.more_views_button):
             b.setEnabled(False)
         self._go(self.page_result)
@@ -521,7 +530,7 @@ class CalibrationWindow(QDialog):
         except Exception as exc:
             self._result = None
             self.result_verdict.setText("Could not compute")
-            self.result_text.setText(f"{exc}\n\nGo back and add more varied views.")
+            self.result_text.setText(f"{self._removed_note}{exc}\n\nGo back and add more varied views.")
             return
         self._result = result
         outliers = cal.outlier_views(result.per_view_rms_px)
@@ -534,6 +543,7 @@ class CalibrationWindow(QDialog):
             "font-size: 18px; font-weight: 700; color: " + ("#2e7d32;" if result.passed else "#c62828;"))
         cov = self._session.coverage
         self.result_text.setText(
+            f"{self._removed_note}"
             f"Camera: {self._selected_slot().label}\n"
             f"Views used: {result.n_views}, image {result.image_size[0]} x {result.image_size[1]}\n"
             f"Focal length: fx {K[0, 0]:.1f} px, fy {K[1, 1]:.1f} px; centre {K[0, 2]:.1f}, {K[1, 2]:.1f}\n"

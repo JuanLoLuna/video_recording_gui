@@ -139,10 +139,21 @@ class Detection:
     ids: np.ndarray
     marker_count: int
     image_size: tuple[int, int]  # (width, height)
+    corners_per_row: int | None = None  # squares_x - 1: turns an id into (row, column) of the board
+
+    @property
+    def spans_board(self) -> bool:
+        """The corners cover at least 2 rows AND 2 columns of the board (unknown layout: assumed yes)."""
+        if not self.corners_per_row or len(self.ids) == 0:
+            return True
+        return (len(np.unique(self.ids // self.corners_per_row)) >= 2
+                and len(np.unique(self.ids % self.corners_per_row)) >= 2)
 
     @property
     def ok(self) -> bool:
-        return self.marker_count >= MIN_MARKERS and len(self.ids) >= MIN_CORNERS
+        # A board edge-on or cut off at the image border can leave all the corners
+        # in one row (6 on the A4 boards = MIN_CORNERS): collinear points have no pose.
+        return self.marker_count >= MIN_MARKERS and len(self.ids) >= MIN_CORNERS and self.spans_board
 
     def object_points(self, board) -> np.ndarray:
         return board.getChessboardCorners()[self.ids].astype(np.float32)
@@ -161,10 +172,11 @@ class BoardDetector:
         h, w = gray.shape[:2]
         corners, ids, _marker_corners, marker_ids = self._detector.detectBoard(gray)
         n_markers = 0 if marker_ids is None else len(marker_ids)
+        per_row = self.cfg.squares_x - 1
         if corners is None or ids is None or len(ids) == 0:
-            return Detection(np.zeros((0, 2), np.float32), np.zeros((0,), np.int32), n_markers, (w, h))
+            return Detection(np.zeros((0, 2), np.float32), np.zeros((0,), np.int32), n_markers, (w, h), per_row)
         return Detection(corners.reshape(-1, 2).astype(np.float32), ids.reshape(-1).astype(np.int32),
-                         n_markers, (w, h))
+                         n_markers, (w, h), per_row)
 
 
 def corner_motion_px(a: Detection, b: Detection) -> float | None:
@@ -375,6 +387,26 @@ class IntrinsicsResult:
         return self.rms_px < INTRINSIC_RMS_PX
 
 
+def unusable_views(views: Sequence[Detection], board) -> list[int]:
+    """Indices of views that cannot be posed: not ok, corners in a line on the board, or no finite pose.
+
+    Such a view makes cv2.calibrateCamera raise, and more views cannot fix that.
+    """
+    bad = []
+    for i, v in enumerate(views):
+        if not v.ok:
+            bad.append(i)
+            continue
+        pts = v.object_points(board)[:, :2]
+        if np.linalg.svd(pts - pts.mean(axis=0), compute_uv=False)[-1] < 1e-6:
+            bad.append(i)  # one row or column of the board, whatever the Detection says
+            continue
+        pose = solve_board_pose(v, board, guess_camera_matrix(v.image_size), np.zeros(5))
+        if pose is None or not math.isfinite(pose.rms_px):
+            bad.append(i)
+    return bad
+
+
 def calibrate_intrinsics(views: Sequence[Detection], board) -> IntrinsicsResult:
     usable = [v for v in views if v.ok]
     if len(usable) < MIN_INTRINSIC_VIEWS:
@@ -385,7 +417,10 @@ def calibrate_intrinsics(views: Sequence[Detection], board) -> IntrinsicsResult:
     image_size = usable[0].image_size
     obj = [v.object_points(board) for v in usable]
     img = [v.corners.reshape(-1, 1, 2) for v in usable]
-    rms, K, D, rvecs, tvecs = cv2.calibrateCamera(obj, img, image_size, None, None)
+    try:
+        rms, K, D, rvecs, tvecs = cv2.calibrateCamera(obj, img, image_size, None, None)
+    except cv2.error as exc:
+        raise ValueError(f"OpenCV could not fit the camera to these views ({str(exc).splitlines()[0][:120]})") from exc
     per_view = []
     for o, i, r, t in zip(obj, img, rvecs, tvecs):
         proj, _ = cv2.projectPoints(o, r, t, K, D)
@@ -422,7 +457,10 @@ def solve_board_pose(det: Detection, board, K: np.ndarray, D: np.ndarray) -> Boa
     if not det.ok:
         return None
     obj = det.object_points(board)
-    ok, rvec, tvec = cv2.solvePnP(obj, det.corners, K, D, flags=cv2.SOLVEPNP_ITERATIVE)
+    try:
+        ok, rvec, tvec = cv2.solvePnP(obj, det.corners, K, D, flags=cv2.SOLVEPNP_ITERATIVE)
+    except cv2.error:  # degenerate corner sets can trip an OpenCV assertion
+        return None
     if not ok:
         return None
     proj, _ = cv2.projectPoints(obj, rvec, tvec, K, D)
@@ -443,7 +481,8 @@ def average_detections(dets: Sequence[Detection]) -> Detection | None:
     # keep ids seen in at least half the frames
     ids = sorted(i for i, cs in by_id.items() if len(cs) * 2 >= len(ok))
     corners = np.array([np.mean(by_id[i], axis=0) for i in ids], np.float32).reshape(-1, 2)
-    return Detection(corners, np.array(ids, np.int32), max(d.marker_count for d in ok), ok[0].image_size)
+    return Detection(corners, np.array(ids, np.int32), max(d.marker_count for d in ok), ok[0].image_size,
+                     ok[0].corners_per_row)
 
 
 def rotation_angle_deg(Ra: np.ndarray, Rb: np.ndarray) -> float:
