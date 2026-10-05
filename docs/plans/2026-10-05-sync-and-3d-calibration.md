@@ -13,6 +13,7 @@ Two parts, done in this order: **A. Sync** (needed first; it also lets the per-s
 | 2 | Calibration lives in the GUI behind a **Calibrate…** button that opens a **separate, non-modal Calibration window** (step-by-step), not a mode of the main window. Reasons under B. | proposed |
 | 3 | Intrinsics stored **per camera serial**, with the camera settings that change them (the "sensor fingerprint"); the camera setup (extrinsics) stored per setup and copied into each session folder. | user |
 | 4 | Sync has two separate jobs. **Alignment** (put every camera frame and the sleeve on one timeline): the **sync-service heartbeat LED**, seen by both cameras. **Simultaneity** (both cameras expose at the same instant): **hardware trigger**, implemented generically (per-camera role `free` / `primary` / `secondary`) so both wirings below use the same code. | alignment: user (2026-10-05); trigger wiring open (Q1) |
+| 9 | **Part A paused after step 1** (2026-10-05). Simultaneity will come from an **external pulse (H2)**, done later. Until then recordings are free-running (gap up to ½ frame, cycling every 1–1.6 min) and the heartbeat LED aligns them. Part B goes ahead now: it does not depend on sync (intrinsics are per camera; the setup uses a fixed board, so the two views need not be simultaneous). | user (2026-10-05) |
 | 8 | **Fixed board** in the scene for the per-session setup. The heartbeat LED is mounted on/next to the board so its image position is known from the board pose. | user (2026-10-05) |
 | 5 | Stability target: both cameras **60 fps, 60 min**, both codecs, with sync on. 30 fps is the production rate. | user |
 | 6 | Lab conventions kept: ChArUco board (default 5×5, 40 mm squares, 30 mm markers, `DICT_5X5_50`), acceptance thresholds from `penncubed_analyze/calibrate_stereo.py` (intrinsics RMS < 0.5 px, stereo RMS < 1.0 px, triangulation < 0.5 mm), plus an export in that script's `.npz` layout for the SLEAP pipeline. | proposed |
@@ -188,7 +189,8 @@ The window uses the cameras the main window already has (starts Preview if neede
 2. *Live check:* per camera "board found: N corners"; Next enabled when both see it.
 3. *Capture:* average ~1 s of frames (fixed board) or several poses (handheld, needs sync from part A).
 4. *Compute:* per-camera pose, reprojection RMS, camera-to-camera baseline in mm, triangulated board corners vs real board (mm).
-5. *Result:* PASS/FAIL against the thresholds → becomes the current setup.
+5. *Verify:* raise the board **≥ 15 cm** toward the cameras (e.g. on a box), hold it still; the app triangulates it with the *saved* camera poses and compares it with the real board: size error < 1 %, shape RMS < 2 mm. Needed because step 4 is self-consistent: it re-uses the board the poses came from, so even a 20 % focal-length error still passes it (synthetic test). A sideways move does not reveal scale errors; a height change does (10 % focal error → ~2 % size error at 20 cm).
+6. *Result:* PASS/FAIL against the thresholds → becomes the current setup.
 
 Also: **Print board…** writes a PDF/PNG of the configured board at true size.
 
@@ -246,7 +248,7 @@ Pure-logic steps are unit-tested without cameras; rig steps are marked **[rig]**
 9. **[rig]** Validation runs above → report in `docs/reports/`.
 
 **Part B**
-10. `backend/calibration.py` + synthetic tests.
+10. ✅ `backend/calibration.py` + synthetic tests (`tests/test_calibration.py`: board images rendered through a known K/D/pose). Thresholds: intrinsics < 0.5 px (lab), setup per-camera reprojection < 1.0 px (lab stereo), setup/verify triangulation < 2.0 mm (lab's 0.5 mm assumes a close rig; at 1–1.5 m one pixel is ~1–2 mm, tune in step 16), verify size error < 1 % with the board ≥ 15 cm off the setup plane. Findings: with a 16-corner board the principal point and distortion trade off (±5–10 px between runs, no bias), so intrinsics are judged on views not used for fitting; the setup triangulation cannot catch wrong intrinsics → step 5 *Verify* above.
 11. `backend/calibration_store.py` + tests; controller fingerprint.
 12. Main-window 3D status line + session snapshot/`calibration_status`.
 13. Calibration window: intrinsics task (+ Print board).
