@@ -227,14 +227,40 @@ class CoverageTest(unittest.TestCase):
         self.assertTrue(cal.is_new_view(tilted, [flat], IMAGE_SIZE))
         self.assertTrue(cal.is_new_view(near, [flat], IMAGE_SIZE))
 
+    def test_tilt_direction_counts_as_a_new_view(self):
+        det = cal.BoardDetector(CFG)
+
+        def sig(*rot):
+            return cal.view_signature(det.detect(render_view(*pose_looking_at_board(0.5, rot))), det.board)
+
+        left, right, up, down = sig(0, 30, 0), sig(0, -30, 0), sig(30, 0, 0), sig(-30, 0, 0)
+        # Same place and same tilt magnitude, different direction.
+        for s in (left, right, up, down):
+            self.assertAlmostEqual(s.tilt_deg, 30, delta=2)
+        self.assertEqual({s.tilt_direction for s in (left, right, up, down)}, set(cal.TILT_DIRECTIONS))
+        for taken, others in ((left, (right, up, down)), (right, (left, up, down)),
+                              (up, (left, right, down)), (down, (left, right, up))):
+            for other in others:
+                self.assertTrue(cal.is_new_view(other, [taken], IMAGE_SIZE), (taken.tilt_direction, other.tilt_direction))
+        # A genuinely similar view (a couple of degrees off, nothing else changed) is still a duplicate.
+        again = sig(2, 29, 1)
+        self.assertFalse(cal.is_new_view(again, [left], IMAGE_SIZE))
+        self.assertFalse(cal.is_new_view(left, [left], IMAGE_SIZE))
+
     def test_hints(self):
         cov = cal.Coverage()
         self.assertTrue(any("cover" in h for h in cov.missing()))
+        normals = {"left": (0.5, 0, 0.87), "right": (-0.5, 0, 0.87), "up": (0, 0.5, 0.87), "down": (0, -0.5, 0.87)}
         for c in range(3):
             for r in range(3):
                 for near, tilt in ((0.4, 30.0), (0.1, 0.0), (0.4, 0.0), (0.1, 30.0)):
-                    cov.add(cal.ViewSignature((c, r), (0, 0), near, tilt))
+                    direction = list(normals)[(c + r) % 4]
+                    cov.add(cal.ViewSignature((c, r), (0, 0), near, tilt, normals[direction] if tilt else (0, 0, 1)))
         self.assertEqual(cov.missing(target_views=30), [])
+        one_way = cal.Coverage()
+        for i in range(9):
+            one_way.add(cal.ViewSignature((i % 3, i // 3), (0, 0), 0.4 if i % 2 else 0.1, 30.0, normals["left"]))
+        self.assertTrue(any("faces right and up and down" in h for h in one_way.missing()), one_way.missing())
 
 
 class SetupTest(unittest.TestCase):

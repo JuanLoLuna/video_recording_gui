@@ -58,6 +58,7 @@ MIN_INTRINSIC_VIEWS = 10
 COVERAGE_GRID = 3            # image split into 3x3 regions
 NEAR_FAR_SPLIT = 0.25        # board bbox area / image area above this = "near"
 TILTED_DEG = 20.0            # board normal vs optical axis above this = "tilted"
+TILT_DIRECTIONS = ("left", "right", "up", "down")
 
 
 @dataclass(frozen=True)
@@ -204,6 +205,17 @@ class ViewSignature:
     centroid: tuple[float, float]
     area_fraction: float       # board corners' bounding box / image area
     tilt_deg: float            # board normal vs optical axis (rough before calibration)
+    normal: tuple[float, float, float] = (0.0, 0.0, 1.0)  # board normal in camera coordinates, z >= 0
+
+    @property
+    def tilt_direction(self) -> str | None:
+        """Which way the board is turned ('left', 'right', 'up', 'down'), None if it is roughly flat."""
+        if not self.tilted:
+            return None
+        nx, ny, _ = self.normal
+        if abs(nx) >= abs(ny):
+            return "left" if nx > 0 else "right"
+        return "up" if ny > 0 else "down"
 
     @property
     def near(self) -> bool:
@@ -228,18 +240,28 @@ def view_signature(det: Detection, board, K: np.ndarray | None = None,
     pose = solve_board_pose(det, board, guess_camera_matrix(det.image_size) if K is None else K,
                             np.zeros(5) if D is None else D)
     tilt = 0.0 if pose is None else pose.tilt_deg
-    return ViewSignature(cell=cell, centroid=(float(cx), float(cy)), area_fraction=area, tilt_deg=tilt)
+    normal = (0.0, 0.0, 1.0) if pose is None else tuple(float(v) for v in pose.normal_cam)
+    return ViewSignature(cell=cell, centroid=(float(cx), float(cy)), area_fraction=area, tilt_deg=tilt,
+                         normal=normal)
+
+
+def _normal_angle_deg(a: tuple, b: tuple) -> float:
+    return math.degrees(math.acos(max(-1.0, min(1.0, float(np.dot(a, b))))))
 
 
 def is_new_view(sig: ViewSignature, taken: Sequence[ViewSignature], image_size: tuple[int, int],
                 min_shift_fraction: float = 0.1, min_tilt_change_deg: float = 10.0,
                 min_scale_ratio: float = 1.25) -> bool:
-    """True if `sig` differs enough from every view already taken."""
+    """True if `sig` differs enough from every view already taken.
+
+    Tilt is compared as the angle between the board normals, not as |tilt|:
+    tilting left and right (or up and down) by the same angle are different views.
+    """
     diag = math.hypot(*image_size)
     for t in taken:
         shift = math.hypot(sig.centroid[0] - t.centroid[0], sig.centroid[1] - t.centroid[1]) / diag
         scale = max(sig.area_fraction, t.area_fraction) / max(1e-9, min(sig.area_fraction, t.area_fraction))
-        if (shift < min_shift_fraction and abs(sig.tilt_deg - t.tilt_deg) < min_tilt_change_deg
+        if (shift < min_shift_fraction and _normal_angle_deg(sig.normal, t.normal) < min_tilt_change_deg
                 and scale < min_scale_ratio):
             return False
     return True
@@ -253,9 +275,12 @@ class Coverage:
     tilted: int = 0
     flat: int = 0
     views: int = 0
+    directions: dict = field(default_factory=dict)   # tilt direction -> number of views
 
     def add(self, sig: ViewSignature) -> None:
         self.cells.add(sig.cell)
+        if sig.tilt_direction is not None:
+            self.directions[sig.tilt_direction] = self.directions.get(sig.tilt_direction, 0) + 1
         self.near += sig.near
         self.far += not sig.near
         self.tilted += sig.tilted
@@ -277,6 +302,10 @@ class Coverage:
             hints.append("move the board further away")
         if self.tilted < 8:
             hints.append("tilt the board more (about 30 degrees, in different directions)")
+        else:
+            untried = [d for d in TILT_DIRECTIONS if not self.directions.get(d)]
+            if untried:
+                hints.append("also tilt the board so it faces " + " and ".join(untried))
         if self.views < target_views:
             hints.append(f"{target_views - self.views} more views")
         return hints
@@ -447,10 +476,15 @@ class BoardPose:
         return (-self.R.T @ self.t).reshape(3)
 
     @property
+    def normal_cam(self) -> np.ndarray:
+        """Board normal in camera coordinates, as a unit vector pointing away from the camera (z >= 0)."""
+        n = self.R @ np.array([0.0, 0.0, 1.0])
+        return -n if n[2] < 0 else n
+
+    @property
     def tilt_deg(self) -> float:
         """Angle between the board normal and the camera's optical axis (0 = facing the camera)."""
-        normal_cam = self.R @ np.array([0.0, 0.0, 1.0])
-        return float(math.degrees(math.acos(min(1.0, abs(normal_cam[2])))))
+        return float(math.degrees(math.acos(min(1.0, abs(self.normal_cam[2])))))
 
 
 def solve_board_pose(det: Detection, board, K: np.ndarray, D: np.ndarray) -> BoardPose | None:
