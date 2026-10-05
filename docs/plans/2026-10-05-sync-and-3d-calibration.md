@@ -76,6 +76,24 @@ Findings:
 
 New option this suggests (software, no wiring) — **S3, software phase lock:** because the camera clocks agree to < 1 ppm, the drift comes only from unequal rate settings. Periodically nudging the Blackfly's `AcquisitionFrameRate` (it has finer steps) using latch-mapped timestamps could hold the gap near 0. Expected accuracy is bounded by the Blackfly's rate step size and how cleanly it accepts live rate changes. Both are unmeasured: a rate change might drop or stretch a frame. It is still not simultaneous capture, and it adds a control loop to the recorder. Worth a short rig test only if wiring a trigger turns out to be impractical.
 
+## Rig evidence — heartbeat LED, 30 fps recording, 2026-10-05
+
+Recorder (MJPEG, 30 fps) `recording_20261005_135059`, 5.75 min, heartbeat `heartbeat_20261005T175017Z` (2–4 s intervals, USB-6501 `Dev1/port0/line0`). Box `SmartSleeve/RawData/temp/60 fps/` (the folder names are swapped: this is the 30 fps run). Analysed per camera: LED ROI brightness → rising edges → matched to heartbeat pulses (laptop perf_counter) → fit `pulse time = a + b · camera_timestamp_ns`.
+
+| | Firefly #23227865 | Blackfly #26134271 |
+|---|---|---|
+| Flashes detected / matched / pulses in window | 118 / 118 / 118 | 118 / 118 / 118 |
+| Fit residual range | ±16.2 ms (= ± half a frame) | ±16.6 ms (= ± half a frame) |
+| Clock vs laptop (LED fit) | +8.0 ppm | +5.9 ppm |
+| Clock vs laptop (latch, probe run) | +4.7 ppm | +5.1 ppm |
+| Arrival (`monotonic_s`) after exposure, median | 13.5 ms | 11.6 ms |
+
+- **Every flash seen by both cameras, no false or missed detections.** Residuals are exactly the frame quantisation, with no outliers.
+- **The LED mapping agrees with the latch mapping** within the fit's uncertainty (about ±9 ppm for 6 min of 2–4 s pulses; longer recordings tighten it).
+- **The inter-camera gap measured through the LED** (median 8.0, p99 16.5, max 16.7 ms) matches the probe → two independent methods agree.
+- The existing single-camera `video_fiducial_diagnose.py` REJECTs the same data: it fits on frame index at an assumed rate and full-frame brightness. Step 2 must fit on camera timestamps with an LED ROI, as done here.
+- Precision now: frame-level onsets (±½ frame each, averaged over the pulses). Sub-frame onsets from partially lit frames (9 and 21 such frames here) are the step 2 improvement.
+
 ---
 
 # Part A — Camera sync
