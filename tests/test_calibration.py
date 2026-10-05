@@ -221,5 +221,67 @@ class SetupTest(unittest.TestCase):
         self.assertTrue(any("raise the board" in p for p in verify.problems), verify.problems)
 
 
+class PresetsTest(unittest.TestCase):
+    def test_presets_are_valid_boards(self):
+        for name, cfg in cal.BOARD_PRESETS.items():
+            with self.subTest(name=name):
+                self.assertEqual(cal.make_board(cfg).getChessboardSize(), (cfg.squares_x, cfg.squares_y))
+        self.assertNotEqual(cal.BOARD_PRESETS[cal.HANDHELD_PRESET].dictionary,
+                            cal.BOARD_PRESETS[cal.FIXED_PRESET].dictionary)
+
+    def test_measured_square_rescales_markers_too(self):
+        cfg = cal.with_measured_square(cal.BOARD_PRESETS[cal.HANDHELD_PRESET], 35.5)
+        self.assertAlmostEqual(cfg.square_length_m, 0.0355)
+        self.assertAlmostEqual(cfg.marker_length_m, 0.027 * 35.5 / 36)
+
+
+class CaptureSessionTest(unittest.TestCase):
+    def setUp(self):
+        self.det = cal.BoardDetector(CFG)
+        self.session = cal.CaptureSession(self.det.board, still_s=0.5)
+
+    def feed_still(self, det, start, seconds=1.0, step=0.2):
+        states = []
+        t = start
+        while t <= start + seconds + 1e-9:
+            states.append(self.session.feed(det, t).state)
+            t += step
+        return states
+
+    def test_takes_a_view_only_after_holding_still(self):
+        view = self.det.detect(render_view(*pose_looking_at_board(0.5)))
+        states = self.feed_still(view, 0.0)
+        self.assertEqual(states[0], "moving")
+        self.assertIn("steady", states)
+        self.assertEqual(states.count("captured"), 1)
+        self.assertEqual(states[-1], "seen already")  # holding on does not add duplicates
+        self.assertEqual(len(self.session.views), 1)
+
+    def test_no_board_resets_and_new_poses_are_added(self):
+        empty = self.det.detect(np.full((540, 720), 90, np.uint8))
+        self.assertEqual(self.session.feed(empty, 0.0).state, "no board")
+        t = 1.0
+        for R, tv in varied_views(4, seed=5):
+            self.feed_still(self.det.detect(render_view(R, tv)), t)
+            t += 2.0
+        self.assertGreaterEqual(len(self.session.views), 3)
+        self.assertEqual(self.session.coverage.views, len(self.session.views))
+
+    def test_manual_capture_undo_and_drop(self):
+        view = self.det.detect(render_view(*pose_looking_at_board(0.5)))
+        self.assertTrue(self.session.capture_now(view))
+        self.assertTrue(self.session.capture_now(view))  # manual allows similar views
+        self.session.drop([0])
+        self.assertEqual(len(self.session.views), 1)
+        self.assertTrue(self.session.undo())
+        self.assertFalse(self.session.undo())
+        empty = self.det.detect(np.full((540, 720), 90, np.uint8))
+        self.assertFalse(self.session.capture_now(empty))
+
+    def test_outlier_views(self):
+        self.assertEqual(cal.outlier_views([0.2, 0.25, 0.22, 0.9]), [3])
+        self.assertEqual(cal.outlier_views([0.2, 0.9]), [])
+
+
 if __name__ == "__main__":
     unittest.main()

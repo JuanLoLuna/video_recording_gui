@@ -94,6 +94,7 @@ from backend.calibration_store import (
 )
 from backend.sustained import SustainedCondition
 from gui.calibration_status import CalibrationStatusBar
+from gui.calibration_window import CalibrationWindow
 from gui.camera_preview import CameraPreviewTile, frame_to_qimage
 
 SYNC_WIDTH_RECORD = 0.100  # 100 ms
@@ -621,6 +622,7 @@ class MainWindow(QWidget):
         self._calibration_moved: dict[str, bool] = {}
         self._calibration_live_rms: dict[str, float] = {}
         self.calibration_status = None
+        self._calibration_window: CalibrationWindow | None = None
         self.calibration_bar = CalibrationStatusBar()
         self.calibration_bar.calibrate_button.clicked.connect(self._open_calibration_window)
         layout.addWidget(self.calibration_bar)
@@ -1657,12 +1659,33 @@ class MainWindow(QWidget):
             print(f"[calibration] could not write {path}: {exc}")
 
     def _open_calibration_window(self) -> None:
-        QMessageBox.information(
-            self,
-            "Calibration",
-            "The calibration window is not built yet (plan steps 13-14).\n\n"
-            f"Calibrations are stored in:\n{self._calibration_store.root}",
-        )
+        if self.cameras is None:
+            return
+        window = self._calibration_window
+        if window is None or not window.isVisible():
+            window = CalibrationWindow(
+                self,
+                self._slots(),
+                self._calibration_store,
+                ensure_preview=self._ensure_preview_for_calibration,
+                on_saved=self._refresh_calibration_status,
+            )
+            window.finished.connect(lambda _result: self._refresh_calibration_status())
+            self._calibration_window = window
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _close_calibration_window(self) -> None:
+        if self._calibration_window is not None:
+            self._calibration_window.close()
+            self._calibration_window = None
+
+    def _ensure_preview_for_calibration(self) -> bool:
+        """The Calibration window reads live frames: start Preview if it is not running."""
+        if not self.preview_running and self.state == AppState.CAMERA_DETECTED:
+            self.on_preview_clicked()
+        return self.preview_running
 
     def _rebuild_preview_tiles(self) -> None:
         """One tile (and one diagnostics accumulator + logger) per camera."""
@@ -1740,6 +1763,7 @@ class MainWindow(QWidget):
     def on_detect_clicked(self):
         if self.state not in (AppState.IDLE, AppState.CAMERA_DETECTED):
             return
+        self._close_calibration_window()  # it holds the previous cameras
 
         self.status_label.setText("Detecting camera...")
         try:
@@ -1941,6 +1965,8 @@ class MainWindow(QWidget):
         if not bypass_confirmation:
             if not self._confirm_power_safe_to_record():
                 return False
+        # Calibration reads frames and burns CPU on detection: not during a recording.
+        self._close_calibration_window()
 
         # SessionPaths is the single place deriving every session
         # artifact name (video segments, wav, metadata, diagnostics,
@@ -2351,6 +2377,10 @@ class MainWindow(QWidget):
 
     def closeEvent(self, event):
         """Ensure all hardware and timers are properly stopped."""
+        try:
+            self._close_calibration_window()
+        except Exception as e:
+            print("Error closing the calibration window:", e)
         try:
             release_keep_awake()
         except Exception as e:

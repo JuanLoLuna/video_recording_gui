@@ -92,6 +92,24 @@ class BoardConfig:
         return (self.squares_x - 1) * (self.squares_y - 1)
 
 
+# The boards in use (plan decision 10). Squares/markers are the NOMINAL print
+# sizes; with_measured_square() rescales both to what the printer produced.
+BOARD_PRESETS: dict[str, BoardConfig] = {
+    "A4 board A - handheld (5x5 markers)": BoardConfig(7, 5, 0.036, 0.027, "DICT_5X5_50"),
+    "A4 board B - fixed (4x4 markers)": BoardConfig(7, 5, 0.036, 0.027, "DICT_4X4_50"),
+    "Lab 5x5 board, 40 mm squares": BoardConfig(),
+}
+HANDHELD_PRESET = "A4 board A - handheld (5x5 markers)"
+FIXED_PRESET = "A4 board B - fixed (4x4 markers)"
+
+
+def with_measured_square(cfg: BoardConfig, measured_square_mm: float) -> BoardConfig:
+    """The board as actually printed: a printer scales squares and markers by the same factor."""
+    scale = (measured_square_mm / 1000.0) / cfg.square_length_m
+    return BoardConfig(cfg.squares_x, cfg.squares_y, measured_square_mm / 1000.0,
+                       cfg.marker_length_m * scale, cfg.dictionary)
+
+
 def make_board(cfg: BoardConfig) -> "cv2.aruco.CharucoBoard":
     dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, cfg.dictionary))
     return cv2.aruco.CharucoBoard(
@@ -250,6 +268,93 @@ class Coverage:
         if self.views < target_views:
             hints.append(f"{target_views - self.views} more views")
         return hints
+
+
+@dataclass
+class CaptureUpdate:
+    state: str                 # "no board" | "moving" | "steady" | "captured" | "seen already"
+    signature: ViewSignature | None = None
+
+
+class CaptureSession:
+    """Automatic view selection for the intrinsics capture (no Qt, no camera).
+
+    Feed it one detection at a time. A view is taken when the board has been
+    still (corners moving < still_px) for still_s seconds AND it differs from
+    every view already taken (is_new_view). Holding still in the same spot
+    therefore never adds duplicates; the operator just moves on.
+    """
+
+    def __init__(self, board, still_px: float = 1.5, still_s: float = 0.5, target_views: int = 30) -> None:
+        self.board = board
+        self.still_px, self.still_s, self.target_views = still_px, still_s, target_views
+        self.views: list[Detection] = []
+        self.signatures: list[ViewSignature] = []
+        self._prev: Detection | None = None
+        self._steady_since: float | None = None
+
+    @property
+    def coverage(self) -> Coverage:
+        cov = Coverage()
+        for sig in self.signatures:
+            cov.add(sig)
+        return cov
+
+    def hints(self) -> list[str]:
+        return self.coverage.missing(self.target_views)
+
+    def feed(self, det: Detection, now: float) -> CaptureUpdate:
+        prev, self._prev = self._prev, det
+        if not det.ok:
+            self._steady_since = None
+            return CaptureUpdate("no board")
+        motion = corner_motion_px(prev, det) if prev is not None and prev.ok else None
+        if motion is None or motion > self.still_px:
+            self._steady_since = now
+            return CaptureUpdate("moving")
+        if self._steady_since is None:
+            self._steady_since = now
+        if now - self._steady_since < self.still_s:
+            return CaptureUpdate("steady")
+        sig = view_signature(det, self.board)
+        if sig is None:
+            return CaptureUpdate("no board")
+        if not is_new_view(sig, self.signatures, det.image_size):
+            return CaptureUpdate("seen already", sig)
+        self._add(det, sig)
+        return CaptureUpdate("captured", sig)
+
+    def capture_now(self, det: Detection) -> bool:
+        """Manual capture: any usable view, even one similar to an earlier one."""
+        sig = view_signature(det, self.board)
+        if sig is None:
+            return False
+        self._add(det, sig)
+        return True
+
+    def undo(self) -> bool:
+        if not self.views:
+            return False
+        self.views.pop()
+        self.signatures.pop()
+        return True
+
+    def drop(self, indices: Sequence[int]) -> None:
+        keep = [i for i in range(len(self.views)) if i not in set(indices)]
+        self.views = [self.views[i] for i in keep]
+        self.signatures = [self.signatures[i] for i in keep]
+
+    def _add(self, det: Detection, sig: ViewSignature) -> None:
+        self.views.append(det)
+        self.signatures.append(sig)
+
+
+def outlier_views(per_view_rms_px: Sequence[float], factor: float = 2.0) -> list[int]:
+    """Views whose error is more than `factor` x the median (blurred, bent board, wrong detection)."""
+    if len(per_view_rms_px) < 3:
+        return []
+    median = float(np.median(per_view_rms_px))
+    return [i for i, e in enumerate(per_view_rms_px) if e > factor * median]
 
 
 # --------------------------------------------------------------------------
