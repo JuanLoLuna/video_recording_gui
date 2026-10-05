@@ -1662,7 +1662,12 @@ class MainWindow(QWidget):
         if self.cameras is None:
             return
         window = self._calibration_window
-        if window is None or not window.isVisible():
+        if window is not None and not window.isVisible():
+            # Hidden but still referenced (e.g. dismissed with Esc): stop its
+            # threads before it is replaced, never leave it running unseen.
+            self._close_calibration_window()
+            window = None
+        if window is None:
             window = CalibrationWindow(
                 self,
                 self._slots(),
@@ -1670,16 +1675,28 @@ class MainWindow(QWidget):
                 ensure_preview=self._ensure_preview_for_calibration,
                 on_saved=self._refresh_calibration_status,
             )
-            window.finished.connect(lambda _result: self._refresh_calibration_status())
+            window.finished.connect(lambda _result, w=window: self._calibration_window_finished(w))
             self._calibration_window = window
         window.show()
         window.raise_()
         window.activateWindow()
 
-    def _close_calibration_window(self) -> None:
-        if self._calibration_window is not None:
-            self._calibration_window.close()
+    def _calibration_window_finished(self, window) -> None:
+        if self._calibration_window is window:
             self._calibration_window = None
+        self._refresh_calibration_status()
+
+    def _close_calibration_window(self) -> None:
+        window, self._calibration_window = self._calibration_window, None
+        if window is None:
+            return
+        try:
+            # Directly, not through close(): closing a hidden dialog does not
+            # deliver a closeEvent, and this is what keeps detection off during a recording.
+            window._shutdown()
+            window.close()
+        except RuntimeError as exc:  # the Qt object is already gone
+            print(f"[calibration] closing the calibration window: {exc}")
 
     def _ensure_preview_for_calibration(self) -> bool:
         """The Calibration window reads live frames: start Preview if it is not running."""

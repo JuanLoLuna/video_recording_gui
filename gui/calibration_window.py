@@ -145,6 +145,9 @@ class CalibrationWindow(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Calibration")
         self.setModal(False)
+        # Nobody keeps a reference to a closed window; let Qt free it (the
+        # worker threads are stopped by _shutdown, not by destruction).
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.resize(820, 760)
         self.slots = list(slots)
         self.store = store
@@ -592,9 +595,29 @@ class CalibrationWindow(QDialog):
         QMessageBox.information(self, "Calibration", f"Saved {path}.\nPrint it at 100% / Actual size.")
 
     # --------------------------------------------------------------- shutdown
-    def closeEvent(self, event) -> None:
+    def _shutdown(self) -> None:
+        """Stop the timers, the detector thread and the compute pool. Safe to call any number of times.
+
+        Esc and reject() hide a QDialog without a closeEvent (Qt >= 6.3), so the
+        cleanup cannot live in closeEvent alone: it also runs from done() and
+        hideEvent, and the main window calls it directly.
+        """
         self.ui_timer.stop()
         self.compute_timer.stop()
         self._stop_detector()
         self._pool.shutdown(wait=False, cancel_futures=True)
+
+    def done(self, result: int) -> None:  # accept(), reject() and Esc all end here
+        self._shutdown()
+        super().done(result)
+
+    def hideEvent(self, event) -> None:
+        # A minimise is a spontaneous hide and the window comes back; anything
+        # else (hide(), parent hidden) leaves it with no use for the threads.
+        if not event.spontaneous():
+            self._shutdown()
+        super().hideEvent(event)
+
+    def closeEvent(self, event) -> None:
+        self._shutdown()
         super().closeEvent(event)

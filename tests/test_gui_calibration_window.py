@@ -7,6 +7,7 @@ window's 3D status.
 """
 import os
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -17,6 +18,8 @@ from fake_spinnaker import FakeCamera, FakeImage, FakeSystem, install_pyspin_stu
 
 REAL_PYSPIN = install_pyspin_stub()
 try:
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication
     HAVE_QT = True
 except ImportError:  # pragma: no cover
@@ -175,6 +178,78 @@ class CalibrationWindowTests(unittest.TestCase):
         cw._cancel_capture()
         self.assertIsNone(cw._detector)
         self.assertIs(cw.stack.currentWidget(), cw.page_check)
+
+
+    def start_capture(self, cw):
+        cw.calibrate_camera_button.click()
+        for box in cw.checks:
+            box.setChecked(True)
+        cw.check_next.click()
+        self.assertIsNotNone(cw._detector)
+
+    @staticmethod
+    def detector_threads():
+        return [t for t in threading.enumerate() if t.name == "calibration-detector" and t.is_alive()]
+
+    def assert_cleaned_up(self, cw):
+        self.assertIsNone(cw._detector)
+        self.assertFalse(cw.ui_timer.isActive())
+        self.assertFalse(cw.compute_timer.isActive())
+        self.assertEqual(self.detector_threads(), [])
+
+    def test_escape_cleans_up(self):
+        # Esc reaches reject() -> done() and, in Qt >= 6.3, never a closeEvent.
+        window = self.main_window()
+        cw = self.open(window)
+        self.start_capture(cw)
+        QTest.keyClick(cw, Qt.Key.Key_Escape)
+        self.assertFalse(cw.isVisible())
+        self.assert_cleaned_up(cw)
+        self.assertIsNone(window._calibration_window)
+
+    def test_reject_hide_and_repeated_shutdown_clean_up(self):
+        window = self.main_window()
+        cw = self.open(window)
+        self.start_capture(cw)
+        cw.reject()
+        self.assert_cleaned_up(cw)
+        cw._shutdown()  # idempotent
+        cw2 = self.open(window)
+        self.start_capture(cw2)
+        cw2.hide()
+        self.assert_cleaned_up(cw2)
+
+    def test_reopening_after_escape_leaves_one_detector(self):
+        window = self.main_window()
+        cw = self.open(window)
+        self.start_capture(cw)
+        cw.reject()
+        cw2 = self.open(window)
+        self.assertIsNot(cw2, cw)
+        self.start_capture(cw2)
+        self.assertEqual(len(self.detector_threads()), 1)
+        window._close_calibration_window()
+        self.assertEqual(self.detector_threads(), [])
+
+    def test_hidden_but_referenced_window_is_shut_down_when_replaced(self):
+        # A window that was only hidden (so no finished/closeEvent) must not be orphaned.
+        window = self.main_window()
+        cw = self.open(window)
+        self.start_capture(cw)
+        cw.isVisible = lambda: False
+        cw2 = self.open(window)
+        self.assertIsNot(cw2, cw)
+        self.assertIsNone(cw._detector)
+        self.assertFalse(cw.ui_timer.isActive())
+
+    def test_escape_then_recording_runs_no_detector(self):
+        window = self.main_window()
+        cw = self.open(window)
+        self.start_capture(cw)
+        QTest.keyClick(cw, Qt.Key.Key_Escape)
+        self.assertTrue(window._begin_recording_session(bypass_confirmation=True))
+        self.assertEqual(self.detector_threads(), [])
+        window._stop_recording_session("stopped")
 
 
 @unittest.skipIf(not HAVE_QT, "needs PySide6")
