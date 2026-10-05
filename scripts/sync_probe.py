@@ -32,9 +32,10 @@ TimestampLatchValue) between two perf_counter() reads. From that it reports:
   - frame gaps / incomplete / errors (should all be 0, as in the
     multi-camera probe).
 
-Raw data goes to probe_output/sync_probe_<timestamp>/ (frames + latch CSV per
-camera and fps, a phase CSV per fps) and summary.json; bring that whole folder
-back for analysis.
+Everything goes to probe_output/sync_probe_<timestamp>/: report.txt (exactly
+what was printed), nodes.json or summary.json, and for skew the raw frames +
+latch CSV per camera and fps and a phase CSV per fps. Send that whole folder
+back -- no screenshots needed.
 """
 from __future__ import annotations
 
@@ -598,6 +599,26 @@ def print_skew(result: dict) -> None:
 # CLI
 # --------------------------------------------------------------------------
 
+class Tee:
+    """Copy everything printed to a file as well, so the report can be shared as text."""
+
+    def __init__(self, path: Path, stream):
+        self._file = open(path, "w", encoding="utf-8", buffering=1)
+        self._stream = stream
+
+    def write(self, text: str) -> int:
+        self._stream.write(text)
+        self._file.write(text)
+        return len(text)
+
+    def flush(self) -> None:
+        self._stream.flush()
+        self._file.flush()
+
+    def close(self) -> None:
+        self._file.close()
+
+
 def discover(PySpin, system) -> list[str]:
     found = system.GetCameras()
     try:
@@ -626,7 +647,18 @@ def main(argv=None) -> int:
 
     out_dir = Path(args.out_dir) / f"sync_probe_{datetime.now():%Y%m%d_%H%M%S}"
     out_dir.mkdir(parents=True, exist_ok=True)
+    tee = Tee(out_dir / "report.txt", sys.stdout)
+    sys.stdout = tee
+    try:
+        return _run(PySpin, args, out_dir)
+    finally:
+        sys.stdout = tee._stream
+        tee.close()
+        print(f"Report saved to {out_dir / 'report.txt'}")
 
+
+def _run(PySpin, args, out_dir: Path) -> int:
+    print(f"sync_probe {args.command}  {datetime.now():%Y-%m-%d %H:%M:%S}  args: {vars(args)}")
     system = PySpin.System.GetInstance()
     try:
         discovered = discover(PySpin, system)

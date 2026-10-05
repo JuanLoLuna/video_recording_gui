@@ -36,6 +36,24 @@ Two parts, done in this order: **A. Sync** (needed first; it also lets the per-s
 - NI DAQ support exists for one digital-output line (`ni_control.NIDaqDO`, `PulseManager`, the "Sync Pulse" button), Windows only, opt-in via `SLEEVE_VIDEO_GUI_NI`. No counter/pulse-train output yet.
 - Evidence from the multi-camera plan: both cameras free-run at 60 fps with 0 gaps (probe), MJPEG at 60 fps passed a 5 min smoke run; **no 60 min run at 60 fps yet**, and none with triggering.
 
+## Rig evidence — `sync_probe.py nodes`, 2026-10-05
+
+| | Firefly FFY-U3-04S2M #23227865 (fw 2101.0.19.0) | Blackfly S BFS-U3-13Y3M #26134271 (fw 1808.0.120.0) |
+|---|---|---|
+| GPIO | Line0–3, each Input **or** Output; `LineFormat` not reported (non-isolated) | Line0 opto-isolated **input**; Line1 opto-isolated **output**; Line2 non-isolated Input/Output (`V3_3Enable` available); Line3 non-isolated **input** only |
+| Output sources | `ExposureActive`, `FrameTriggerWait`, line passthrough, `SerialPort0` | same + `UserOutput0–3`, counters, logic blocks |
+| FrameStart `TriggerSource` | Software, Line0–3 | Software, Line0, Line2, Line3, UserOutput0–3, counters, logic blocks |
+| `TriggerActivation` | LevelLow/High, Falling/RisingEdge | same + AnyEdge |
+| `TriggerOverlap` | **not available** (trigger only after the previous readout) | Off / **ReadOut** |
+| `TriggerDelay` | **not available** | 14–65 520 µs |
+| Timestamp latch | yes (`TimestampIncrement` 480) | yes (`TimestampIncrement` 1000) |
+
+Consequences:
+- **Both wirings are possible.** The Blackfly is the better *secondary*: it has `TriggerOverlap=ReadOut` (higher triggered rates) and `TriggerDelay` (to line up exposure centres when exposures differ). Proposed H1: **Firefly primary** (`LineN` Output, `LineSource=ExposureActive`) → **Blackfly secondary** on **Line3** (non-isolated input) or Line0 (opto input), `RisingEdge`, overlap `ReadOut`. Common ground between the two GPIO connectors is required; output drive / pull-up of the Firefly's non-isolated lines to be confirmed from the FLIR Firefly GPIO wiring note before connecting.
+- For H2 (external generator) both cameras can take an input: Blackfly Line0 (opto, tolerant of 5 V signals) or Line3; Firefly any of Line0–3 (check its input voltage range).
+- Firefly as a secondary has no overlap: exposure + readout must fit the period (fine at 60 fps with exposure ≤ ~14 ms).
+- `TimestampIncrement` differs (480 vs 1000); the `skew` run measures each camera's real tick length directly.
+
 ---
 
 # Part A — Camera sync

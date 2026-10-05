@@ -10,6 +10,8 @@ Script: [`scripts/sync_probe.py`](../../scripts/sync_probe.py).
 
 **Time:** about 1 hour in total. Part 1 takes 1 min, Part 2 about 22 min unattended, Part 3 about 25 min.
 
+**No screenshots needed.** Every run writes `report.txt` (exactly what was printed) plus JSON/CSV files into its own `probe_output\sync_probe_<date>_<time>\` folder. Send those folders back.
+
 **Nothing in this step changes the recorder.** The probe opens the cameras directly, the same way `scripts/multi_camera_probe.py` does, and writes only CSV/JSON files.
 
 ---
@@ -62,7 +64,7 @@ python scripts\sync_probe.py nodes
 - [ ] Both cameras are listed, and both show `SuperSpeed`.
 - [ ] Note whether each camera says `timestamp latch: yes`. A `NO` is not a failure, but tell me.
 
-The full details are saved to `probe_output\sync_probe_<date>_<time>\nodes.json`.
+Saved to `probe_output\sync_probe_<date>_<time>\`: `report.txt` (what you saw) and `nodes.json` (full details).
 
 ---
 
@@ -99,7 +101,9 @@ python scripts\sync_probe.py skew
 **Check:**
 - [ ] Every camera line ends in `OK`, meaning 0 gaps, 0 incomplete and 0 errors. If not, note which camera and fps.
 - [ ] `tick` is about 1.0 ns. This confirms the metadata column `timestamp_us` is really nanoseconds.
-- [ ] Write down the **Gap between cameras** lines for 30 and 60 fps. These numbers are what plan Q4 is decided on.
+- [ ] The **Gap between cameras** lines for 30 and 60 fps are what plan Q4 is decided on. They are in `report.txt`; no need to copy them by hand.
+
+Saved to `probe_output\sync_probe_<date>_<time>\`: `report.txt`, `summary.json`, and the raw `*_frames.csv`, `*_latch.csv` and `*_phase.csv`.
 
 For a quick 1-minute trial first:
 
@@ -164,12 +168,12 @@ python video_fiducial_diagnose.py --video <rec folder>\recording_<stamp>_cam<ser
 
 | What | Where |
 |---|---|
-| Part 1 + Part 2 output (the whole folders) | `probe_output\sync_probe_*\` in the recorder repo |
+| Part 1 + Part 2 output: the whole folders, including `report.txt` | `probe_output\sync_probe_*\` in the recorder repo |
 | Both recordings: all `.avi`, `_metadata.csv`, `_events.jsonl` and `_segments.csv` files of both cameras | the recorder's output folder |
 | Heartbeat logs | `D:\sync-logs\heartbeat_*.jsonl` |
 | Notes | anything odd: a camera not OK, latch `NO`, the LED hard to see, etc. |
 
-Copy them to the server, or tell me where they are.
+Copy them to the server, or tell me where they are. For the optional check in 3.6, save its output too: add `| Tee-Object -FilePath fiducial_<serial>.txt` to each command.
 
 ## Troubleshooting
 
