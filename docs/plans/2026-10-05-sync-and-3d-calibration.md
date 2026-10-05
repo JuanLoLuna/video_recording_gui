@@ -93,6 +93,7 @@ Recorder (MJPEG, 30 fps) `recording_20261005_135059`, 5.75 min, heartbeat `heart
 - **The LED mapping agrees with the latch mapping** within the fit's uncertainty (about ±9 ppm for 6 min of 2–4 s pulses; longer recordings tighten it).
 - **The inter-camera gap measured through the LED** (median 8.0, p99 16.5, max 16.7 ms) matches the probe → two independent methods agree.
 - The existing single-camera `video_fiducial_diagnose.py` REJECTs the same data: it fits on frame index at an assumed rate and full-frame brightness. Step 2 must fit on camera timestamps with an LED ROI, as done here.
+- **60 fps run** (`recording_20261005_135859`, 12 min, uncompressed through the real recorder, 6 + 19 segments, every segment decoded = manifest; heartbeat `T175836Z`): Firefly / Blackfly **236 / 236 flashes matched of 236**, 0 unmatched; residuals ±8.4 / ±9.0 ms (≈ ± half a 60 fps frame); clock vs laptop +4.5 / +6.1 ppm (latch probe: +5.1 / +5.7); inter-camera gap median 4.15, p99 8.25, max 8.34 ms (probe: 4.15 / 8.25 / 8.34). Recording: 43 318 / 43 330 frames, 0 FrameID gaps, 0 reinits.
 - Precision now: frame-level onsets (±½ frame each, averaged over the pulses). Sub-frame onsets from partially lit frames (9 and 21 such frames here) are the step 2 improvement.
 
 ---
