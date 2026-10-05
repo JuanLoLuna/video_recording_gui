@@ -13,6 +13,7 @@ The per-session setup task (fixed board, plan step 14) is not built yet.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -31,7 +32,6 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
-    QMessageBox,
     QPushButton,
     QStackedWidget,
     QVBoxLayout,
@@ -44,10 +44,12 @@ from gui.camera_preview import frame_to_qimage
 
 DETECT_INTERVAL_S = 0.2       # worker: ~5 detections per second
 UI_INTERVAL_MS = 120
+NO_FRAMES_S = 1.5             # no new detection for this long while capturing = Preview stopped
 LIVE_VIEW_SIZE = (720, 540)
 
 _BIG = "font-size: 16px; font-weight: 600;"
 _HINT = "color: #555;"
+_ERROR = "color: #c62828; font-weight: 600;"
 
 
 class _Detector:
@@ -115,6 +117,10 @@ def write_board_pdf(path: str, cfg: cal.BoardConfig, label: str, dpi: int = 600)
                                      QMarginsF(0, 0, 0, 0)))
     mm = dpi / 25.4
     painter = QPainter(writer)
+    if not painter.isActive():  # QPdfWriter raises nothing when it cannot open the file
+        raise OSError(f"cannot write {path} (open in another program, or the folder is not writable?)")
+    # Without this Qt stores the board JPEG-compressed in the PDF.
+    painter.setRenderHint(QPainter.RenderHint.LosslessImageRendering)
     try:
         x0 = (297 - w_mm) / 2 * mm
         y0 = 10 * mm
@@ -135,6 +141,8 @@ def write_board_pdf(path: str, cfg: cal.BoardConfig, label: str, dpi: int = 600)
                          "Print at 100% / Actual size. Bar = 100 mm: measure it and one square before use.")
     finally:
         painter.end()
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        raise OSError(f"{path} was not written")
 
 
 class CalibrationWindow(QDialog):
@@ -163,6 +171,8 @@ class CalibrationWindow(QDialog):
         self._compute: Future | None = None
         self._result: cal.IntrinsicsResult | None = None
         self._removed_note = ""
+        self._saved_record: IntrinsicsRecord | None = None   # written but not yet made current (retry)
+        self._last_new_at = 0.0
 
         self.stack = QStackedWidget()
         root = QVBoxLayout(self)
@@ -205,6 +215,10 @@ class CalibrationWindow(QDialog):
         self.saved_label.setWordWrap(True)
         self.saved_label.setStyleSheet("color: #2e7d32; font-weight: 600;")
         v.addWidget(self.saved_label)
+        self.home_error = QLabel("")
+        self.home_error.setWordWrap(True)
+        self.home_error.setStyleSheet(_ERROR)
+        v.addWidget(self.home_error)
 
         self.calibrate_camera_button = QPushButton("1. Calibrate a camera…")
         self.calibrate_camera_button.setMinimumHeight(40)
@@ -281,6 +295,10 @@ class CalibrationWindow(QDialog):
         how.setWordWrap(True)
         how.setStyleSheet(_HINT)
         v.addWidget(how)
+        self.check_error = QLabel("")
+        self.check_error.setWordWrap(True)
+        self.check_error.setStyleSheet(_ERROR)
+        v.addWidget(self.check_error)
         v.addStretch(1)
         nav = QHBoxLayout()
         back = QPushButton("Back")
@@ -360,6 +378,10 @@ class CalibrationWindow(QDialog):
         self.result_text.setWordWrap(True)
         self.result_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         v.addWidget(self.result_text)
+        self.save_error = QLabel("")
+        self.save_error.setWordWrap(True)
+        self.save_error.setStyleSheet(_ERROR)
+        v.addWidget(self.save_error)
         v.addStretch(1)
         nav = QHBoxLayout()
         self.more_views_button = QPushButton("Back: add more views")
@@ -387,7 +409,11 @@ class CalibrationWindow(QDialog):
     def _refresh_camera_state(self) -> None:
         lines = []
         for slot in self.slots:
-            rec = self.store.current_intrinsics(slot.serial)
+            try:
+                rec = self.store.current_intrinsics(slot.serial)
+            except Exception as exc:  # a damaged folder must not stop the window from opening
+                lines.append(f"{slot.label}: could not read the saved calibration ({exc})")
+                continue
             state = "not calibrated" if rec is None else (
                 f"calibrated {rec.created_at.replace('T', ' ')}, {rec.rms_px:.2f} px"
                 + (" (saved as failed)" if rec.loose else ""))
@@ -406,8 +432,9 @@ class CalibrationWindow(QDialog):
 
     # ---------------------------------------------------------------- capture
     def _start_capture(self) -> None:
+        self.check_error.setText("")
         if not self.ensure_preview():
-            QMessageBox.warning(self, "Calibration", "The cameras could not start. Check them in the main window.")
+            self.check_error.setText("The cameras could not start. Check them in the main window.")
             return
         preset = cal.BOARD_PRESETS[self.board_combo.currentText()]
         self._board_cfg = cal.with_measured_square(preset, self.square_spin.value())
@@ -417,6 +444,7 @@ class CalibrationWindow(QDialog):
         self._detector = _Detector(self._selected_slot().controller, detector)
         self._last_seq = 0
         self._last_det = None
+        self._last_new_at = time.monotonic()
         self.capture_head.setText(f"Calibrate {self._selected_slot().label}: step 2 of 3, move the board")
         self._go(self.page_capture)
         self.ui_timer.start()
@@ -427,6 +455,7 @@ class CalibrationWindow(QDialog):
             return
         self._detector = self._detector or _Detector(self._selected_slot().controller,
                                                      cal.BoardDetector(self._board_cfg))
+        self._last_new_at = time.monotonic()
         self._go(self.page_capture)
         self.ui_timer.start()
         self._update_capture_labels()
@@ -448,9 +477,16 @@ class CalibrationWindow(QDialog):
             return
         latest = self._detector.latest()
         if latest is None or latest[0] == self._last_seq:
+            # Every frame the worker sees gives a detection (board or not), so a
+            # silent worker means no frames: Preview was stopped in the main window.
+            if time.monotonic() - self._last_new_at > NO_FRAMES_S and self._last_state != "preview stopped":
+                self._last_state = "preview stopped"
+                self.live_view.setText("Preview stopped: start it again in the main window")
+                self._update_capture_labels()
             return
         seq, frame, det = latest
         self._last_seq, self._last_det = seq, det
+        self._last_new_at = time.monotonic()
         update = self._session.feed(det, time.monotonic())
         self._last_state = update.state
         image = frame_to_qimage(draw_overlay(frame, det))
@@ -471,6 +507,7 @@ class CalibrationWindow(QDialog):
             "steady": "Hold still…",
             "captured": "Captured.",
             "seen already": "Already have this view: move to a new position or angle.",
+            "preview stopped": "Preview stopped: start it again in the main window.",
         }.get(self._last_state, "")
         self.capture_state.setText(f"{n} / {target} views.  {text}")
         cov = self._session.coverage
@@ -502,6 +539,8 @@ class CalibrationWindow(QDialog):
         self.ui_timer.stop()
         self._stop_detector()
         board = self._session.board
+        self._saved_record = None   # a new result is a new record
+        self.save_error.setText("")
         # A view whose board pose cannot be solved makes calibrateCamera fail, and
         # adding views cannot cure that: leave such views out and say so.
         unusable = cal.unusable_views(self._session.views, board)
@@ -565,30 +604,62 @@ class CalibrationWindow(QDialog):
     def _save(self, loose: bool) -> None:
         if self._result is None or self._session is None:
             return
+        self.save_error.setText("")
         slot = self._selected_slot()
-        fingerprint = slot.controller.get_sensor_fingerprint() or {}
+        fingerprint = slot.controller.get_sensor_fingerprint()
         w, h = self._result.image_size
-        if fingerprint.get("Width") not in (None, w) or fingerprint.get("Height") not in (None, h):
-            QMessageBox.warning(self, "Calibration", "The camera's resolution changed during calibration. "
-                                                     "Calibrate again.")
+        # Without the camera's settings on record, a later change to them (binning,
+        # ROI, ...) could never be noticed, so such a calibration is not saved.
+        if not fingerprint or fingerprint.get("Width") is None or fingerprint.get("Height") is None:
+            self.save_error.setText("Cannot save: the camera's settings cannot be read right now. "
+                                    "Start Preview in the main window, then press Save again.")
             return
-        cov = self._session.coverage
-        record = IntrinsicsRecord(
-            serial=slot.serial, model=slot.model,
-            K=self._result.K.tolist(), D=[float(d) for d in self._result.D],
-            image_size=[int(w), int(h)], fingerprint=fingerprint, board=self._board_cfg.to_dict(),
-            rms_px=float(self._result.rms_px), n_views=int(self._result.n_views),
-            per_view_rms_px=[float(e) for e in self._result.per_view_rms_px],
-            coverage={"cells": sorted(list(c) for c in cov.cells), "near": cov.near, "far": cov.far,
-                      "tilted": cov.tilted, "flat": cov.flat},
-            loose=loose,
-        )
-        path = self.store.save_intrinsics(record)
-        self.on_saved()
+        if fingerprint["Width"] != w or fingerprint["Height"] != h:
+            self.save_error.setText("Cannot save: the camera's resolution changed during calibration. "
+                                    "Go back and calibrate again.")
+            return
+        record = self._saved_record
+        if record is None or record.loose != loose or record.serial != slot.serial:
+            self._saved_record = None
+            cov = self._session.coverage
+            record = IntrinsicsRecord(
+                serial=slot.serial, model=slot.model,
+                K=self._result.K.tolist(), D=[float(d) for d in self._result.D],
+                image_size=[int(w), int(h)], fingerprint=fingerprint, board=self._board_cfg.to_dict(),
+                rms_px=float(self._result.rms_px), n_views=int(self._result.n_views),
+                per_view_rms_px=[float(e) for e in self._result.per_view_rms_px],
+                coverage={"cells": sorted(list(c) for c in cov.cells), "near": cov.near, "far": cov.far,
+                          "tilted": cov.tilted, "flat": cov.flat},
+                loose=loose,
+            )
+        try:
+            if self._saved_record is None:
+                self.store.save_intrinsics(record, make_current=False)
+                self._saved_record = record  # a retry only has to switch the pointer, not write a second record
+            path = self.store.set_current_intrinsics(record)
+        except Exception as exc:  # disk full, file locked by a scanner, folder not writable...
+            self.save_error.setText(f"Could not save the calibration: {exc}\n"
+                                    f"Folder: {self.store.intrinsics_dir(slot.serial)}\nPress Save to try again.")
+            return
+        self._saved_record = None
+        try:
+            self.on_saved()
+        except Exception as exc:  # the record is safe; only the status line failed to refresh
+            print(f"[calibration] status refresh after save failed: {exc}")
         self._session = None
         self._result = None
         self.saved_label.setText(f"Saved {slot.label}" + (" (marked as failed)" if loose else "") + f": {path}")
+        self._prepare_next_camera(slot.serial)
         self._go(self.page_home)
+
+    def _prepare_next_camera(self, saved_serial: str) -> None:
+        """After a save: clear the checklist and pre-select the next camera that still needs calibrating."""
+        for box in self.checks:
+            box.setChecked(False)
+        for other in self.slots:
+            if other.serial != saved_serial and self.store.current_intrinsics(other.serial) is None:
+                self.camera_combo.setCurrentIndex(self.camera_combo.findData(other.serial))
+                break
 
     # ------------------------------------------------------------------ board
     def _on_print_board(self) -> None:
@@ -597,12 +668,16 @@ class CalibrationWindow(QDialog):
         path, _ = QFileDialog.getSaveFileName(self, "Save printable board", default, "PDF (*.pdf)")
         if not path:
             return
+        self.home_error.setText("")
         try:
             write_board_pdf(path, cal.BOARD_PRESETS[name], name)
         except Exception as exc:
-            QMessageBox.warning(self, "Calibration", f"Could not write the board: {exc}")
+            self.home_error.setText(f"Could not write the board: {exc}")
             return
-        QMessageBox.information(self, "Calibration", f"Saved {path}.\nPrint it at 100% / Actual size.")
+        self.saved_label.setText(f"Saved {path}. Print it at 100% / Actual size.")
+
+    def has_unsaved_result(self) -> bool:
+        return self._result is not None
 
     # --------------------------------------------------------------- shutdown
     def _shutdown(self) -> None:
