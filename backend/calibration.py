@@ -92,6 +92,11 @@ class BoardConfig:
     def corner_count(self) -> int:
         return (self.squares_x - 1) * (self.squares_y - 1)
 
+    @property
+    def centre_m(self) -> tuple[float, float, float]:
+        """Centre of the board in its own frame (the origin is a corner)."""
+        return self.squares_x * self.square_length_m / 2, self.squares_y * self.square_length_m / 2, 0.0
+
 
 # The boards in use (plan decision 10). Squares/markers are the NOMINAL print
 # sizes; with_measured_square() rescales both to what the printer produced.
@@ -530,6 +535,12 @@ class SetupResult:
     baseline_mm: float | None      # distance between the first two camera centres
     triangulation_rms_mm: float | None
     triangulated_corners: int
+    expected: tuple = ()           # serials compute_setup was given (a camera without a pose is dropped from `poses`)
+
+    @property
+    def missing(self) -> list:
+        """Cameras that were given but whose pose could not be solved (board not found)."""
+        return [s for s in self.expected if s not in self.poses]
 
     @property
     def per_camera_passed(self) -> dict:
@@ -538,6 +549,8 @@ class SetupResult:
     @property
     def passed(self) -> bool:
         if not self.poses or not all(self.per_camera_passed.values()):
+            return False
+        if len(self.expected) >= 2 and self.missing:  # one of two cameras posed is not a 3D setup
             return False
         if len(self.poses) >= 2:
             return self.triangulation_rms_mm is not None and self.triangulation_rms_mm < SETUP_TRIANGULATION_RMS_MM
@@ -576,7 +589,8 @@ def compute_setup(dets: dict, intrinsics: dict, board) -> SetupResult:
         a, b = serials[:2]
         baseline = float(np.linalg.norm(poses[a].camera_centre_m - poses[b].camera_centre_m) * 1000.0)
         tri, n_tri = triangulate_board(dets[a], poses[a], *intrinsics[a], dets[b], poses[b], *intrinsics[b], board)
-    return SetupResult(poses=poses, baseline_mm=baseline, triangulation_rms_mm=tri, triangulated_corners=n_tri)
+    return SetupResult(poses=poses, baseline_mm=baseline, triangulation_rms_mm=tri, triangulated_corners=n_tri,
+                       expected=tuple(dets))
 
 
 def kabsch_rms_mm(points_m: np.ndarray, truth_m: np.ndarray) -> float:
@@ -656,9 +670,19 @@ class MoveCheck:
         return self.translation_mm > SETUP_MOVED_TRANSLATION_MM or self.rotation_deg > SETUP_MOVED_ROTATION_DEG
 
 
-def compare_poses(saved: BoardPose, live: BoardPose) -> MoveCheck:
-    """How far a camera moved relative to the fixed board since the setup was saved."""
+def compare_poses(saved: BoardPose, live: BoardPose, board_centre_m: Sequence[float]) -> MoveCheck:
+    """How far a camera moved relative to the fixed board since the setup was saved.
+
+    Both poses are compared in the CAMERA's frame: the angle between the two
+    board rotations, and the shift of the board centre (R @ c + t, c in the
+    board frame, e.g. BoardConfig.centre_m). The camera centre in the board frame
+    would multiply the rotation noise of a single pose by the board distance (0.24
+    degrees = 5 mm at 1.2 m), so a 5 mm limit would fire on noise alone; the
+    board centre is where the fit is best pinned.
+    """
+    c = np.asarray(board_centre_m, dtype=float).reshape(3)
+    shift = (saved.R @ c + saved.t) - (live.R @ c + live.t)
     return MoveCheck(
-        translation_mm=float(np.linalg.norm(saved.camera_centre_m - live.camera_centre_m) * 1000.0),
+        translation_mm=float(np.linalg.norm(shift) * 1000.0),
         rotation_deg=rotation_angle_deg(saved.R, live.R),
     )

@@ -282,6 +282,17 @@ class SetupTest(unittest.TestCase):
         self.assertEqual(result.triangulated_corners, CFG.corner_count)
         self.assertTrue(result.passed)
 
+    def test_a_camera_without_a_pose_fails_the_setup(self):
+        blank = cal.Detection(np.zeros((0, 2), np.float32), np.zeros((0,), np.int32), 0, IMAGE_SIZE)
+        result = cal.compute_setup({"A": self.da, "B": blank}, self.intr, self.det.board)
+        self.assertEqual(list(result.poses), ["A"])
+        self.assertEqual(result.missing, ["B"])
+        self.assertFalse(result.passed)
+        result = cal.compute_setup({"A": self.da, "B": None}, self.intr, self.det.board)
+        self.assertFalse(result.passed)
+        # One camera on its own is still a valid single-camera check.
+        self.assertTrue(cal.compute_setup({"A": self.da}, self.intr, self.det.board).passed)
+
     def _verify(self, intr, offset=(0.08, -0.06, -0.22)):
         """Setup from the fixed board, then the board moved by (M, offset) in the fixed board's frame
         (negative z = raised toward the cameras) and verified with the SAVED poses."""
@@ -314,6 +325,62 @@ class SetupTest(unittest.TestCase):
         _, verify = self._verify(self.intr, offset=(0.1, -0.05, -0.03))
         self.assertFalse(verify.passed)
         self.assertTrue(any("raise the board" in p for p in verify.problems), verify.problems)
+
+
+class MovedCheckTest(unittest.TestCase):
+    """The fixed-board drift check at the rig's working distance (1.2 m, A4 board)."""
+
+    def setUp(self):
+        self.cfg = cal.BOARD_PRESETS[cal.FIXED_PRESET]
+        self.board = cal.make_board(self.cfg)
+        self.K = np.array([[1150.0, 0, 640], [0, 1150.0, 512], [0, 0, 1]])
+        self.ids = np.arange(self.cfg.corner_count, dtype=np.int32)
+        self.obj = self.board.getChessboardCorners().astype(np.float64)
+        self.rng = np.random.default_rng(0)
+        self.centre = np.array(self.cfg.centre_m)
+
+    def pose(self, rot_deg, shift=(0.0, 0.0, 0.0), dist=1.2):
+        R, _ = cv2.Rodrigues(np.radians(np.array(rot_deg, dtype=float)))
+        return R, np.array([0, 0, dist]) - R @ self.centre + np.array(shift)
+
+    def solve(self, R, t, noise_px):
+        rvec, _ = cv2.Rodrigues(R)
+        pts, _ = cv2.projectPoints(self.obj, rvec, t, self.K, np.zeros(5))
+        pts = pts.reshape(-1, 2) + self.rng.normal(0, noise_px, (len(self.obj), 2))
+        det = cal.Detection(pts.astype(np.float32), self.ids, 12, (1280, 1024), self.cfg.squares_x - 1)
+        return cal.solve_board_pose(det, self.board, self.K, np.zeros(5))
+
+    def test_corner_noise_is_not_a_move(self):
+        R, t = self.pose((20, 0, 0))
+        saved = self.solve(R, t, 0.0)
+        old_style_mm = []
+        # At 0.2 px a single frame's rotation (limit 0.5 deg) is itself near the noise: a few %
+        # of single frames, which is why the live pose should be an average of many frames.
+        for noise, allowed_false_alarms in ((0.1, 0), (0.2, 0.1)):
+            checks = [cal.compare_poses(saved, self.solve(R, t, noise), self.centre) for _ in range(200)]
+            # Translation is never the reason, even at 0.2 px (the board centre moves ~1-3 mm; limit 5 mm).
+            self.assertLess(max(c.translation_mm for c in checks), cal.SETUP_MOVED_TRANSLATION_MM)
+            self.assertLessEqual(np.mean([c.moved for c in checks]), allowed_false_alarms, noise)
+        # What this replaced: the camera centre in the board frame, at 0.2 px.
+        for _ in range(200):
+            live = self.solve(R, t, 0.2)
+            old_style_mm.append(np.linalg.norm(saved.camera_centre_m - live.camera_centre_m) * 1000)
+        self.assertGreater(np.mean(np.array(old_style_mm) > cal.SETUP_MOVED_TRANSLATION_MM), 0.25)
+
+    def test_a_real_turn_or_shift_is_detected(self):
+        R0, t0 = self.pose((20, 0, 0))
+        saved = self.solve(R0, t0, 0.0)
+        turned = cal.compare_poses(saved, self.solve(*self.pose((20, 2, 0)), 0.1), self.centre)
+        self.assertTrue(turned.moved)
+        self.assertGreater(turned.rotation_deg, 1.5)
+        for axis in ((0.01, 0, 0), (0, 0.01, 0), (0, 0, 0.01)):  # 10 mm sideways, up, toward the camera
+            shifted = cal.compare_poses(saved, self.solve(*self.pose((20, 0, 0), axis), 0.1), self.centre)
+            self.assertTrue(shifted.moved, axis)
+            self.assertAlmostEqual(shifted.translation_mm, 10.0, delta=1.5)
+        same = cal.compare_poses(saved, saved, self.centre)
+        self.assertAlmostEqual(same.translation_mm, 0.0)
+        self.assertAlmostEqual(same.rotation_deg, 0.0, places=3)
+        self.assertFalse(same.moved)
 
 
 class PresetsTest(unittest.TestCase):
