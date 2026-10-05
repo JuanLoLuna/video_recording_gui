@@ -77,6 +77,63 @@ class StoreTest(unittest.TestCase):
         self.assertEqual([r.rms_px for r in history], [0.3, 0.2, 0.25])
         self.assertEqual(self.store.current_intrinsics("23227865").rms_px, 0.2)
 
+    def test_history_is_in_time_order_beyond_nine_in_one_second(self):
+        for i in range(12):
+            self.store.save_intrinsics(intrinsics(rms_px=0.1 + i / 100), now=NOW)
+        history = self.store.intrinsics_history("23227865")
+        self.assertEqual([r.id for r in history][:3], ["20261006_100000", "20261006_100000_2", "20261006_100000_3"])
+        self.assertEqual([r.id for r in history][-2:], ["20261006_100000_11", "20261006_100000_12"])
+        self.store.save_intrinsics(intrinsics(), now=NOW + timedelta(seconds=1))
+        self.assertEqual(self.store.intrinsics_history("23227865")[-1].id, "20261006_100001")
+
+    def test_concurrent_writers_never_share_or_overwrite_a_record(self):
+        import threading
+        barrier = threading.Barrier(8)
+        paths, errors = [], []
+
+        def writer(i):
+            store = cs.CalibrationStore(self.tmp.name)   # separate instances, like two app copies
+            barrier.wait()
+            try:
+                paths.append(store.save_intrinsics(intrinsics(rms_px=i / 100), now=NOW))
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        threads = [threading.Thread(target=writer, args=(i,)) for i in range(8)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        self.assertEqual(errors, [])
+        self.assertEqual(len(set(paths)), 8)
+        rms = sorted(r.rms_px for r in self.store.intrinsics_history("23227865"))
+        self.assertEqual(rms, [i / 100 for i in range(8)])   # every record kept its own content
+        self.assertEqual(sorted(p.name for p in self.store.intrinsics_dir("23227865").glob("*.tmp")), [])
+
+    def test_an_existing_record_is_never_replaced(self):
+        folder = self.store.intrinsics_dir("23227865")
+        folder.mkdir(parents=True)
+        (folder / "20261006_100000.json").write_text("someone else's")
+        path = self.store.save_intrinsics(intrinsics(), now=NOW)
+        self.assertEqual(path.name, "20261006_100000_2.json")
+        self.assertEqual((folder / "20261006_100000.json").read_text(), "someone else's")
+
+    def test_temp_files_are_unique_and_a_failed_write_leaves_nothing(self):
+        from unittest import mock
+        sources = []
+        real_replace = cs.os.replace
+        with mock.patch.object(cs.os, "replace", side_effect=lambda a, b: (sources.append(a), real_replace(a, b))):
+            self.store.save_intrinsics(intrinsics(), now=NOW)
+            self.store.save_intrinsics(intrinsics(), now=NOW + timedelta(seconds=5))
+        pointer_tmps = [s for s in sources if "current.json" in str(s)]
+        self.assertEqual(len(pointer_tmps), 2)
+        self.assertEqual(len(set(pointer_tmps)), 2)
+        self.assertNotIn("current.json.tmp", [Path(s).name for s in sources])
+        folder = self.store.intrinsics_dir("23227865")
+        before = sorted(p.name for p in folder.iterdir())
+        with mock.patch.object(cs.os, "replace", side_effect=PermissionError("locked")):
+            with self.assertRaises(PermissionError):
+                self.store.save_intrinsics(intrinsics(), now=NOW + timedelta(days=1))
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), before)   # no placeholder, no tmp
+
     def test_cameras_are_kept_apart(self):
         self.store.save_intrinsics(intrinsics("A"), now=NOW)
         self.assertIsNone(self.store.current_intrinsics("B"))

@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import uuid
 from dataclasses import MISSING as MISSING_DEFAULT
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
@@ -196,12 +197,28 @@ class SetupRecord:
 
 def _write_json_atomic(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    # A name of its own, so two writers (two app instances) never share a temp file.
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        with open(tmp, "x", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _id_order(stem: str) -> tuple:
+    """Sort key for record ids '<YYYYMMDD>_<HHMMSS>[_<n>]': chronological, '_10' after '_2'."""
+    parts = stem.split("_")
+    if len(parts) in (2, 3) and all(p.isdigit() for p in parts):
+        return (parts[0] + parts[1], int(parts[2]) if len(parts) == 3 else 1, stem)
+    return (stem, 0, stem)
 
 
 def _read_json(path: Path) -> dict | None:
@@ -219,12 +236,34 @@ class CalibrationStore:
 
     # -- helpers -----------------------------------------------------------
     @staticmethod
-    def _free_name(folder: Path, base: str) -> str:
+    def _claim_name(folder: Path, base: str) -> str:
+        """Create '<name>.json' exclusively (an empty placeholder) and return the name.
+
+        Exclusive creation is what makes "never overwritten" hold with two
+        writers: the loser of a race gets FileExistsError and takes the next name.
+        """
+        folder.mkdir(parents=True, exist_ok=True)
         name, n = base, 1
-        while (folder / f"{name}.json").exists():
-            n += 1
-            name = f"{base}_{n}"
-        return name
+        while True:
+            try:
+                with open(folder / f"{name}.json", "x"):
+                    return name
+            except FileExistsError:
+                n += 1
+                name = f"{base}_{n}"
+
+    def _write_new_record(self, folder: Path, record, base: str) -> Path:
+        record.id = self._claim_name(folder, base)
+        path = folder / f"{record.id}.json"
+        try:
+            _write_json_atomic(path, record.to_dict())   # replaces the placeholder
+        except BaseException:
+            try:
+                path.unlink()   # never leave an empty claim behind
+            except OSError:
+                pass
+            raise
+        return path
 
     def _set_current(self, folder: Path, file_stem: str) -> None:
         _write_json_atomic(folder / "current.json", {"file": f"{file_stem}.json"})
@@ -243,10 +282,8 @@ class CalibrationStore:
                         make_current: bool = True) -> Path:
         now = now or datetime.now()
         folder = self.intrinsics_dir(record.serial)
-        record.id = self._free_name(folder, stamp(now))
         record.created_at = record.created_at or now.isoformat(timespec="seconds")
-        path = folder / f"{record.id}.json"
-        _write_json_atomic(path, record.to_dict())
+        path = self._write_new_record(folder, record, stamp(now))
         if make_current:
             self._set_current(folder, record.id)
         return path
@@ -264,7 +301,7 @@ class CalibrationStore:
     def intrinsics_history(self, serial: str) -> list[IntrinsicsRecord]:
         folder = self.intrinsics_dir(serial)
         out = []
-        for path in sorted(folder.glob("*.json")):
+        for path in sorted(folder.glob("*.json"), key=lambda p: _id_order(p.stem)):
             if path.name == "current.json":
                 continue
             record = IntrinsicsRecord.from_dict(_read_json(path))
@@ -279,10 +316,8 @@ class CalibrationStore:
 
     def save_setup(self, record: SetupRecord, now: datetime | None = None) -> Path:
         now = now or datetime.now()
-        record.id = self._free_name(self.setups_dir, stamp(now))
         record.created_at = record.created_at or now.isoformat(timespec="seconds")
-        path = self.setups_dir / f"{record.id}.json"
-        _write_json_atomic(path, record.to_dict())
+        path = self._write_new_record(self.setups_dir, record, stamp(now))
         self._set_current(self.setups_dir, record.id)
         return path
 
