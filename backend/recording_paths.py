@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -84,6 +85,25 @@ def session_basename(started_at: datetime) -> str:
     return f"recording_{started_at.strftime('%Y%m%d_%H%M%S')}"
 
 
+# Windows sometimes answers a folder operation wrongly for a moment (see
+# ensure_directory). Counting those lets a run report how often it happened
+# instead of leaving it to someone reading the console.
+_transient_lock = threading.Lock()
+_transient_count = 0
+
+
+def note_transient_error() -> None:
+    global _transient_count
+    with _transient_lock:
+        _transient_count += 1
+
+
+def transient_error_count() -> int:
+    """How many staging-folder operations in this process needed a retry."""
+    with _transient_lock:
+        return _transient_count
+
+
 def ensure_directory(
     path: Path,
     *,
@@ -94,13 +114,16 @@ def ensure_directory(
 ) -> None:
     """mkdir -p that tolerates a transient filesystem error on Windows.
 
-    Two cameras share the .incomplete staging folder and both create it. On the
-    rig, Path.mkdir(exist_ok=True) failed once with WinError 183 ("file already
-    exists") although the folder was there (pathlib re-raises when its own
-    is_dir() check also flaps), which aborted a pre-armed segment. Retry a few
-    times with a short, growing pause and only raise if the folder is really not
-    usable; the first failure is logged with enough state to diagnose it.
+    On the rig, Path.mkdir(exist_ok=True) failed with WinError 183 ("file
+    already exists") on a staging folder that existed and had never been
+    removed (pathlib re-raises when its own is_dir() check also flaps), which
+    aborted a pre-armed segment. A folder that is already there is left alone
+    (no mkdir at all); otherwise retry a few times with a short, growing pause
+    and only raise if the folder is really not usable. The first failure is
+    logged with enough state to diagnose it and counted.
     """
+    if path.is_dir():
+        return
     last: OSError | None = None
     for attempt in range(attempts):
         try:
@@ -111,6 +134,7 @@ def ensure_directory(
             if path.is_dir():
                 return
             if attempt == 0:
+                note_transient_error()
                 log(
                     f"[paths] could not create {path}: {exc} "
                     f"(exists={path.exists()}, parent_exists={path.parent.exists()}); retrying"
@@ -186,8 +210,17 @@ class SessionPaths:
         Keeps a concurrent Box/rclone copy of output_dir from ever seeing
         a half-written AVI: only fully-closed, canonically-named segments
         exist directly under output_dir.
+
+        The primary / only camera stages directly in ".incomplete" (exactly as
+        before multi-camera support). Every other camera gets its own folder
+        inside it, so two cameras never create, list or rename files in the same
+        directory at the same moment: both rotate on the same frame count, and
+        the only transient Windows folder errors seen on the rig appeared with
+        two cameras sharing one folder. Staying inside ".incomplete" keeps
+        whatever already excludes that name from a sync excluding these too.
         """
-        return self.output_dir / ".incomplete"
+        base = self.output_dir / ".incomplete"
+        return base if self.camera_tag is None else base / self.camera_tag
 
     def video_part_base(self, segment_index: int) -> Path:
         """Base path (no extension) SpinVideo writes to while a segment is open.

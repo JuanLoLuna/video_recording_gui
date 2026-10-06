@@ -270,7 +270,7 @@ def _main_with_args(args) -> int:
 
 def run_session(args, slots, group) -> int:
     from backend.disk_guard import assess_disk, estimate_bytes_per_hour, sample_disk_usage
-    from backend.recording_paths import SessionPaths, resolve_output_dir
+    from backend.recording_paths import SessionPaths, resolve_output_dir, transient_error_count
     from backend.session_verify import verify_camera_outputs
 
     result = group.start_all()
@@ -442,6 +442,12 @@ def run_session(args, slots, group) -> int:
         for problem in problems:
             print(f"    !! {problem}")
         print(f"    verify video: python scripts/verify_avi.py \"{p.video_final(0)}\" --segments \"{p.segments_csv}\"")
+    staging_errors = transient_error_count()
+    if staging_errors:
+        print(
+            f"\nnote: {staging_errors} staging-folder operation(s) hit a transient Windows "
+            "error and were retried (recovered)"
+        )
     print(f"\nprocess CPU {cpu_cores:.2f} cores over the run")
     print("RESULT:", "PASS" if all_ok else "FAIL")
 
@@ -450,10 +456,11 @@ def run_session(args, slots, group) -> int:
             p = paths[s.serial]
             for f in list(out_dir.glob(f"{p.stem}*")):
                 f.unlink(missing_ok=True)
-        try:
-            (out_dir / ".incomplete").rmdir()
-        except OSError:
-            pass
+        for staging in [*(paths[s.serial].incomplete_dir for s in slots), out_dir / ".incomplete"]:
+            try:
+                staging.rmdir()
+            except OSError:
+                pass
     return 0 if all_ok else 1
 
 

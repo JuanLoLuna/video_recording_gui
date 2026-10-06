@@ -31,6 +31,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
+from backend.recording_paths import note_transient_error
+
 
 DEFAULT_SEGMENT_SECONDS = 900.0  # 15 minutes
 DEFAULT_MAX_BYTES = 3_000_000_000  # ~2.6x headroom under the 4 GiB RIFF ceiling
@@ -149,6 +151,8 @@ def reconcile_part_files(
             break
         except OSError as exc:
             last_error = exc
+            if attempt == 0:
+                note_transient_error()
             if attempt < attempts - 1:
                 sleep(delay_s * (attempt + 1))
     if entries is None:

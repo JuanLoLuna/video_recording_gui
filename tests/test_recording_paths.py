@@ -15,6 +15,7 @@ from backend.recording_paths import (
     check_writable,
     ensure_directory,
     resolve_output_dir,
+    transient_error_count,
     session_basename,
 )
 
@@ -183,8 +184,20 @@ class CameraTagTests(unittest.TestCase):
         self.assertEqual(paths.segments_csv, Path("/data") / f"{stem}_segments.csv")
         self.assertEqual(paths.events_jsonl, Path("/data") / f"{stem}_events.jsonl")
         self.assertEqual(
-            paths.video_part_base(1), Path("/data/.incomplete") / f"{stem}_part0001"
+            paths.video_part_base(1),
+            Path("/data/.incomplete/cam26134271") / f"{stem}_part0001",
         )
+
+    def test_the_primary_stages_in_incomplete_and_others_in_their_own_folder_inside_it(self):
+        primary, other = self.paths(), self.paths("cam26134271")
+        self.assertEqual(primary.incomplete_dir, Path("/data/.incomplete"))
+        self.assertEqual(other.incomplete_dir, Path("/data/.incomplete/cam26134271"))
+        self.assertNotEqual(primary.incomplete_dir, other.incomplete_dir)
+        # Nested, so anything that excludes ".incomplete" from a sync keeps doing so.
+        self.assertIn(Path("/data/.incomplete"), other.video_part_base(0).parents)
+        # Two additional cameras do not share a folder with each other either.
+        third = self.paths("cam99999999")
+        self.assertNotEqual(other.incomplete_dir, third.incomplete_dir)
 
     def test_wav_is_never_tagged_because_the_microphone_is_shared(self):
         self.assertEqual(self.paths("cam26134271").wav, self.paths().wav)
@@ -280,8 +293,15 @@ class EnsureDirectoryTests(unittest.TestCase):
     def test_a_directory_that_really_exists_needs_no_retry(self):
         path, pauses = FlakyPath(5, is_dir=True), []
         ensure_directory(path, sleep=pauses.append, log=lambda m: None)
-        self.assertEqual(path.calls, 1)
+        self.assertEqual(path.calls, 0)  # already there: mkdir is not even attempted
         self.assertEqual(pauses, [])
+
+    def test_each_call_that_needed_a_retry_is_counted_once(self):
+        before = transient_error_count()
+        ensure_directory(FlakyPath(3), sleep=lambda s: None, log=lambda m: None)
+        self.assertEqual(transient_error_count(), before + 1)
+        ensure_directory(FlakyPath(0, is_dir=True), sleep=lambda s: None, log=lambda m: None)
+        self.assertEqual(transient_error_count(), before + 1)
 
     def test_a_persistent_failure_is_raised_after_the_attempts(self):
         path = FlakyPath(99)
