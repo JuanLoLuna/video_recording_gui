@@ -175,6 +175,22 @@ def with_measured_square(cfg: BoardConfig, measured_square_mm: float) -> BoardCo
                        cfg.marker_length_m * scale, cfg.dictionary, cfg.first_marker_id, cfg.kind)
 
 
+# What the rig's printer actually produced (measured 2026-10-06), used as the default
+# of the "measured size" fields. The presets above stay nominal: they are what gets printed.
+PRINTED_SIZE_MM: dict[str, float] = {
+    HANDHELD_PRESET: 35.86,
+    REFERENCE_PRESETS[0]: 35.86,
+    REFERENCE_PRESETS[1]: 35.86,
+    REFERENCE_PRESETS[2]: 69.89,
+    REFERENCE_PRESETS[3]: 69.89,
+}
+
+
+def default_measured_mm(preset_name: str) -> float:
+    """Default for a measured-size field: the rig's measured print, else the nominal size."""
+    return PRINTED_SIZE_MM.get(preset_name, measured_size_mm(BOARD_PRESETS[preset_name]))
+
+
 def measured_size_mm(cfg: BoardConfig) -> float:
     """The length the operator measures on the print: one square (ChArUco) or one marker (grid)."""
     return (cfg.marker_length_m if cfg.kind == "grid" else cfg.square_length_m) * 1000.0

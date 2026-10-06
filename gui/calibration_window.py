@@ -230,7 +230,7 @@ class CalibrationWindow(SetupTaskMixin, QDialog):
         self.square_spin.setRange(5.0, 200.0)
         self.square_spin.setDecimals(2)
         self.square_spin.setSuffix(" mm")
-        self.square_spin.setValue(cal.BOARD_PRESETS[cal.HANDHELD_PRESET].square_length_m * 1000)
+        self.square_spin.setValue(cal.default_measured_mm(cal.HANDHELD_PRESET))
         grid.addWidget(self.square_spin, 2, 1)
         v.addLayout(grid)
 
@@ -378,7 +378,7 @@ class CalibrationWindow(SetupTaskMixin, QDialog):
         self.camera_state_label.setText("\n".join(lines))
 
     def _on_board_preset_changed(self, name: str) -> None:
-        self.square_spin.setValue(cal.BOARD_PRESETS[name].square_length_m * 1000)
+        self.square_spin.setValue(cal.default_measured_mm(name))
 
     def _update_checklist_next(self) -> None:
         self.check_next.setEnabled(all(box.isChecked() for box in self.checks))

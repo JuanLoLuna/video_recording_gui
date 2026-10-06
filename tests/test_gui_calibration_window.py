@@ -123,8 +123,10 @@ class CalibrationWindowTests(unittest.TestCase):
         cw.calibrate_camera_button.click()
         self.assertIs(cw.stack.currentWidget(), cw.page_check)
         cw.camera_combo.setCurrentIndex(cw.camera_combo.findData(FIREFLY[0]))
+        self.assertEqual(cw.board_combo.currentText(), cal.HANDHELD_PRESET)
+        self.assertAlmostEqual(cw.square_spin.value(), 35.86)  # the rig's measured board A
         cw.board_combo.setCurrentText(LAB_PRESET)
-        self.assertAlmostEqual(cw.square_spin.value(), 40.0)
+        self.assertAlmostEqual(cw.square_spin.value(), 40.0)   # no measured print: nominal
         self.assertFalse(cw.check_next.isEnabled())
         for box in cw.checks:
             box.setChecked(True)
