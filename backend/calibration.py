@@ -63,6 +63,14 @@ TILT_DIRECTIONS = ("left", "right", "up", "down")
 
 @dataclass(frozen=True)
 class BoardConfig:
+    """A ChArUco board, or (kind="grid") a plain ArUco marker grid.
+
+    For a grid the fields mean: squares_x/squares_y = markers across/down,
+    marker_length_m = marker side, square_length_m = marker pitch (side + gap).
+    Grids have few, big markers: they are read from ~3x farther than a
+    ChArUco board of the same paper size, which is what the reference boards
+    need (they only detect camera moves; calibration accuracy comes from A).
+    """
     squares_x: int = 5
     squares_y: int = 5
     square_length_m: float = 0.04
@@ -71,10 +79,14 @@ class BoardConfig:
     # Boards sharing a dictionary must not share marker ids, or a camera that
     # sees both cannot tell them apart (B1 uses ids 0-16, B2 17-33).
     first_marker_id: int = 0
+    kind: str = "charuco"
 
     def __post_init__(self) -> None:
-        if self.squares_x < 2 or self.squares_y < 2:
-            raise ValueError("a ChArUco board needs at least 2x2 squares")
+        if self.kind not in ("charuco", "grid"):
+            raise ValueError(f"unknown board kind {self.kind!r}")
+        minimum = 1 if self.kind == "grid" else 2
+        if self.squares_x < minimum or self.squares_y < minimum or self.squares_x * self.squares_y < 2:
+            raise ValueError("a ChArUco board needs at least 2x2 squares, a grid at least 2 markers")
         if not 0 < self.marker_length_m < self.square_length_m:
             raise ValueError("marker_length_m must be > 0 and smaller than square_length_m")
         if not hasattr(cv2.aruco, self.dictionary):
@@ -92,20 +104,41 @@ class BoardConfig:
         return cls(**{k: data[k] for k in cls.__dataclass_fields__ if k in data})
 
     @property
+    def gap_m(self) -> float:
+        """Grid only: the white space between markers, also left as a quiet zone around them."""
+        return self.square_length_m - self.marker_length_m
+
+    @property
+    def image_origin_m(self) -> float:
+        """Where render_board()'s top-left pixel lies in the board frame (a grid has a quiet zone)."""
+        return -self.gap_m if self.kind == "grid" else 0.0
+
+    @property
     def size_m(self) -> tuple[float, float]:
+        """Printed size, including a grid's quiet zone."""
+        if self.kind == "grid":
+            return (self.squares_x * self.square_length_m + self.gap_m,
+                    self.squares_y * self.square_length_m + self.gap_m)
         return self.squares_x * self.square_length_m, self.squares_y * self.square_length_m
 
     @property
     def corner_count(self) -> int:
+        if self.kind == "grid":
+            return 4 * self.marker_count
         return (self.squares_x - 1) * (self.squares_y - 1)
 
     @property
     def marker_count(self) -> int:
+        if self.kind == "grid":
+            return self.squares_x * self.squares_y
         return (self.squares_x * self.squares_y) // 2
 
     @property
     def centre_m(self) -> tuple[float, float, float]:
-        """Centre of the board in its own frame (the origin is a corner)."""
+        """Centre of the board's pattern in its own frame (the origin is a corner of the pattern)."""
+        if self.kind == "grid":
+            return ((self.squares_x * self.square_length_m - self.gap_m) / 2,
+                    (self.squares_y * self.square_length_m - self.gap_m) / 2, 0.0)
         return self.squares_x * self.square_length_m / 2, self.squares_y * self.square_length_m / 2, 0.0
 
 
@@ -117,32 +150,68 @@ BOARD_PRESETS: dict[str, BoardConfig] = {
     "A4 board B2 - camera 2 reference (4x4, ids 17-33)": BoardConfig(7, 5, 0.036, 0.027, "DICT_4X4_50", 17),
     "Lab 5x5 board, 40 mm squares": BoardConfig(),
 }
+# Big-marker reference boards: 6 markers of 70 mm (2.6x the 27 mm of B1/B2), with
+# 12 mm gaps and quiet zone: 258 x 176 mm, fits A4 landscape inside the margins.
+BOARD_PRESETS["A4 board G1 - camera 1 reference, big markers (ids 34-39)"] = BoardConfig(
+    3, 2, 0.082, 0.070, "DICT_4X4_50", 34, "grid")
+BOARD_PRESETS["A4 board G2 - camera 2 reference, big markers (ids 40-45)"] = BoardConfig(
+    3, 2, 0.082, 0.070, "DICT_4X4_50", 40, "grid")
 HANDHELD_PRESET = "A4 board A - handheld (5x5 markers)"
 REFERENCE_PRESETS = ("A4 board B1 - camera 1 reference (4x4, ids 0-16)",
-                     "A4 board B2 - camera 2 reference (4x4, ids 17-33)")
+                     "A4 board B2 - camera 2 reference (4x4, ids 17-33)",
+                     "A4 board G1 - camera 1 reference, big markers (ids 34-39)",
+                     "A4 board G2 - camera 2 reference, big markers (ids 40-45)")
 FIXED_PRESET = REFERENCE_PRESETS[0]  # the first fixed board printed ("B") is B1
 
 
 def with_measured_square(cfg: BoardConfig, measured_square_mm: float) -> BoardConfig:
-    """The board as actually printed: a printer scales squares and markers by the same factor."""
-    scale = (measured_square_mm / 1000.0) / cfg.square_length_m
-    return BoardConfig(cfg.squares_x, cfg.squares_y, measured_square_mm / 1000.0,
-                       cfg.marker_length_m * scale, cfg.dictionary, cfg.first_marker_id)
+    """The board as actually printed: a printer scales squares and markers by the same factor.
+
+    For a ChArUco board measure one square; for a grid measure one MARKER (black outer edge).
+    """
+    nominal = cfg.marker_length_m if cfg.kind == "grid" else cfg.square_length_m
+    scale = (measured_square_mm / 1000.0) / nominal
+    return BoardConfig(cfg.squares_x, cfg.squares_y, cfg.square_length_m * scale,
+                       cfg.marker_length_m * scale, cfg.dictionary, cfg.first_marker_id, cfg.kind)
 
 
-def make_board(cfg: BoardConfig) -> "cv2.aruco.CharucoBoard":
+def measured_size_mm(cfg: BoardConfig) -> float:
+    """The length the operator measures on the print: one square (ChArUco) or one marker (grid)."""
+    return (cfg.marker_length_m if cfg.kind == "grid" else cfg.square_length_m) * 1000.0
+
+
+def make_board(cfg: BoardConfig):
     dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, cfg.dictionary))
     ids = np.arange(cfg.first_marker_id, cfg.first_marker_id + cfg.marker_count, dtype=np.int32)
+    if cfg.kind == "grid":
+        return cv2.aruco.GridBoard((cfg.squares_x, cfg.squares_y), cfg.marker_length_m, cfg.gap_m,
+                                   dictionary, ids)
     return cv2.aruco.CharucoBoard(
         (cfg.squares_x, cfg.squares_y), cfg.square_length_m, cfg.marker_length_m, dictionary, ids
     )
 
 
 def render_board(cfg: BoardConfig, px_per_m: float, margin_px: int = 0) -> np.ndarray:
-    """Board image at `px_per_m` (e.g. dpi / 0.0254 for printing), white margin around it."""
+    """Board image at `px_per_m` (e.g. dpi / 0.0254 for printing), white margin around it.
+
+    A grid comes with its quiet zone (one gap wide) already around the markers:
+    the top-left pixel is at cfg.image_origin_m in the board frame.
+    """
     w_m, h_m = cfg.size_m
     w, h = round(w_m * px_per_m), round(h_m * px_per_m)
-    img = make_board(cfg).generateImage((w, h), marginSize=0, borderBits=1)
+    if cfg.kind == "grid":
+        # Each marker drawn at its exact board position (GridBoard.generateImage
+        # rounds its own layout and can fail on sizes that do not divide evenly).
+        board = make_board(cfg)
+        img = np.full((h, w), 255, np.uint8)
+        side = round(cfg.marker_length_m * px_per_m)
+        for marker_id, obj in zip(np.asarray(board.getIds()).reshape(-1), board.getObjPoints()):
+            x0, y0 = np.asarray(obj, float).reshape(4, 3)[0, :2] - cfg.image_origin_m
+            col, row = round(x0 * px_per_m), round(y0 * px_per_m)
+            img[row:row + side, col:col + side] = cv2.aruco.generateImageMarker(
+                board.getDictionary(), int(marker_id), side, borderBits=1)
+    else:
+        img = make_board(cfg).generateImage((w, h), marginSize=0, borderBits=1)
     if margin_px:
         img = cv2.copyMakeBorder(img, margin_px, margin_px, margin_px, margin_px,
                                  cv2.BORDER_CONSTANT, value=255)
@@ -161,6 +230,9 @@ class Detection:
     marker_count: int
     image_size: tuple[int, int]  # (width, height)
     corners_per_row: int | None = None  # squares_x - 1: turns an id into (row, column) of the board
+    # A grid's corners are its markers' corners (id = 4 * marker index + corner): 2 markers
+    # already give 8 corners spread over a plane, so fewer markers are enough.
+    min_markers: int = MIN_MARKERS
 
     @property
     def spans_board(self) -> bool:
@@ -174,10 +246,12 @@ class Detection:
     def ok(self) -> bool:
         # A board edge-on or cut off at the image border can leave all the corners
         # in one row (6 on the A4 boards = MIN_CORNERS): collinear points have no pose.
-        return self.marker_count >= MIN_MARKERS and len(self.ids) >= MIN_CORNERS and self.spans_board
+        return self.marker_count >= self.min_markers and len(self.ids) >= MIN_CORNERS and self.spans_board
 
     def object_points(self, board) -> np.ndarray:
-        return board.getChessboardCorners()[self.ids].astype(np.float32)
+        if isinstance(board, cv2.aruco.CharucoBoard):
+            return board.getChessboardCorners()[self.ids].astype(np.float32)
+        return np.concatenate([np.asarray(m, np.float32).reshape(4, 3) for m in board.getObjPoints()])[self.ids]
 
 
 class BoardDetector:
@@ -186,10 +260,36 @@ class BoardDetector:
     def __init__(self, cfg: BoardConfig) -> None:
         self.cfg = cfg
         self.board = make_board(cfg)
-        self._detector = cv2.aruco.CharucoDetector(self.board)
+        if cfg.kind == "grid":
+            # Plain marker corners are pixel-accurate by default; the move check needs sub-pixel.
+            params = cv2.aruco.DetectorParameters()
+            params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+            self._detector = cv2.aruco.ArucoDetector(self.board.getDictionary(), params)
+            self._index = {int(i): n for n, i in enumerate(np.asarray(self.board.getIds()).reshape(-1))}
+        else:
+            self._detector = cv2.aruco.CharucoDetector(self.board)
+
+    def _detect_grid(self, gray: np.ndarray) -> Detection:
+        h, w = gray.shape[:2]
+        corners, ids, _rejected = self._detector.detectMarkers(gray)
+        pts, pt_ids, n = [], [], 0
+        for c, i in zip(corners, [] if ids is None else ids.reshape(-1)):
+            index = self._index.get(int(i))
+            if index is None:
+                continue  # a marker of another board in the same dictionary
+            n += 1
+            pts.append(c.reshape(4, 2))
+            pt_ids.extend(4 * index + k for k in range(4))
+        if not pts:
+            return Detection(np.zeros((0, 2), np.float32), np.zeros((0,), np.int32), 0, (w, h), None, 2)
+        order = np.argsort(pt_ids)
+        return Detection(np.concatenate(pts).astype(np.float32)[order], np.asarray(pt_ids, np.int32)[order],
+                         n, (w, h), None, 2)
 
     def detect(self, image: np.ndarray) -> Detection:
         gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        if self.cfg.kind == "grid":
+            return self._detect_grid(gray)
         h, w = gray.shape[:2]
         corners, ids, _marker_corners, marker_ids = self._detector.detectBoard(gray)
         n_markers = 0 if marker_ids is None else len(marker_ids)
@@ -536,7 +636,7 @@ def average_detections(dets: Sequence[Detection]) -> Detection | None:
     ids = sorted(i for i, cs in by_id.items() if len(cs) * 2 >= len(ok))
     corners = np.array([np.mean(by_id[i], axis=0) for i in ids], np.float32).reshape(-1, 2)
     return Detection(corners, np.array(ids, np.int32), max(d.marker_count for d in ok), ok[0].image_size,
-                     ok[0].corners_per_row)
+                     ok[0].corners_per_row, ok[0].min_markers)
 
 
 def rotation_angle_deg(Ra: np.ndarray, Rb: np.ndarray) -> float:

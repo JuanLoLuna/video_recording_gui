@@ -83,11 +83,17 @@ def write_board_pdf(path: str, cfg: cal.BoardConfig, label: str, dpi: int = 600)
         font = QFont("Arial")
         font.setPointSizeF(7)
         painter.setFont(font)
-        painter.drawText(int(x0 + 105 * mm), int(yb + 2.5 * mm),
-                         f"{label}  {cfg.squares_x}x{cfg.squares_y} ChArUco {cfg.dictionary}  "
-                         f"squares {cfg.square_length_m * 1000:g} mm  markers {cfg.marker_length_m * 1000:g} mm")
+        if cfg.kind == "grid":
+            layout = (f"{cfg.squares_x}x{cfg.squares_y} ArUco grid {cfg.dictionary} ids {cfg.first_marker_id}-"
+                      f"{cfg.first_marker_id + cfg.marker_count - 1}  markers {cfg.marker_length_m * 1000:g} mm")
+            measure = "one marker (outer black edge)"
+        else:
+            layout = (f"{cfg.squares_x}x{cfg.squares_y} ChArUco {cfg.dictionary}  "
+                      f"squares {cfg.square_length_m * 1000:g} mm  markers {cfg.marker_length_m * 1000:g} mm")
+            measure = "one square"
+        painter.drawText(int(x0 + 105 * mm), int(yb + 2.5 * mm), f"{label}  {layout}")
         painter.drawText(int(x0 + 105 * mm), int(yb + 6.5 * mm),
-                         "Print at 100% / Actual size. Bar = 100 mm: measure it and one square before use.")
+                         f"Print at 100% / Actual size. Bar = 100 mm: measure it and {measure} before use.")
     finally:
         painter.end()
     if not os.path.isfile(path) or os.path.getsize(path) == 0:
@@ -154,7 +160,7 @@ class CalibrationWindow(SetupTaskMixin, QDialog):
             "touches the lens or changes the camera's resolution.\n"
             "2. The cameras set up for the session: where they are relative to each other, measured "
             "from board A resting at its marked spot, and checked with board A raised on a box. "
-            "Every time a camera is moved; the reference boards B1/B2 tell the app whether one was.")
+            "Every time a camera is moved; the reference boards (B1/B2 or G1/G2) tell the app whether one was.")
         intro.setWordWrap(True)
         v.addWidget(intro)
 
@@ -214,7 +220,8 @@ class CalibrationWindow(SetupTaskMixin, QDialog):
         grid.addWidget(self.camera_combo, 0, 1)
         grid.addWidget(QLabel("Board"), 1, 0)
         self.board_combo = QComboBox()
-        self.board_combo.addItems(list(cal.BOARD_PRESETS))
+        # Camera calibration needs a ChArUco board; the grids are only reference boards.
+        self.board_combo.addItems([n for n, c in cal.BOARD_PRESETS.items() if c.kind == "charuco"])
         self.board_combo.setCurrentText(cal.HANDHELD_PRESET)
         self.board_combo.currentTextChanged.connect(self._on_board_preset_changed)
         grid.addWidget(self.board_combo, 1, 1)

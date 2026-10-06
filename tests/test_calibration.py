@@ -71,11 +71,12 @@ def render_scene(items, K=K_TRUE, D=D_TRUE, size=IMAGE_SIZE, background=90, ppm=
     whole image, as a real lens would.
     """
     ideal = np.full((size[1], size[0]), background, np.uint8)
-    S = np.array([[1 / ppm, 0, 0.5 / ppm], [0, 1 / ppm, 0.5 / ppm], [0, 0, 1]])
     for cfg, R, t in items:
         if cfg not in _BOARD_CACHE:
             _BOARD_CACHE[cfg] = np.where(cal.render_board(cfg, ppm) > 127, 230, 25).astype(np.uint8)
         board = _BOARD_CACHE[cfg]
+        o = cfg.image_origin_m  # a grid's quiet zone puts pixel (0, 0) left of / above the origin
+        S = np.array([[1 / ppm, 0, 0.5 / ppm + o], [0, 1 / ppm, 0.5 / ppm + o], [0, 0, 1]])
         H = K @ np.column_stack([R[:, 0], R[:, 1], t]) @ S
         warped = cv2.warpPerspective(board, H, size, flags=cv2.INTER_LINEAR, borderValue=background)
         mask = cv2.warpPerspective(np.full_like(board, 255), H, size, flags=cv2.INTER_NEAREST, borderValue=0)
@@ -420,7 +421,9 @@ class PresetsTest(unittest.TestCase):
     def test_presets_are_valid_boards(self):
         for name, cfg in cal.BOARD_PRESETS.items():
             with self.subTest(name=name):
-                self.assertEqual(cal.make_board(cfg).getChessboardSize(), (cfg.squares_x, cfg.squares_y))
+                board = cal.make_board(cfg)
+                size = board.getGridSize() if cfg.kind == "grid" else board.getChessboardSize()
+                self.assertEqual(tuple(size), (cfg.squares_x, cfg.squares_y))
         self.assertNotEqual(cal.BOARD_PRESETS[cal.HANDHELD_PRESET].dictionary,
                             cal.BOARD_PRESETS[cal.FIXED_PRESET].dictionary)
 
@@ -480,7 +483,7 @@ class CaptureSessionTest(unittest.TestCase):
 
 class MarkerIdRangeTest(unittest.TestCase):
     def test_reference_boards_share_a_dictionary_but_not_ids(self):
-        b1, b2 = (cal.BOARD_PRESETS[n] for n in cal.REFERENCE_PRESETS)
+        b1, b2 = (cal.BOARD_PRESETS[n] for n in cal.REFERENCE_PRESETS[:2])
         self.assertEqual(b1.dictionary, b2.dictionary)
         self.assertEqual((b1.first_marker_id, b2.first_marker_id), (0, 17))
         self.assertEqual(cal.with_measured_square(b2, 35.0).first_marker_id, 17)
@@ -496,7 +499,7 @@ class MarkerIdRangeTest(unittest.TestCase):
             cal.BoardConfig(7, 5, 0.036, 0.027, "DICT_4X4_50", -1)
 
     def test_each_reference_detector_sees_only_its_own_board(self):
-        b1, b2 = (cal.BOARD_PRESETS[n] for n in cal.REFERENCE_PRESETS)
+        b1, b2 = (cal.BOARD_PRESETS[n] for n in cal.REFERENCE_PRESETS[:2])
         img = render_scene([(b1, *pose_looking_at_board(0.9, (0, 0, 0), (-0.15, 0), b1)),
                             (b2, *pose_looking_at_board(0.9, (0, 0, 0), (0.15, 0), b2))], D=np.zeros(5))
         d1, d2 = cal.BoardDetector(b1).detect(img), cal.BoardDetector(b2).detect(img)
@@ -553,6 +556,57 @@ class DiagnoseFrameTest(unittest.TestCase):
         # Far and nearly edge-on: markers too small to read.
         far = render_scene([(A, *pose_looking_at_board(2.2, (72, 0, 0), cfg=A))], D=np.zeros(5))
         self.assertFalse(cal.diagnose_frame(far, {"A": A})["boards"]["A"]["usable"])
+
+
+class GridReferenceBoardTest(unittest.TestCase):
+    def setUp(self):
+        self.g1, self.g2 = (cal.BOARD_PRESETS[n] for n in cal.REFERENCE_PRESETS[2:])
+
+    def test_fits_a4_and_round_trips(self):
+        w, h = self.g1.size_m
+        self.assertLessEqual(w, 0.277)
+        self.assertLessEqual(h, 0.180)
+        self.assertEqual((self.g1.marker_count, self.g1.corner_count), (6, 24))
+        self.assertEqual(cal.BoardConfig.from_dict(self.g1.to_dict()), self.g1)
+        printed = cal.with_measured_square(self.g1, 68.6)  # printer shrank it by 2 %
+        self.assertAlmostEqual(printed.marker_length_m, 0.0686)
+        self.assertAlmostEqual(printed.square_length_m, 0.082 * 0.98)
+        self.assertEqual(cal.measured_size_mm(self.g1), 70.0)
+        ids = [set(range(c.first_marker_id, c.first_marker_id + c.marker_count))
+               for c in (cal.BOARD_PRESETS[n] for n in cal.REFERENCE_PRESETS)]
+        self.assertFalse(any(a & b for i, a in enumerate(ids) for b in ids[i + 1:]))
+
+    def test_read_far_away_and_posed_accurately_up_close(self):
+        R, t = pose_looking_at_board(1.2, (20, 10, 0), (0.1, 0.05), self.g1)
+        det = cal.BoardDetector(self.g1).detect(render_scene([(self.g1, R, t)]))
+        self.assertTrue(det.ok)
+        pose = cal.solve_board_pose(det, cal.make_board(self.g1), K_TRUE, D_TRUE)
+        self.assertLess(pose.rms_px, 0.6)
+        self.assertLess(cal.rotation_angle_deg(pose.R, R), 0.3)
+        # 4 m away and turned 45 degrees: far beyond what the ChArUco reference boards reach.
+        far = render_scene([(self.g1, *pose_looking_at_board(4.0, (45, 0, 0), cfg=self.g1))], D=np.zeros(5))
+        self.assertTrue(cal.BoardDetector(self.g1).detect(far).ok)
+        self.assertFalse(cal.BoardDetector(cal.BOARD_PRESETS[cal.REFERENCE_PRESETS[0]]).detect(far).ok)
+
+    def test_two_markers_are_enough_and_other_boards_are_ignored(self):
+        img = render_scene([(self.g1, *pose_looking_at_board(2.0, (0, 0, 0), (-0.2, 0), self.g1)),
+                            (self.g2, *pose_looking_at_board(2.0, (0, 0, 0), (0.2, 0), self.g2))], D=np.zeros(5))
+        d1, d2 = cal.BoardDetector(self.g1).detect(img), cal.BoardDetector(self.g2).detect(img)
+        self.assertEqual((len(d1.ids), len(d2.ids)), (24, 24))
+        self.assertLess(d1.corners[:, 0].max(), d2.corners[:, 0].min())
+        two = cal.Detection(d1.corners[:8], d1.ids[:8], 2, d1.image_size, None, 2)
+        self.assertTrue(two.ok)
+        self.assertIsNotNone(cal.solve_board_pose(two, cal.make_board(self.g1), K_TRUE, np.zeros(5)))
+
+    def test_move_check_with_a_grid_reference(self):
+        R, t = pose_looking_at_board(2.0, (25, 10, 0), (0.05, 0.0), self.g1)
+        det, board = cal.BoardDetector(self.g1), cal.make_board(self.g1)
+        saved = cal.solve_board_pose(det.detect(render_scene([(self.g1, R, t)])), board, K_TRUE, D_TRUE)
+        same = cal.solve_board_pose(det.detect(render_scene([(self.g1, R, t)])), board, K_TRUE, D_TRUE)
+        self.assertFalse(cal.check_reference(saved.R, saved.t, saved.rms_px, same, self.g1).moved)
+        turn, _ = cv2.Rodrigues(np.radians([0, 1.0, 0]))
+        turned = cal.solve_board_pose(det.detect(render_scene([(self.g1, turn @ R, turn @ t)])), board, K_TRUE, D_TRUE)
+        self.assertTrue(cal.check_reference(saved.R, saved.t, saved.rms_px, turned, self.g1).moved)
 
 
 if __name__ == "__main__":

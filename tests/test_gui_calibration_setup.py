@@ -71,7 +71,7 @@ class SessionSetupTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         A = cal.BOARD_PRESETS[cal.HANDHELD_PRESET]
-        B1, B2 = (cal.BOARD_PRESETS[n] for n in cal.REFERENCE_PRESETS)
+        B1, B2 = (cal.BOARD_PRESETS[n] for n in cal.REFERENCE_PRESETS[:2])
         I = np.eye(3)
         # world (board A) -> camera poses
         cls.R1, cls.t1 = synth.pose_looking_at_board(1.0, (-20, 10, 0), (0.06, 0.0), A)
@@ -257,6 +257,50 @@ class SessionSetupTests(unittest.TestCase):
         self.assertEqual(len(cw._setup_detectors), 2)
         cw.reject()  # Esc
         self.assertEqual(cw._setup_detectors, {})
+
+
+@unittest.skipIf(REAL_PYSPIN or not HAVE_QT, "needs PySide6 and no real PySpin")
+class GridReferenceSetupTests(SessionSetupTests):
+    """Same flow, but camera 1's reference is the big-marker G1 board far behind the desk,
+    where the ChArUco B1 could not be read."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        A = cal.BOARD_PRESETS[cal.HANDHELD_PRESET]
+        B2, G1 = cal.BOARD_PRESETS[cal.REFERENCE_PRESETS[1]], cal.BOARD_PRESETS[cal.REFERENCE_PRESETS[2]]
+        I = np.eye(3)
+        refs = [(G1, I, np.array([-0.5, -0.1, 1.2])), (B2, I, np.array([0.30, 0.0, 0.0]))]
+        M, _ = cv2.Rodrigues(np.radians([10, -15, 20]))
+        a_rest, a_raised = (I, np.zeros(3)), (M, np.array([0.06, -0.04, -0.22]))
+
+        def scene(Rc, tc, K, D, size, a_pose):
+            items = [(A, *synth.in_camera(Rc, tc, *a_pose))]
+            items += [(cfg, *synth.in_camera(Rc, tc, R, t)) for cfg, R, t in refs]
+            return synth.render_scene(items, K=K, D=D, size=size)
+
+        turn, _ = cv2.Rodrigues(np.radians([0, 2.0, 0]))
+        cls.frames = {
+            "setup": {720: scene(cls.R1, cls.t1, synth.K_TRUE, synth.D_TRUE, (720, 540), a_rest),
+                      1280: scene(cls.R2, cls.t2, K2, D2, (1280, 1024), a_rest)},
+            "verify": {720: scene(cls.R1, cls.t1, synth.K_TRUE, synth.D_TRUE, (720, 540), a_raised),
+                       1280: scene(cls.R2, cls.t2, K2, D2, (1280, 1024), a_raised)},
+        }
+        cls.frames["moved"] = {720: cls.frames["setup"][720],
+                               1280: scene(turn @ cls.R2, turn @ cls.t2, K2, D2, (1280, 1024), a_rest)}
+
+    def test_camera_1_uses_the_grid_board(self):
+        window = self.main_window()
+        self.run_setup(window)
+        setup = window._calibration_store.current_setup()
+        ref = setup.camera(FIREFLY[0])["reference"]
+        self.assertEqual(ref["name"], cal.REFERENCE_PRESETS[2])
+        self.assertEqual(ref["board"]["kind"], "grid")
+        self.assertAlmostEqual(ref["board"]["marker_length_m"], 0.070)
+        for _ in range(2):
+            window._apply_reference_results(window._measure_reference_boards())
+        self.assertEqual(window._calibration_moved.get(FIREFLY[0]), False)
+        self.assertEqual(window.calibration_bar.label.text(), "3D pose: ready")
 
 
 if __name__ == "__main__":

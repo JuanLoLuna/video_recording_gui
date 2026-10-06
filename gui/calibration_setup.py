@@ -2,7 +2,7 @@
 
 1. Before you start: both cameras calibrated, board A RESTING flat at its marked
    spot (static, so the unsynchronised cameras do not matter), reference boards
-   B1/B2 mounted, measured square sizes.
+   reference boards mounted (B1/B2, or the big-marker G1/G2), measured sizes.
 2. Capture: ~1 s of frames per camera, averaged. Each camera's pose to board A
    (board A's frame is the session's world frame), the camera-to-camera baseline
    and the triangulation check (backend.calibration.compute_setup); each
@@ -50,8 +50,11 @@ _A_COLOUR = (60, 200, 60)       # BGR: board A corners
 _REF_COLOUR = (255, 140, 0)     # BGR: reference board corners
 
 
+_REF_SHORT = dict(zip(cal.REFERENCE_PRESETS, ("B1", "B2", "G1", "G2")))
+
+
 def _ref_label(name: str) -> str:
-    return "B1" if name == cal.REFERENCE_PRESETS[0] else "B2" if name == cal.REFERENCE_PRESETS[1] else name
+    return _REF_SHORT.get(name, name)
 
 
 class SetupTaskMixin:
@@ -91,13 +94,21 @@ class SetupTaskMixin:
         self.setup_square_a.setSuffix(" mm")
         self.setup_square_a.setValue(cal.BOARD_PRESETS[cal.HANDHELD_PRESET].square_length_m * 1000)
         grid.addWidget(self.setup_square_a, 0, 1)
-        grid.addWidget(QLabel("Boards B1/B2 measured square"), 1, 0)
+        grid.addWidget(QLabel("Boards B1/B2 measured square (if used)"), 1, 0)
         self.setup_square_b = QDoubleSpinBox()
         self.setup_square_b.setRange(5.0, 200.0)
         self.setup_square_b.setDecimals(2)
         self.setup_square_b.setSuffix(" mm")
         self.setup_square_b.setValue(cal.BOARD_PRESETS[cal.REFERENCE_PRESETS[0]].square_length_m * 1000)
         grid.addWidget(self.setup_square_b, 1, 1)
+        grid.addWidget(QLabel("Boards G1/G2 measured marker side (if used)"), 2, 0)
+        self.setup_marker_g = QDoubleSpinBox()
+        self.setup_marker_g.setRange(5.0, 300.0)
+        self.setup_marker_g.setDecimals(2)
+        self.setup_marker_g.setSuffix(" mm")
+        self.setup_marker_g.setValue(cal.measured_size_mm(cal.BOARD_PRESETS[cal.REFERENCE_PRESETS[2]]))
+        self.setup_marker_g.setToolTip("Outer edge of one black marker on G1/G2 (nominal 70 mm)")
+        grid.addWidget(self.setup_marker_g, 2, 1)
         v.addLayout(grid)
 
         self.setup_checks = [
@@ -108,9 +119,11 @@ class SetupTaskMixin:
             box.toggled.connect(self._update_setup_check_next)
             v.addWidget(box)
         refs = QLabel(
-            "Reference boards: B1 where camera 1 sees it, B2 where camera 2 sees it (either camera may "
-            "see both). They let the app notice later if a camera was moved, and reuse this setup in the "
-            "next session if nothing moved. Without them the setup is only valid until the next Detect.")
+            "Reference boards: one where camera 1 sees it (B1 or G1), one where camera 2 sees it (B2 or G2); "
+            "either camera may see more than one. The big-marker G boards are read from about 3x farther, so "
+            "they can go on a wall away from the subject. They let the app notice later if a camera was "
+            "moved, and reuse this setup in the next session if nothing moved. Without them the setup is "
+            "only valid until the next Detect.")
         refs.setWordWrap(True)
         refs.setStyleSheet(_HINT)
         v.addWidget(refs)
@@ -161,7 +174,7 @@ class SetupTaskMixin:
             self.setup_view_status[slot.serial] = status
             row.addLayout(col)
         v.addLayout(row, stretch=1)
-        legend = QLabel("Green dots: board A. Orange dots: the reference board (B1/B2).")
+        legend = QLabel("Green dots: board A. Orange dots: the reference board (B1/B2/G1/G2).")
         legend.setStyleSheet(_HINT)
         v.addWidget(legend)
         self.setup_verdict = QLabel("")
@@ -234,7 +247,9 @@ class SetupTaskMixin:
             return
         self._setup_boards = {
             "A": cal.with_measured_square(cal.BOARD_PRESETS[cal.HANDHELD_PRESET], self.setup_square_a.value()),
-            **{name: cal.with_measured_square(cal.BOARD_PRESETS[name], self.setup_square_b.value())
+            **{name: cal.with_measured_square(
+                cal.BOARD_PRESETS[name],
+                (self.setup_marker_g if cal.BOARD_PRESETS[name].kind == "grid" else self.setup_square_b).value())
                for name in cal.REFERENCE_PRESETS},
         }
         self._stop_setup_detectors()
