@@ -189,6 +189,7 @@ def with_measured_square(cfg: BoardConfig, measured_square_mm: float) -> BoardCo
 # of the "measured size" fields. The presets above stay nominal: they are what gets printed.
 PRINTED_SIZE_MM: dict[str, float] = {
     HANDHELD_PRESET: 35.86,
+    A_BIG_PRESET: 44.82,     # measured 2026-10-06
     REFERENCE_PRESETS[0]: 35.86,
     REFERENCE_PRESETS[1]: 35.86,
     REFERENCE_PRESETS[2]: 69.89,

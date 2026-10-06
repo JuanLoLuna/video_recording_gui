@@ -583,6 +583,8 @@ class BigBoardATest(unittest.TestCase):
 class MeasuredDefaultsTest(unittest.TestCase):
     def test_measured_prints_are_defaults_and_presets_stay_nominal(self):
         self.assertEqual(cal.default_measured_mm(cal.HANDHELD_PRESET), 35.86)
+        self.assertEqual(cal.default_measured_mm(cal.A_BIG_PRESET), 44.82)
+        self.assertEqual(cal.BOARD_PRESETS[cal.A_BIG_PRESET].square_length_m, 0.045)  # what gets printed
         self.assertEqual([cal.default_measured_mm(n) for n in cal.REFERENCE_PRESETS], [35.86, 35.86, 69.89, 69.89])
         self.assertEqual(cal.default_measured_mm("Lab 5x5 board, 40 mm squares"), 40.0)
         self.assertEqual(cal.BOARD_PRESETS[cal.HANDHELD_PRESET].square_length_m, 0.036)  # what gets printed
