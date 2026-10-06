@@ -6,11 +6,13 @@ verification board A raised on a "box". The test clicks through the setup task,
 then drives the main window's live reference check, including a camera turned
 by 2 degrees after the setup.
 """
+import json
 import os
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -115,6 +117,9 @@ class SessionSetupTests(unittest.TestCase):
         self.addCleanup(lambda: setattr(FakeImage, "GetNDArray", original))
         self.scene = "setup"
         FakeImage.GetNDArray = lambda image: self.frames[self.scene][image.width]
+        patcher = mock.patch("gui.calibration_setup.SETUP_CAPTURE_S", 1.2)  # 3 s on the rig
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def main_window(self):
         self.cameras = [FakeCamera(*BLACKFLY), FakeCamera(*FIREFLY)]
@@ -179,6 +184,13 @@ class SessionSetupTests(unittest.TestCase):
         cw.setup_save_button.click()
         self.assertIs(cw.stack.currentWidget(), cw.page_home)
         self.assertIn("Setup saved", cw.saved_label.text())
+        log = window._calibration_store.root / "diagnostics" / "setup_log.jsonl"
+        entries = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual([e["phase"] for e in entries][-2:], ["setup", "verify"])
+        self.assertTrue(entries[-1]["outcome"]["passed"])
+        self.assertEqual(entries[-1]["thresholds"]["verify_scale_pct"], cal.VERIFY_SCALE_ERROR_PCT)
+        self.assertEqual(set(entries[-1]["cameras"]), {FIREFLY[0], BLACKFLY[0]})
+        self.assertIsNotNone(entries[-1]["cameras"][FIREFLY[0]]["detections"]["A"]["corners"])
         self.assertEqual(cw._setup_detectors, {})
         self.scene = "setup"  # board A back on the table
         return cw

@@ -32,15 +32,21 @@ INTRINSIC_RMS_PX = 0.5
 # script's stereo RMS threshold.
 SETUP_REPROJECTION_RMS_PX = 1.0
 # Setup triangulation of the board corners vs the real board. The lab's 0.5 mm
-# assumes a close behaviour rig; at ~1-1.5 m with these sensors one pixel is
-# ~1-2 mm on the table, so the default is looser. Tune on the rig (plan step 16).
-SETUP_TRIANGULATION_RMS_MM = 2.0
+# assumes a close behaviour rig. Tuned on the rig (2026-10-06): cameras ~20 deg
+# apart at 1.3-1.6 m, the Firefly reading only ~6 corners of A-big at ~0.4 px
+# corner noise. Simulated with a CORRECT calibration, 2 mm failed 26-75 % of
+# captures there, 3 mm 6-17 % (with 1.2 s averaging; the capture is now 3 s).
+SETUP_TRIANGULATION_RMS_MM = 3.0
 # Verification (verify_setup): the board, moved to a new static spot, must
 # triangulate to its real size within this, and the spot must be at least this
 # far (along the board normal) from where the setup board lies. Scale errors
 # from wrong intrinsics grow with that distance: on synthetic data a 10 % focal
 # error gives ~2 % scale error at 20 cm and almost none for a sideways move.
-VERIFY_SCALE_ERROR_PCT = 1.0
+# 2 % (was 1 %, too tight for the rig's noise, see SETUP_TRIANGULATION_RMS_MM):
+# 4 mm over a 20 cm hand span, below a pose model's keypoint noise; it still
+# fails a lens whose focal length moved by ~10 % or more.
+VERIFY_SCALE_ERROR_PCT = 2.0
+VERIFY_SHAPE_RMS_MM = 3.0
 VERIFY_MIN_DEPTH_CHANGE_M = 0.15
 # A stored intrinsics whose live board reprojection error exceeds this is
 # "suspect" (lens probably touched).
@@ -319,7 +325,10 @@ class BoardDetector:
             return self._detect_grid(gray)
         h, w = gray.shape[:2]
         corners, ids, _marker_corners, marker_ids = self._detector.detectBoard(gray)
-        n_markers = 0 if marker_ids is None else len(marker_ids)
+        # Only this board's markers: a dictionary can hold other boards' markers too
+        # (A-big's DICT_4X4_100 contains every B/G marker of DICT_4X4_50).
+        own = range(self.cfg.first_marker_id, self.cfg.first_marker_id + self.cfg.marker_count)
+        n_markers = 0 if marker_ids is None else int(sum(int(i) in own for i in marker_ids.reshape(-1)))
         per_row = self.cfg.squares_x - 1
         if corners is None or ids is None or len(ids) == 0:
             return Detection(np.zeros((0, 2), np.float32), np.zeros((0,), np.int32), n_markers, (w, h), per_row)
@@ -763,7 +772,7 @@ class VerifyResult:
                        f"(now {self.depth_change_m * 100:.0f} cm)")
         if abs(self.scale_error_pct) >= VERIFY_SCALE_ERROR_PCT:
             out.append(f"board measures {self.scale_error_pct:+.1f} % off its real size")
-        if self.rms_mm >= SETUP_TRIANGULATION_RMS_MM:
+        if self.rms_mm >= VERIFY_SHAPE_RMS_MM:
             out.append(f"board shape off by {self.rms_mm:.1f} mm RMS")
         return out
 

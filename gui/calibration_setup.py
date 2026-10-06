@@ -17,6 +17,7 @@ _go() and _detector bookkeeping conventions.
 from __future__ import annotations
 
 import json
+import shutil
 import time
 from datetime import datetime
 
@@ -41,7 +42,9 @@ from backend.calibration_store import SetupRecord
 from gui.calibration_common import _Detector, draw_overlay
 from gui.camera_preview import frame_to_qimage
 
-SETUP_CAPTURE_S = 1.2           # frames averaged per capture (board A and references are static)
+# Frames averaged per capture (board A and references are static). 3 s = ~15
+# detections: small, far markers are noisy and averaging is what steadies them.
+SETUP_CAPTURE_S = 3.0
 SETUP_VIEW_SIZE = (400, 300)
 _BIG = "font-size: 16px; font-weight: 600;"
 _HINT = "color: #555;"
@@ -283,12 +286,12 @@ class SetupTaskMixin:
             self.setup_instructions.setText(
                 "Board A rests still at its marked spot. Check that both cameras see it whole (green dots), "
                 "and that each sees its reference board (orange). Nobody touches anything, then press "
-                "Capture setup (about 1 second).")
+                "Capture setup (about 3 seconds).")
         else:
             self.setup_head.setText("Set up for this session: step 3 of 3, verify")
             self.setup_instructions.setText(
                 "Move board A at least 15 cm toward the cameras from where it was (e.g. stand it on a box), "
-                "where both cameras see it. Let go of it, then press Verify (about 1 second). The app "
+                "where both cameras see it. Let go of it, then press Verify (about 3 seconds). The app "
                 "measures it in 3D with the setup just captured and checks it comes out at its real size.")
         self._setup_update_buttons()
 
@@ -435,6 +438,12 @@ class SetupTaskMixin:
             lines.append("Problems: " + "; ".join(problems) + ". Check board A is whole, flat, still and in "
                          "focus in both views, then capture again. If it keeps failing, recalibrate the camera.")
         self.setup_text.setText("\n".join(lines))
+        self._log_attempt("setup", averaged, {
+            "passed": bool(passed), "problems": problems, "baseline_mm": result.baseline_mm,
+            "triangulation_rms_mm": result.triangulation_rms_mm, "triangulated_corners": result.triangulated_corners,
+            "reprojection_px": {s: p.rms_px for s, p in result.poses.items()},
+            "references": {s: (None if r is None else {"name": r[0], "rms_px": r[2].rms_px})
+                           for s, r in refs.items()}})
 
     def _compute_verify(self, averaged: dict) -> None:
         board_a = cal.make_board(self._setup_boards["A"])
@@ -453,13 +462,53 @@ class SetupTaskMixin:
         lines = []
         if result.rms_mm is not None:
             lines.append(f"Board A moved: {result.scale_error_pct:+.2f} % off its real size "
-                         f"(limit ±{cal.VERIFY_SCALE_ERROR_PCT} %), shape {result.rms_mm:.2f} mm RMS, "
+                         f"(limit ±{cal.VERIFY_SCALE_ERROR_PCT} %), shape {result.rms_mm:.2f} mm RMS "
+                         f"(limit {cal.VERIFY_SHAPE_RMS_MM} mm), "
                          f"{result.depth_change_m * 100:.0f} cm from where it was, {result.corners} corners")
         if result.problems:
             lines.append("Problems: " + "; ".join(result.problems) + ".")
             lines.append("If it is high enough and still fails: go Back and capture the setup again; if it "
                          "keeps failing, recalibrate the cameras (a lens may have been touched).")
         self.setup_text.setText("\n".join(lines))
+        self._log_attempt("verify", averaged, {
+            "passed": passed, "problems": result.problems, "scale_error_pct": result.scale_error_pct,
+            "shape_rms_mm": result.rms_mm, "depth_change_m": result.depth_change_m, "corners": result.corners})
+
+    def _log_attempt(self, phase: str, averaged: dict, outcome: dict) -> None:
+        """Append one capture/verify attempt to <calibration dir>/diagnostics/setup_log.jsonl.
+
+        Everything needed to redo the computation offline: the averaged corners each
+        camera saw, the intrinsics and boards used, and the result. Never raises.
+        """
+        def det_dict(det):
+            return None if det is None else {"ids": det.ids.tolist(), "corners": det.corners.tolist(),
+                                              "markers": int(det.marker_count), "image_size": list(det.image_size)}
+        try:
+            entry = {
+                "time": datetime.now().isoformat(timespec="seconds"), "phase": phase,
+                "capture_s": SETUP_CAPTURE_S,
+                "boards": {name: cfg.to_dict() for name, cfg in self._setup_boards.items()},
+                "cameras": {
+                    serial: {
+                        "label": next((s.label for s in self.slots if s.serial == serial), serial),
+                        "intrinsics_id": getattr(self._setup_intrinsics.get(serial), "id", None),
+                        "K": getattr(self._setup_intrinsics.get(serial), "K", None),
+                        "D": getattr(self._setup_intrinsics.get(serial), "D", None),
+                        "detections": {name: det_dict(det) for name, det in per.items()},
+                    } for serial, per in averaged.items()},
+                "thresholds": {"setup_triangulation_mm": cal.SETUP_TRIANGULATION_RMS_MM,
+                               "setup_reprojection_px": cal.SETUP_REPROJECTION_RMS_PX,
+                               "verify_scale_pct": cal.VERIFY_SCALE_ERROR_PCT,
+                               "verify_shape_mm": cal.VERIFY_SHAPE_RMS_MM,
+                               "verify_min_move_m": cal.VERIFY_MIN_DEPTH_CHANGE_M},
+                "outcome": outcome,
+            }
+            folder = self.store.root / "diagnostics"
+            folder.mkdir(parents=True, exist_ok=True)
+            with open(folder / "setup_log.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception as exc:  # the log is a help, never a reason to fail the setup
+            print(f"[calibration] could not write the setup log: {exc}")
 
     def _save_setup_snapshot(self) -> None:
         """Full-resolution frame + detection report per camera, in <calibration dir>/diagnostics/<time>/."""
@@ -489,6 +538,9 @@ class SetupTaskMixin:
                         f"rejected {b['rejected_candidates']}, corners {b['charuco_corners']}, "
                         f"{'usable' if b['usable'] else 'NOT usable'}")
             (folder / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+            log = self.store.root / "diagnostics" / "setup_log.jsonl"
+            if log.exists():
+                shutil.copyfile(log, folder / "setup_log.jsonl")
             (folder / "report.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
         except Exception as exc:
             self.setup_text.setText(f"Could not save the snapshot: {exc}")

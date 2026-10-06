@@ -349,7 +349,8 @@ class SetupTest(unittest.TestCase):
         self.assertAlmostEqual(verify.depth_change_m, abs((M @ centre + [0.08, -0.06, -0.22])[2]), delta=0.01)
 
     def test_wrong_intrinsics_pass_the_setup_but_fail_verification(self):
-        bad = {"A": (K_TRUE * np.array([[1.1], [1.1], [1]]), D_TRUE), "B": self.intr["B"]}
+        # 20 %: the limits are set for the rig's noise and catch focal errors of ~10 % and more.
+        bad = {"A": (K_TRUE * np.array([[1.2], [1.2], [1]]), D_TRUE), "B": self.intr["B"]}
         setup, verify = self._verify(bad)
         self.assertTrue(setup.passed)  # self-consistent: exactly why verification exists
         self.assertFalse(verify.passed)
