@@ -156,7 +156,17 @@ BOARD_PRESETS["A4 board G1 - camera 1 reference, big markers (ids 34-39)"] = Boa
     3, 2, 0.082, 0.070, "DICT_4X4_50", 34, "grid")
 BOARD_PRESETS["A4 board G2 - camera 2 reference, big markers (ids 40-45)"] = BoardConfig(
     3, 2, 0.082, 0.070, "DICT_4X4_50", 40, "grid")
+# Board A with big markers, for setups where A is small in a low-resolution view
+# (the Firefly read A's 5x5 markers at ~13 px only partly). 6x4 squares of 45 mm,
+# 4x4 markers of 36 mm: each marker cell is 6.0 mm instead of 3.9 mm. Ids 50-61 of
+# DICT_4X4_100 are not in the DICT_4X4_50 set the B/G boards use, and differ from
+# every one of them by >= 4 bits in any rotation (4X4_50 corrects 1), so neither
+# can be read as the other.
+BOARD_PRESETS["A4 board A-big - setup, big markers (4x4, ids 50-61)"] = BoardConfig(
+    6, 4, 0.045, 0.036, "DICT_4X4_100", 50)
 HANDHELD_PRESET = "A4 board A - handheld (5x5 markers)"
+A_BIG_PRESET = "A4 board A-big - setup, big markers (4x4, ids 50-61)"
+SETUP_A_PRESETS = (HANDHELD_PRESET, A_BIG_PRESET)
 REFERENCE_PRESETS = ("A4 board B1 - camera 1 reference (4x4, ids 0-16)",
                      "A4 board B2 - camera 2 reference (4x4, ids 17-33)",
                      "A4 board G1 - camera 1 reference, big markers (ids 34-39)",
@@ -747,7 +757,8 @@ class VerifyResult:
             return [f"both cameras must see the board ({self.corners} common corners)"]
         out = []
         if self.depth_change_m < VERIFY_MIN_DEPTH_CHANGE_M:
-            out.append(f"raise the board at least {VERIFY_MIN_DEPTH_CHANGE_M * 100:.0f} cm above where it was "
+            out.append(f"move the board at least {VERIFY_MIN_DEPTH_CHANGE_M * 100:.0f} cm toward the cameras "
+                       "from where it was "
                        f"(now {self.depth_change_m * 100:.0f} cm)")
         if abs(self.scale_error_pct) >= VERIFY_SCALE_ERROR_PCT:
             out.append(f"board measures {self.scale_error_pct:+.1f} % off its real size")

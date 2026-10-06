@@ -68,9 +68,11 @@ def pump_until(condition, timeout):
 
 @unittest.skipIf(REAL_PYSPIN or not HAVE_QT, "needs PySide6 and no real PySpin")
 class SessionSetupTests(unittest.TestCase):
+    A_NAME = "A4 board A - handheld (5x5 markers)"   # which board A the setup uses
+
     @classmethod
     def setUpClass(cls):
-        A = cal.BOARD_PRESETS[cal.HANDHELD_PRESET]
+        A = cal.BOARD_PRESETS[cls.A_NAME]
         B1, B2 = (cal.BOARD_PRESETS[n] for n in cal.REFERENCE_PRESETS[:2])
         I = np.eye(3)
         # world (board A) -> camera poses
@@ -146,7 +148,8 @@ class SessionSetupTests(unittest.TestCase):
         # The fields default to the rig's measured prints; the rendered boards are nominal size.
         self.assertEqual((cw.setup_square_a.value(), cw.setup_square_b.value(), cw.setup_marker_g.value()),
                          (35.86, 35.86, 69.89))
-        cw.setup_square_a.setValue(36.0)
+        cw.setup_board_a.setCurrentText(self.A_NAME)
+        cw.setup_square_a.setValue(cal.measured_size_mm(cal.BOARD_PRESETS[self.A_NAME]))
         cw.setup_square_b.setValue(36.0)
         cw.setup_marker_g.setValue(70.0)
         self.assertFalse(cw.setup_check_next.isEnabled())
@@ -238,6 +241,8 @@ class SessionSetupTests(unittest.TestCase):
         window._open_calibration_window()
         cw = window._calibration_window
         cw.setup_button.click()
+        cw.setup_board_a.setCurrentText(self.A_NAME)
+        cw.setup_square_a.setValue(cal.measured_size_mm(cal.BOARD_PRESETS[self.A_NAME]))
         for box in cw.setup_checks:
             box.setChecked(True)
         cw.setup_check_next.click()
@@ -273,7 +278,7 @@ class GridReferenceSetupTests(SessionSetupTests):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        A = cal.BOARD_PRESETS[cal.HANDHELD_PRESET]
+        A = cal.BOARD_PRESETS[cls.A_NAME]
         B2, G1 = cal.BOARD_PRESETS[cal.REFERENCE_PRESETS[1]], cal.BOARD_PRESETS[cal.REFERENCE_PRESETS[2]]
         I = np.eye(3)
         refs = [(G1, I, np.array([-0.5, -0.1, 1.2])), (B2, I, np.array([0.30, 0.0, 0.0]))]
@@ -307,6 +312,20 @@ class GridReferenceSetupTests(SessionSetupTests):
             window._apply_reference_results(window._measure_reference_boards())
         self.assertEqual(window._calibration_moved.get(FIREFLY[0]), False)
         self.assertEqual(window.calibration_bar.label.text(), "3D pose: ready")
+
+
+
+@unittest.skipIf(REAL_PYSPIN or not HAVE_QT, "needs PySide6 and no real PySpin")
+class BigBoardASetupTests(SessionSetupTests):
+    """The whole setup flow with the big-marker board A-big."""
+    A_NAME = "A4 board A-big - setup, big markers (4x4, ids 50-61)"
+
+    def test_the_setup_record_names_a_big(self):
+        window = self.main_window()
+        self.run_setup(window)
+        board = window._calibration_store.current_setup().board
+        self.assertEqual((board["squares_x"], board["squares_y"], board["dictionary"], board["first_marker_id"]),
+                         (6, 4, "DICT_4X4_100", 50))
 
 
 if __name__ == "__main__":

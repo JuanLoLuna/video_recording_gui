@@ -26,6 +26,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QGridLayout,
     QHBoxLayout,
@@ -87,32 +88,40 @@ class SetupTaskMixin:
         v.addWidget(self.setup_cameras_label)
 
         grid = QGridLayout()
-        grid.addWidget(QLabel("Board A measured square"), 0, 0)
+        grid.addWidget(QLabel("Board A"), 0, 0)
+        self.setup_board_a = QComboBox()
+        self.setup_board_a.addItems(list(cal.SETUP_A_PRESETS))
+        self.setup_board_a.setToolTip("A-big has fewer, bigger markers: use it when a camera sees board A small")
+        grid.addWidget(self.setup_board_a, 0, 1)
+        grid.addWidget(QLabel("Board A measured square"), 1, 0)
         self.setup_square_a = QDoubleSpinBox()
         self.setup_square_a.setRange(5.0, 200.0)
         self.setup_square_a.setDecimals(2)
         self.setup_square_a.setSuffix(" mm")
         self.setup_square_a.setValue(cal.default_measured_mm(cal.HANDHELD_PRESET))
-        grid.addWidget(self.setup_square_a, 0, 1)
-        grid.addWidget(QLabel("Boards B1/B2 measured square (if used)"), 1, 0)
+        grid.addWidget(self.setup_square_a, 1, 1)
+        self.setup_board_a.currentTextChanged.connect(
+            lambda name: self.setup_square_a.setValue(cal.default_measured_mm(name)))
+        grid.addWidget(QLabel("Boards B1/B2 measured square (if used)"), 2, 0)
         self.setup_square_b = QDoubleSpinBox()
         self.setup_square_b.setRange(5.0, 200.0)
         self.setup_square_b.setDecimals(2)
         self.setup_square_b.setSuffix(" mm")
         self.setup_square_b.setValue(cal.default_measured_mm(cal.REFERENCE_PRESETS[0]))
-        grid.addWidget(self.setup_square_b, 1, 1)
-        grid.addWidget(QLabel("Boards G1/G2 measured marker side (if used)"), 2, 0)
+        grid.addWidget(self.setup_square_b, 2, 1)
+        grid.addWidget(QLabel("Boards G1/G2 measured marker side (if used)"), 3, 0)
         self.setup_marker_g = QDoubleSpinBox()
         self.setup_marker_g.setRange(5.0, 300.0)
         self.setup_marker_g.setDecimals(2)
         self.setup_marker_g.setSuffix(" mm")
         self.setup_marker_g.setValue(cal.default_measured_mm(cal.REFERENCE_PRESETS[2]))
         self.setup_marker_g.setToolTip("Outer edge of one black marker on G1/G2 (nominal 70 mm)")
-        grid.addWidget(self.setup_marker_g, 2, 1)
+        grid.addWidget(self.setup_marker_g, 3, 1)
         v.addLayout(grid)
 
         self.setup_checks = [
-            QCheckBox("Board A is lying flat at its marked spot, where both cameras see it, and nobody is touching it."),
+            QCheckBox("Board A is resting still at its marked spot (flat, or propped up facing both cameras, "
+                      "e.g. on the panel), both cameras see it, and nobody is touching it."),
             QCheckBox("The cameras are mounted where they will stay for this session."),
         ]
         for box in self.setup_checks:
@@ -246,7 +255,8 @@ class SetupTaskMixin:
             self.setup_check_error.setText("The cameras could not start. Check them in the main window.")
             return
         self._setup_boards = {
-            "A": cal.with_measured_square(cal.BOARD_PRESETS[cal.HANDHELD_PRESET], self.setup_square_a.value()),
+            "A": cal.with_measured_square(cal.BOARD_PRESETS[self.setup_board_a.currentText()],
+                                          self.setup_square_a.value()),
             **{name: cal.with_measured_square(
                 cal.BOARD_PRESETS[name],
                 (self.setup_marker_g if cal.BOARD_PRESETS[name].kind == "grid" else self.setup_square_b).value())
@@ -271,15 +281,15 @@ class SetupTaskMixin:
         if phase == "setup":
             self.setup_head.setText("Set up for this session: step 2 of 3, capture the setup")
             self.setup_instructions.setText(
-                "Board A lies flat at its marked spot. Check that both cameras see it whole (green dots), "
+                "Board A rests still at its marked spot. Check that both cameras see it whole (green dots), "
                 "and that each sees its reference board (orange). Nobody touches anything, then press "
                 "Capture setup (about 1 second).")
         else:
             self.setup_head.setText("Set up for this session: step 3 of 3, verify")
             self.setup_instructions.setText(
-                "Put board A on the box, at least 15 cm higher than where it was, where both cameras see "
-                "it. Let go of it, then press Verify (about 1 second). The app measures it in 3D with the "
-                "setup just captured and checks it comes out at its real size.")
+                "Move board A at least 15 cm toward the cameras from where it was (e.g. stand it on a box), "
+                "where both cameras see it. Let go of it, then press Verify (about 1 second). The app "
+                "measures it in 3D with the setup just captured and checks it comes out at its real size.")
         self._setup_update_buttons()
 
     def _setup_update_buttons(self) -> None:
@@ -442,9 +452,9 @@ class SetupTaskMixin:
         self.setup_verdict.setText("Verify: PASS. Save the setup." if passed else "Verify: FAIL")
         lines = []
         if result.rms_mm is not None:
-            lines.append(f"Board A on the box: {result.scale_error_pct:+.2f} % off its real size "
+            lines.append(f"Board A moved: {result.scale_error_pct:+.2f} % off its real size "
                          f"(limit ±{cal.VERIFY_SCALE_ERROR_PCT} %), shape {result.rms_mm:.2f} mm RMS, "
-                         f"{result.depth_change_m * 100:.0f} cm above where it was, {result.corners} corners")
+                         f"{result.depth_change_m * 100:.0f} cm from where it was, {result.corners} corners")
         if result.problems:
             lines.append("Problems: " + "; ".join(result.problems) + ".")
             lines.append("If it is high enough and still fails: go Back and capture the setup again; if it "

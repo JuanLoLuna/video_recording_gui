@@ -358,7 +358,7 @@ class SetupTest(unittest.TestCase):
     def test_verification_spot_too_close_to_the_setup_board(self):
         _, verify = self._verify(self.intr, offset=(0.1, -0.05, -0.03))
         self.assertFalse(verify.passed)
-        self.assertTrue(any("raise the board" in p for p in verify.problems), verify.problems)
+        self.assertTrue(any("toward the cameras" in p for p in verify.problems), verify.problems)
 
 
 class MovedCheckTest(unittest.TestCase):
@@ -556,6 +556,28 @@ class DiagnoseFrameTest(unittest.TestCase):
         # Far and nearly edge-on: markers too small to read.
         far = render_scene([(A, *pose_looking_at_board(2.2, (72, 0, 0), cfg=A))], D=np.zeros(5))
         self.assertFalse(cal.diagnose_frame(far, {"A": A})["boards"]["A"]["usable"])
+
+
+class BigBoardATest(unittest.TestCase):
+    def test_fits_a4_and_is_never_read_as_a_reference_board(self):
+        ab = cal.BOARD_PRESETS[cal.A_BIG_PRESET]
+        self.assertLessEqual(ab.size_m[0], 0.277)
+        self.assertLessEqual(ab.size_m[1], 0.180)
+        self.assertEqual((ab.marker_count, ab.corner_count), (12, 15))
+        img = render_scene([(ab, *pose_looking_at_board(0.8, (20, 0, 0), cfg=ab))], D=np.zeros(5))
+        self.assertTrue(cal.BoardDetector(ab).detect(img).ok)
+        for name in (*cal.REFERENCE_PRESETS, cal.HANDHELD_PRESET):
+            with self.subTest(name=name):
+                self.assertEqual(len(cal.BoardDetector(cal.BOARD_PRESETS[name]).detect(img).ids), 0)
+
+    def test_reads_where_board_a_markers_are_too_small(self):
+        a, ab = cal.BOARD_PRESETS[cal.HANDHELD_PRESET], cal.BOARD_PRESETS[cal.A_BIG_PRESET]
+        dist = K_TRUE[0, 0] * a.marker_length_m / 13.0  # board A's markers ~13 px, as on the rig's Firefly
+        small = cal.BoardDetector(a).detect(render_scene([(a, *pose_looking_at_board(dist, (40, 0, 0), cfg=a))], D=np.zeros(5)))
+        big = cal.BoardDetector(ab).detect(render_scene([(ab, *pose_looking_at_board(dist, (40, 0, 0), cfg=ab))], D=np.zeros(5)))
+        self.assertFalse(small.ok)
+        self.assertTrue(big.ok)
+        self.assertEqual(len(big.ids), ab.corner_count)
 
 
 class MeasuredDefaultsTest(unittest.TestCase):
