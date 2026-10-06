@@ -1,0 +1,718 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>*, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }</style>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@600;700;800&family=Public+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<title>Video Recorder Phase 5</title>
+
+<style>
+  :root {
+    --paper: #eef1ee;
+    --paper-raised: #f6f8f5;
+    --ink: #1a231f;
+    --ink-soft: #4c5750;
+    --ink-faint: #7c8880;
+    --rule: #ccd4cd;
+    --rule-soft: #dde3dc;
+    --accent: #1f5c6b;
+    --accent-soft: #dceaec;
+    --accent-ink: #0f3540;
+    --good: #3e7d5c;
+    --good-soft: #e1ede5;
+    --warn: #a8631a;
+    --warn-soft: #f3e6d5;
+    --bad: #a63a2c;
+    --bad-soft: #f4e0dc;
+    --shadow: 0 1px 2px rgba(26,35,31,0.06), 0 8px 24px -12px rgba(26,35,31,0.18);
+    --grid-line: rgba(31,92,107,0.08);
+
+    --font-display: "Big Shoulders Display", "Arial Narrow", sans-serif;
+    --font-body: "Public Sans", -apple-system, "Segoe UI", sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #12181a;
+      --paper-raised: #182121;
+      --ink: #e7ece7;
+      --ink-soft: #aab5ac;
+      --ink-faint: #71807a;
+      --rule: #2c3937;
+      --rule-soft: #23302e;
+      --accent: #5db3c4;
+      --accent-soft: #1c3438;
+      --accent-ink: #bfe6ee;
+      --good: #6bbf93;
+      --good-soft: #1d3227;
+      --warn: #d99a4e;
+      --warn-soft: #382a17;
+      --bad: #e0796a;
+      --bad-soft: #3a221e;
+      --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px -12px rgba(0,0,0,0.5);
+      --grid-line: rgba(93,179,196,0.10);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --paper: #12181a;
+    --paper-raised: #182121;
+    --ink: #e7ece7;
+    --ink-soft: #aab5ac;
+    --ink-faint: #71807a;
+    --rule: #2c3937;
+    --rule-soft: #23302e;
+    --accent: #5db3c4;
+    --accent-soft: #1c3438;
+    --accent-ink: #bfe6ee;
+    --good: #6bbf93;
+    --good-soft: #1d3227;
+    --warn: #d99a4e;
+    --warn-soft: #382a17;
+    --bad: #e0796a;
+    --bad-soft: #3a221e;
+    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 8px 24px -12px rgba(0,0,0,0.5);
+    --grid-line: rgba(93,179,196,0.10);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-body);
+    font-size: 16px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: var(--accent); color: var(--paper); }
+  a { color: var(--accent); }
+  a:focus-visible, button:focus-visible, summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .page {
+    max-width: 920px;
+    margin: 0 auto;
+    padding: clamp(28px, 5vw, 64px) clamp(18px, 5vw, 40px) 96px;
+  }
+
+  /* ---------- header ---------- */
+  .masthead {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding-bottom: 28px;
+    margin-bottom: 40px;
+    border-bottom: 3px solid var(--ink);
+    background-image:
+      linear-gradient(var(--grid-line) 1px, transparent 1px);
+    background-size: 100% 8px;
+    background-position: 0 100%;
+    background-repeat: repeat-x;
+    padding-top: 4px;
+  }
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  h1.title {
+    font-family: var(--font-display);
+    font-weight: 800;
+    font-size: clamp(38px, 6.4vw, 60px);
+    line-height: 0.96;
+    letter-spacing: 0.002em;
+    margin: 0;
+    text-wrap: balance;
+    text-transform: uppercase;
+  }
+  .dek {
+    font-size: 17px;
+    color: var(--ink-soft);
+    max-width: 62ch;
+    margin: 2px 0 0;
+  }
+  .meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 22px;
+    margin-top: 10px;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    color: var(--ink-faint);
+  }
+  .meta-row b { color: var(--ink-soft); font-weight: 600; }
+
+  /* ---------- prose sections ---------- */
+  section { margin-bottom: 56px; }
+  .section-head {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    margin-bottom: 18px;
+  }
+  .section-num {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--accent);
+    font-weight: 600;
+    letter-spacing: 0.04em;
+  }
+  h2 {
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: clamp(24px, 3.6vw, 32px);
+    text-transform: uppercase;
+    letter-spacing: 0.005em;
+    margin: 0;
+    text-wrap: balance;
+  }
+  h3 {
+    font-family: var(--font-body);
+    font-weight: 700;
+    font-size: 18px;
+    margin: 28px 0 10px;
+    color: var(--ink);
+  }
+  .prose { max-width: 68ch; }
+  .prose p { margin: 0 0 14px; }
+  .prose ul, .prose ol { margin: 0 0 14px; padding-left: 22px; }
+  .prose li { margin-bottom: 6px; }
+  code {
+    font-family: var(--font-mono);
+    font-size: 0.88em;
+    background: var(--accent-soft);
+    color: var(--accent-ink);
+    padding: 0.1em 0.4em;
+    border-radius: 3px;
+  }
+
+  /* ---------- scoreboard ---------- */
+  .scoreboard {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 14px;
+    margin-top: 8px;
+  }
+  @media (max-width: 720px) { .scoreboard { grid-template-columns: 1fr; } }
+  .score-card {
+    background: var(--paper-raised);
+    border: 1px solid var(--rule);
+    border-top: 3px solid var(--accent);
+    border-radius: 3px;
+    padding: 18px 18px 16px;
+    box-shadow: var(--shadow);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .score-label {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+  .score-value {
+    font-family: var(--font-mono);
+    font-weight: 600;
+    font-size: 27px;
+    letter-spacing: -0.01em;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+  }
+  .score-sub { font-size: 13px; color: var(--ink-soft); }
+
+  /* ---------- verdict pill ---------- */
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    padding: 3px 9px 3px 8px;
+    border-radius: 100px;
+    width: fit-content;
+  }
+  .pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .pill.good { background: var(--good-soft); color: var(--good); }
+  .pill.warn { background: var(--warn-soft); color: var(--warn); }
+  .pill.bad  { background: var(--bad-soft);  color: var(--bad); }
+
+  /* ---------- readout card (per-item results) ---------- */
+  .readout {
+    background: var(--paper-raised);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    box-shadow: var(--shadow);
+    margin-bottom: 22px;
+    overflow: hidden;
+  }
+  .readout-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+    flex-wrap: wrap;
+    padding: 18px 22px;
+    border-bottom: 1px solid var(--rule-soft);
+    background-image: linear-gradient(var(--grid-line) 1px, transparent 1px);
+    background-size: 100% 10px;
+  }
+  .readout-title { font-weight: 700; font-size: 16.5px; }
+  .readout-title .path { color: var(--ink-faint); font-weight: 500; }
+  .readout-body {
+    padding: 20px 22px 22px;
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 22px 32px;
+  }
+  @media (max-width: 640px) { .readout-body { grid-template-columns: 1fr; } }
+  .headline-stat .num {
+    font-family: var(--font-mono);
+    font-weight: 600;
+    font-size: 40px;
+    letter-spacing: -0.015em;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    color: var(--accent-ink);
+  }
+  .headline-stat .num small { font-size: 0.4em; color: var(--ink-faint); font-weight: 500; margin-left: 4px; }
+  .headline-stat .cap { font-size: 12.5px; color: var(--ink-faint); margin-top: 6px; max-width: 22ch; }
+
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 14px 20px;
+  }
+  .stat { display: flex; flex-direction: column; gap: 2px; }
+  .stat dt {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+  .stat dd {
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 15px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+  }
+
+  /* shipped-feature table */
+  .runs {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--font-mono);
+    font-size: 13px;
+  }
+  .runs-wrap { overflow-x: auto; border-top: 1px solid var(--rule-soft); }
+  .runs th, .runs td {
+    text-align: left;
+    padding: 9px 22px 9px 0;
+    white-space: nowrap;
+  }
+  .runs th:first-child, .runs td:first-child { padding-left: 22px; }
+  .runs thead th {
+    font-size: 10.5px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    font-weight: 600;
+    border-bottom: 1px solid var(--rule-soft);
+  }
+  .runs tbody td { border-bottom: 1px solid var(--rule-soft); color: var(--ink-soft); font-variant-numeric: tabular-nums; }
+  .runs tbody tr:last-child td { border-bottom: none; font-weight: 600; color: var(--ink); }
+  .runs td.num { font-variant-numeric: tabular-nums; }
+  .runs td.wrap { white-space: normal; }
+
+  /* ---------- bug/finding stories ---------- */
+  .bug {
+    border-left: 3px solid var(--bad);
+    background: var(--paper-raised);
+    border-radius: 0 4px 4px 0;
+    padding: 16px 20px;
+    margin-bottom: 14px;
+    box-shadow: var(--shadow);
+  }
+  .bug-head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+  }
+  .bug-num { font-family: var(--font-mono); color: var(--bad); font-weight: 600; font-size: 13px; }
+  .bug-title { font-weight: 700; font-size: 15.5px; }
+  .bug dl { margin: 10px 0 0; display: grid; grid-template-columns: max-content 1fr; gap: 5px 14px; }
+  .bug dt {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--ink-faint);
+    padding-top: 2px;
+  }
+  .bug dd { margin: 0; font-size: 14px; color: var(--ink-soft); }
+  .bug .arrow { font-family: var(--font-mono); color: var(--bad); }
+  .bug .fixed { color: var(--good); font-weight: 600; }
+  .bug .open { color: var(--warn); font-weight: 600; }
+
+  /* ---------- open items ---------- */
+  .open-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+  @media (max-width: 680px) { .open-grid { grid-template-columns: 1fr; } }
+  .open-card {
+    background: var(--paper-raised);
+    border: 1px solid var(--rule);
+    border-top: 3px solid var(--warn);
+    border-radius: 3px;
+    padding: 16px 18px;
+    box-shadow: var(--shadow);
+  }
+  .open-card.next { border-top-color: var(--accent); }
+  .open-card h4 { margin: 0 0 6px; font-size: 15px; font-weight: 700; }
+  .open-card p { margin: 0; font-size: 13.5px; color: var(--ink-soft); }
+
+  /* ---------- closing ---------- */
+  .closing {
+    background: var(--accent-soft);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 24px 26px;
+  }
+  .closing h2 { color: var(--accent-ink); }
+  .closing .prose { color: var(--ink); }
+
+  footer {
+    margin-top: 64px;
+    padding-top: 20px;
+    border-top: 1px solid var(--rule);
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--ink-faint);
+  }
+
+  @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+</style>
+</head>
+<body>
+
+
+<div class="page">
+
+  <header class="masthead">
+    <span class="eyebrow">Engineering validation report</span>
+    <h1 class="title">Video Recorder Phase&nbsp;5</h1>
+    <p class="dek">Two cameras measured in 3D: how far apart in time their frames really are, a heartbeat LED that puts both on the laptop's clock, and calibration built into the recorder, validated on the rig at 1&ndash;3&nbsp;mm.</p>
+    <div class="meta-row">
+      <span><b>Status</b> 3D calibration validated on the rig; simultaneous capture (hardware trigger) still open</span>
+      <span><b>Repo</b> <a href="https://github.com/JuanLoLuna/video_recording_gui/tree/feat/sync-and-3d-calibration">github.com/JuanLoLuna/video_recording_gui</a> &middot; branch <code>feat/sync-and-3d-calibration</code></span>
+      <span><b>Period</b> 2026-10-05 &ndash; 2026-10-06, following the Phase&nbsp;4 report</span>
+    </div>
+  </header>
+
+  <section id="summary">
+    <div class="section-head"><span class="section-num">00</span><h2>Summary</h2></div>
+    <div class="prose">
+      <p>Phase 4 made the recorder run two cameras reliably. This phase asked what it takes to measure hands in 3D with them. There are two halves to that. The cameras have to be <b>aligned in time</b>, and their <b>positions and lenses have to be known</b>.</p>
+      <p>The second half is done and validated on the rig. Each camera is calibrated in the recorder; each session is set up from a board in about a minute; a live check notices if a camera is bumped; and an independent recording measured the result at 0.7&ndash;1.4&nbsp;mm shape error, with the worst single corner off by 2.8&nbsp;mm. The first half is measured but not solved. The cameras free-run, so their frames are up to half a frame apart. The heartbeat LED puts every frame on one clock, and simultaneous exposure needs an external trigger pulse, which is the next piece of work.</p>
+    </div>
+    <div class="scoreboard">
+      <div class="score-card">
+        <span class="score-label">3D accuracy on the rig</span>
+        <span class="score-value">2.8<small> mm worst corner</small></span>
+        <span class="score-sub">Shape 0.74&ndash;1.40&nbsp;mm, size within 1.32&nbsp;%, 3 placements up to 38&nbsp;cm from the setup spot</span>
+        <span class="pill good">Validated</span>
+      </div>
+      <div class="score-card">
+        <span class="score-label">Heartbeat LED, both cameras</span>
+        <span class="score-value">354<small>/354 flashes</small></span>
+        <span class="score-sub">Every flash matched in both videos, at 30 and 60&nbsp;fps</span>
+        <span class="pill good">Validated</span>
+      </div>
+      <div class="score-card">
+        <span class="score-label">Gap between the cameras' frames</span>
+        <span class="score-value">&le;16.7<small> ms at 30 fps</small></span>
+        <span class="score-sub">Median 8.0&nbsp;ms; cycles through every value every 1.6&nbsp;min</span>
+        <span class="pill warn">Open: needs a trigger</span>
+      </div>
+    </div>
+  </section>
+
+  <section id="shipped">
+    <div class="section-head"><span class="section-num">01</span><h2>What shipped</h2></div>
+    <div class="prose"><p>Twenty-eight commits on <code>feat/sync-and-3d-calibration</code>. The test suite grew from 526 to 662 tests, including full runs of the calibration and setup windows against fake cameras that show rendered boards through known lenses. An independent code audit of the calibration work found 13 issues, all fixed and covered by tests before the rig sessions.</p></div>
+    <div class="runs-wrap">
+      <table class="runs">
+        <thead><tr><th>Feature</th><th>What it does</th><th>Commits</th></tr></thead>
+        <tbody>
+          <tr><td>Sync probe</td><td class="wrap"><code>scripts/sync_probe.py</code>: lists each camera's trigger lines and options, then runs both cameras free at 30 and 60&nbsp;fps, reads their clocks against the laptop every second, and reports the gap between their frames. Saves <code>report.txt</code> with everything it prints.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/367d449">367d449</a>, <a href="https://github.com/JuanLoLuna/video_recording_gui/commit/205aba7">205aba7</a></td></tr>
+          <tr><td>Calibration logic</td><td class="wrap"><code>backend/calibration.py</code>: ChArUco and marker-grid boards, detection, guided view capture, lens calibration, camera positions from a shared board, the independent verification, and the moved-camera check.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/ee9078f">ee9078f</a></td></tr>
+          <tr><td>Calibration records</td><td class="wrap"><code>backend/calibration_store.py</code>: calibrations saved per camera serial with the camera settings they depend on, history never overwritten, and the rules for whether 3D is ready.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/6685207">6685207</a></td></tr>
+          <tr><td>3D status line</td><td class="wrap">Under the previews: <i>3D pose: ready</i> or the reasons it is not. Never blocks recording. Every recording saves <code>&lt;basename&gt;_calibration.json</code> with the setup and both lenses.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/0f7938d">0f7938d</a></td></tr>
+          <tr><td>Camera calibration window</td><td class="wrap">Step by step: checklist, live view with a coverage map that says where to move the board next, views taken automatically when the board is held still, compute, save. Saves printable boards as true-size PDFs.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/6415502">6415502</a></td></tr>
+          <tr><td>Session setup</td><td class="wrap">Board A resting where both cameras see it gives the camera positions; moving it at least 15&nbsp;cm toward the cameras verifies them; each camera's own reference board then shows whether that camera moved.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/704deb8">704deb8</a>, <a href="https://github.com/JuanLoLuna/video_recording_gui/commit/a702b2f">a702b2f</a></td></tr>
+          <tr><td>Boards for this room</td><td class="wrap">Big-marker reference boards G1/G2 (read from about 3&times; farther) and A-big for the setup, each in marker sets that cannot be mistaken for one another.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/04b2a40">04b2a40</a>, <a href="https://github.com/JuanLoLuna/video_recording_gui/commit/5a006db">5a006db</a></td></tr>
+          <tr><td>Diagnosis snapshot</td><td class="wrap">One button in the setup page saves both cameras' full frames, a detection report and the log of every setup attempt, to send instead of photos.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/9119cab">9119cab</a></td></tr>
+          <tr><td>3D accuracy check</td><td class="wrap"><code>scripts/validate_3d.py</code>: from a normal recording with the board held still at several places, measures each placement in 3D against the real board.</td><td><a href="https://github.com/JuanLoLuna/video_recording_gui/commit/26dbd70">26dbd70</a></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="timing">
+    <div class="section-head"><span class="section-num">02</span><h2>How far apart the frames are</h2></div>
+    <div class="prose"><p>Both cameras free-running together, 10 minutes at 30&nbsp;fps and 10 minutes at 60&nbsp;fps, with each camera's clock read against the laptop once per second.</p></div>
+
+    <div class="readout">
+      <div class="readout-head">
+        <div class="readout-title">Free-running gap &middot; <span class="path">sync_probe skew &middot; Firefly #23227865 + Blackfly S #26134271 &middot; 2026-10-05</span></div>
+        <span class="pill warn">Gap uncontrolled</span>
+      </div>
+      <div class="readout-body">
+        <div class="headline-stat">
+          <div class="num">7.96<small>ms</small></div>
+          <div class="cap">median gap between the cameras' frames at 30&nbsp;fps</div>
+        </div>
+        <dl class="stat-grid">
+          <div class="stat"><dt>Missing frames</dt><dd>0 / 0</dd></div>
+          <div class="stat"><dt>Camera clocks vs laptop</dt><dd>+4.7 to +5.7 ppm</dd></div>
+          <div class="stat"><dt>Clock fit residual</dt><dd>41&ndash;116 &micro;s</dd></div>
+          <div class="stat"><dt>Timestamp unit</dt><dd>1.000 ns</dd></div>
+        </dl>
+      </div>
+      <div class="runs-wrap">
+        <table class="runs">
+          <thead><tr><th>Rate</th><th>Real fps (Firefly / Blackfly)</th><th>Gap median</th><th>Gap p99</th><th>Gap max</th><th>Cycles every</th></tr></thead>
+          <tbody>
+            <tr><td>30 fps</td><td>29.9887 / 29.9992</td><td>7.96 ms</td><td>16.50 ms</td><td>16.66 ms</td><td>1.6 min</td></tr>
+            <tr><td>60 fps</td><td>59.9774 / 59.9940</td><td>4.15 ms</td><td>8.25 ms</td><td>8.33 ms</td><td>1.0 min</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div class="prose">
+      <p>The gap covers the whole possible range, from zero to half a frame, and passes through every value every one to two minutes. It is not clock drift: the two camera clocks agree to better than 1&nbsp;ppm. It comes from the Firefly's frame-rate setting, which cannot reach exactly 30.000 or 60.000&nbsp;fps and runs about 0.035&nbsp;% slow. A hand moving at 1&nbsp;m/s travels up to 17&nbsp;mm between the two views at 30&nbsp;fps, so triangulating fast movement needs either simultaneous exposures or interpolated keypoints.</p>
+      <p>Two smaller results came from the same run. The <code>timestamp_us</code> column in the metadata holds nanoseconds; the column keeps its name because downstream code reads it by name. And the laptop arrival time (<code>system_time</code>) jitters by 2&ndash;4&nbsp;ms, with bursts up to 300&nbsp;ms at the start of a recording, so it is too noisy to pair frames; the camera timestamps mapped to the laptop clock are accurate to 40&ndash;120&nbsp;&micro;s.</p>
+    </div>
+
+    <h3>What the cameras can do for a trigger</h3>
+    <div class="runs-wrap">
+      <table class="runs">
+        <thead><tr><th></th><th>Firefly FFY-U3-04S2M</th><th>Blackfly S BFS-U3-13Y3M</th></tr></thead>
+        <tbody>
+          <tr><td>GPIO lines</td><td class="wrap">Line0&ndash;3, each input or output</td><td class="wrap">Line0 isolated in, Line1 isolated out, Line2 in/out, Line3 in</td></tr>
+          <tr><td>Trigger from a line</td><td>Line0&ndash;3</td><td>Line0, Line2, Line3</td></tr>
+          <tr><td>Trigger during readout</td><td>No</td><td>Yes (<code>TriggerOverlap=ReadOut</code>)</td></tr>
+          <tr><td>Trigger delay</td><td>No</td><td>14 &micro;s &ndash; 65 ms</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="prose"><p>Both cameras can be triggered from a line, so an external pulse (one source driving both) or a cable from the Firefly's exposure output to the Blackfly's Line3 would both work. The Blackfly is the better camera to trigger, because it can start a new exposure during readout and can delay its exposure to line up with the Firefly's.</p></div>
+  </section>
+
+  <section id="led">
+    <div class="section-head"><span class="section-num">03</span><h2>One clock from the heartbeat LED</h2></div>
+    <div class="prose"><p>The sync-service heartbeat (100&nbsp;ms pulses at random 2&ndash;4&nbsp;s intervals for these tests) drove an LED seen by both cameras during real recordings. For each camera, the LED's onsets were matched to the heartbeat log and fitted against the camera's own timestamps.</p></div>
+    <div class="readout">
+      <div class="readout-head">
+        <div class="readout-title">LED alignment &middot; <span class="path">recorder, both cameras &middot; USB-6501 Dev1/port0/line0 &middot; 2026-10-05</span></div>
+        <span class="pill good">Every flash matched</span>
+      </div>
+      <div class="readout-body">
+        <div class="headline-stat">
+          <div class="num">354<small>/354</small></div>
+          <div class="cap">heartbeat flashes found in both videos, no false detections</div>
+        </div>
+        <dl class="stat-grid">
+          <div class="stat"><dt>Fit residual</dt><dd>&plusmn; half a frame</dd></div>
+          <div class="stat"><dt>Clock vs laptop (LED)</dt><dd>+4.5 to +8.0 ppm</dd></div>
+          <div class="stat"><dt>Same, latch probe</dt><dd>+4.7 to +5.7 ppm</dd></div>
+          <div class="stat"><dt>Gap measured via LED</dt><dd>matches probe</dd></div>
+        </dl>
+      </div>
+      <div class="runs-wrap">
+        <table class="runs">
+          <thead><tr><th>Recording</th><th>Length</th><th>Flashes (Firefly / Blackfly)</th><th>Gap median / p99 / max</th><th>Missing frames</th></tr></thead>
+          <tbody>
+            <tr><td>30 fps, MJPEG</td><td>5.75 min</td><td>118 / 118 of 118</td><td>8.0 / 16.5 / 16.7 ms</td><td>&mdash;</td></tr>
+            <tr><td>60 fps, uncompressed</td><td>12.0 min</td><td>236 / 236 of 236</td><td>4.15 / 8.25 / 8.34 ms</td><td>0 / 0</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div class="prose"><p>Two independent methods, the clock latch and the LED, give the same camera clock rates within the LED fit's uncertainty, and the same inter-camera gap. The 60&nbsp;fps recording also ran the real recorder at about 100&nbsp;MB/s of uncompressed video from both cameras for 12 minutes, with every one of its 25 video files decoding completely and no missing frames. The existing single-camera LED script in sync-service rejected the same data, because it fits against frame count at an assumed rate; the fit has to use camera timestamps and a small box around the LED.</p></div>
+  </section>
+
+  <section id="calibration">
+    <div class="section-head"><span class="section-num">04</span><h2>Calibration in the recorder</h2></div>
+    <div class="prose">
+      <p>A <b>Calibrate&hellip;</b> button opens a separate window with two tasks. <b>Calibrate a camera</b> is done once per camera, and again if anyone touches the lens. <b>Set up for this session</b> is done each time the cameras are moved, and takes about a minute. Both passed on the rig: both cameras' lens calibrations came out under the 0.5&nbsp;px limit, and the session setup passed verification once its limits matched the rig's noise (finding 4).</p>
+      <p>The boards had to fit this room. The cameras sit on opposite sides of the desk, 2.83&nbsp;m apart and about 125&deg; apart around the work area, so one flat board is seen steeply by at least one of them, and the Firefly is low-resolution.</p>
+    </div>
+    <div class="runs-wrap">
+      <table class="runs">
+        <thead><tr><th>Board</th><th>Used for</th><th>Layout</th><th>Measured print</th></tr></thead>
+        <tbody>
+          <tr><td>A</td><td class="wrap">Calibrating each camera</td><td class="wrap">7&times;5 ChArUco, 36 mm squares, 5&times;5 markers</td><td>35.86 mm</td></tr>
+          <tr><td>A-big</td><td class="wrap">Session setup and verification</td><td class="wrap">6&times;4 ChArUco, 45 mm squares, 4&times;4 markers of 36 mm</td><td>44.82 mm</td></tr>
+          <tr><td>G1 / G2</td><td class="wrap">Each camera's reference, to spot a moved camera</td><td class="wrap">3&times;2 marker grid, 70 mm markers</td><td>69.89 mm</td></tr>
+          <tr><td>B1 / B2</td><td class="wrap">Smaller references (superseded by G here)</td><td class="wrap">7&times;5 ChArUco, 36 mm squares, 4&times;4 markers</td><td>35.86 mm</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="accuracy">
+    <div class="section-head"><span class="section-num">05</span><h2>Measured 3D accuracy</h2></div>
+    <div class="prose"><p>After setup, a normal recording with A-big held still at several places. <code>validate_3d.py</code> found the still stretches in both videos, triangulated the board with the saved setup, and compared it with the real board.</p></div>
+    <div class="readout">
+      <div class="readout-head">
+        <div class="readout-title">3D validation &middot; <span class="path">recording_20261006_132002 &middot; A-big &middot; 2026-10-06</span></div>
+        <span class="pill good">Nominal</span>
+      </div>
+      <div class="readout-body">
+        <div class="headline-stat">
+          <div class="num">2.8<small>mm</small></div>
+          <div class="cap">largest single-corner error, any placement</div>
+        </div>
+        <dl class="stat-grid">
+          <div class="stat"><dt>Shape RMS</dt><dd>0.74&ndash;1.40 mm</dd></div>
+          <div class="stat"><dt>Size error</dt><dd>+0.17 to +1.32 %</dd></div>
+          <div class="stat"><dt>Camera baseline</dt><dd>2828 mm</dd></div>
+          <div class="stat"><dt>Placements used</dt><dd>3</dd></div>
+        </dl>
+      </div>
+      <div class="runs-wrap">
+        <table class="runs">
+          <thead><tr><th>Placement</th><th>From setup spot</th><th>To cameras (Firefly / Blackfly)</th><th>Corners</th><th>Size</th><th>Shape RMS</th><th>Worst corner</th></tr></thead>
+          <tbody>
+            <tr><td>#1</td><td>11.2 cm</td><td>142 / 177 cm</td><td>10</td><td>+0.26 %</td><td>0.79 mm</td><td>1.4 mm</td></tr>
+            <tr><td>#3</td><td>12.9 cm</td><td>141 / 176 cm</td><td>14</td><td>+0.17 %</td><td>0.74 mm</td><td>1.3 mm</td></tr>
+            <tr><td>#2 (raised, to the side)</td><td>38.3 cm</td><td>117 / 198 cm</td><td>15</td><td>+1.32 %</td><td>1.40 mm</td><td>2.8 mm</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div class="prose">
+      <p>A hand-pose model places keypoints with about 5&ndash;10&nbsp;mm of noise, so calibration at this level will not limit 3D hand measurement. Only three of the recorded placements counted: the Blackfly saw the board still in three stretches, the Firefly in nine. The remaining size error of about 1&nbsp;% is the same size as the measurement of the printed square itself (0.45&nbsp;mm of 45&nbsp;mm); measuring across five squares would tighten it.</p>
+    </div>
+  </section>
+
+  <section id="findings">
+    <div class="section-head"><span class="section-num">06</span><h2>What broke, and how it&rsquo;s handled</h2></div>
+
+    <div class="bug">
+      <div class="bug-head"><span class="bug-num">01</span><span class="bug-title">The two cameras' frames slide through every possible offset</span></div>
+      <dl>
+        <dt>Symptom</dt><dd>The gap between the cameras' frames was spread evenly from 0 to half a frame, cycling every 1&ndash;1.6 minutes.</dd>
+        <dt>Cause</dt><dd><span class="arrow">&rarr;</span> The Firefly's frame-rate setting cannot hit exactly 30 or 60&nbsp;fps; the camera clocks themselves agree to better than 1&nbsp;ppm.</dd>
+        <dt>Found by</dt><dd>The sync probe's per-frame camera timestamps, confirmed independently through the heartbeat LED.</dd>
+        <dt>Result</dt><dd><span class="open">Handled for alignment, open for simultaneity</span>: the LED puts every frame on the laptop's clock; simultaneous exposures need the external trigger pulse (open items).</dd>
+      </dl>
+    </div>
+
+    <div class="bug">
+      <div class="bug-head"><span class="bug-num">02</span><span class="bug-title">The setup's own 3D check could not catch a wrong lens</span></div>
+      <dl>
+        <dt>Symptom</dt><dd>In simulation, a 20&nbsp;% focal-length error still passed the setup's 3D check with under 1&nbsp;mm of error.</dd>
+        <dt>Cause</dt><dd><span class="arrow">&rarr;</span> Both camera positions are solved from the same board that is then measured, so they stay consistent with each other even when wrong.</dd>
+        <dt>Found by</dt><dd>Tests that render boards through deliberately wrong lenses.</dd>
+        <dt>Result</dt><dd><span class="fixed">Fixed by design</span>: a separate verification measures the board after it moves at least 15&nbsp;cm toward the cameras, using the saved positions; a 10&nbsp;% focal error then shows as about 2&nbsp;% size error.</dd>
+      </dl>
+    </div>
+
+    <div class="bug">
+      <div class="bug-head"><span class="bug-num">03</span><span class="bug-title">The boards were too small or too steep for one of the cameras</span></div>
+      <dl>
+        <dt>Symptom</dt><dd>The Firefly could not read board A anywhere the Blackfly could also see it, and could read a reference board only where the subject sits.</dd>
+        <dt>Cause</dt><dd><span class="arrow">&rarr;</span> The cameras face each other across the desk, so a shared board is steep to at least one; at the Firefly's 720&times;540, board A's markers were about 13&nbsp;px, about 2&nbsp;px per marker cell. One snapshot was also 22&nbsp;% saturated.</dd>
+        <dt>Found by</dt><dd>The diagnosis snapshots, read here instead of guessed from photos.</dd>
+        <dt>Result</dt><dd><span class="fixed">Fixed</span>: board A no longer has to lie flat; A-big for the setup (1.55&times; bigger marker cells); G1/G2 reference boards readable from about 3&times; farther; exposure lowered.</dd>
+      </dl>
+    </div>
+
+    <div class="bug">
+      <div class="bug-head"><span class="bug-num">04</span><span class="bug-title">Verification failed by small margins, again and again</span></div>
+      <dl>
+        <dt>Symptom</dt><dd>The setup verification kept failing just over its limits.</dd>
+        <dt>Cause</dt><dd><span class="arrow">&rarr;</span> With about 6 shared corners at about 0.4&nbsp;px of noise, a correct calibration failed the original 1&nbsp;% / 2&nbsp;mm limits in 26&ndash;75&nbsp;% of simulated attempts.</dd>
+        <dt>Found by</dt><dd>Simulating the rig's geometry and noise with a known-correct calibration.</dd>
+        <dt>Result</dt><dd><span class="fixed">Fixed</span>: limits of 2&nbsp;% size and 3&nbsp;mm shape (4&nbsp;mm over a 20&nbsp;cm hand span), 3&nbsp;s of frames averaged instead of 1.2&nbsp;s, and a log of every attempt. Passed on the rig.</dd>
+      </dl>
+    </div>
+
+    <div class="bug">
+      <div class="bug-head"><span class="bug-num">05</span><span class="bug-title">The code audit's two serious findings</span></div>
+      <dl>
+        <dt>Symptom</dt><dd>Closing the Calibration window with Esc left its detection thread running through later recordings. A board seen as a single row of corners was captured and then made Compute fail with no way out.</dd>
+        <dt>Cause</dt><dd><span class="arrow">&rarr;</span> Esc hides a Qt dialog without its close event, where the cleanup was; and a single row has exactly the minimum corner count on the A4 boards.</dd>
+        <dt>Found by</dt><dd>An independent code audit, before any rig session.</dd>
+        <dt>Result</dt><dd><span class="fixed">Fixed</span>, along with the 11 smaller findings, each with a test.</dd>
+      </dl>
+    </div>
+  </section>
+
+  <section id="open">
+    <div class="section-head"><span class="section-num">07</span><h2>Open items</h2></div>
+    <div class="open-grid">
+      <div class="open-card next">
+        <h4>External trigger pulse</h4>
+        <p>One pulse source driving both cameras' trigger inputs, so their exposures coincide and the same pulse can mark the EMG recording. Needed before triangulating fast hand movement.</p>
+      </div>
+      <div class="open-card next">
+        <h4>Merge into main</h4>
+        <p>Open a pull request for <code>feat/sync-and-3d-calibration</code> with this report.</p>
+      </div>
+      <div class="open-card">
+        <h4>Fuller accuracy map</h4>
+        <p>Only three placements counted. A second validation recording with more placements the Blackfly sees clearly, and the squares measured across five squares, would map accuracy over the whole work area.</p>
+      </div>
+      <div class="open-card">
+        <h4>Two-camera LED alignment in sync-service</h4>
+        <p>The LED fit done here for this report becomes a tool in sync-service: camera timestamps, a box around the LED, sub-frame onsets, both cameras at once.</p>
+      </div>
+      <div class="open-card">
+        <h4>One-hour runs at 60 fps</h4>
+        <p>The 60&nbsp;fps headroom was shown for 10&ndash;12 minutes; the one-hour runs in both codecs, with the trigger once it exists, are still to do.</p>
+      </div>
+      <div class="open-card">
+        <h4>Heartbeat inside the recorder</h4>
+        <p>Remove the old Sync Pulse button and run the heartbeat from the recorder. Planned separately.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="next" class="closing">
+    <div class="section-head"><span class="section-num">08</span><h2>Where this leaves things</h2></div>
+    <div class="prose">
+      <p>The geometry side of 3D is ready: two cameras on opposite sides of the desk measure a still object to within a few millimetres, the recorder keeps every session's calibration with the video, and it notices when a camera moves. What stands between this and 3D hand tracking is time. Every frame can already be placed on one clock, but until the cameras expose together, fast movements will be blurred across the two views by up to a frame. The external trigger pulse is the next piece of work.</p>
+    </div>
+  </section>
+
+  <footer>
+    <span><a href="https://github.com/JuanLoLuna/video_recording_gui/tree/feat/sync-and-3d-calibration">github.com/JuanLoLuna/video_recording_gui</a> &middot; feat/sync-and-3d-calibration</span>
+    <span>Report generated 2026-10-06</span>
+  </footer>
+
+</div>
+
+</body>
+</html>
