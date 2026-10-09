@@ -1,0 +1,14 @@
+[Unit]
+Description=Camera trigger pulse generator (hardware PWM on GPIO18 / physical pin 12)
+After=multi-user.target
+
+[Service]
+Type=simple
+# ttyGS1 = the second USB serial port of the g_serial gadget (ttyGS0 is the login console).
+ExecStart=/usr/bin/python3 /opt/pi-trigger/pi_trigger_server.py --port /dev/ttyGS1
+# The server already reopens the port when the host goes away; this covers crashes.
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
