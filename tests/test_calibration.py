@@ -542,6 +542,60 @@ class ReferenceCheckTest(unittest.TestCase):
         self.assertTrue(check.suspect or check.moved, (check.rms_px, check.move))
 
 
+class RigMoveCheckTest(unittest.TestCase):
+    """The two-camera rig: big-marker reference boards 2.6-3.9 m away, only ~90-110 px wide.
+
+    There the board's tilt is estimated to ~0.7-0.9 deg, so the pose rule (0.5 deg)
+    reported a still camera as moved on most checks. The live check now decides from
+    the image shift of the board's corners against the saved pose.
+    """
+
+    def setUp(self):
+        self.cfg = cal.BOARD_PRESETS[cal.REFERENCE_PRESETS[3]]   # G2
+        self.board = cal.make_board(self.cfg)
+        self.ids = np.arange(self.cfg.corner_count, dtype=np.int32)
+        self.obj = np.concatenate([np.asarray(m, np.float64).reshape(4, 3) for m in self.board.getObjPoints()])
+        self.K = np.array([[956.0, 0, 435.0], [0, 961.0, 229.0], [0, 0, 1]])   # the rig's Firefly
+        self.D = np.zeros(5)
+        self.R, self.t = pose_looking_at_board(2.6, (25, 10, 0), (0.0, 0.0), self.cfg)
+        self.rng = np.random.default_rng(3)
+
+    def detection(self, R, t, noise_px):
+        pts, _ = cv2.projectPoints(self.obj, cv2.Rodrigues(R)[0], t, self.K, self.D)
+        pts = pts.reshape(-1, 2) + self.rng.normal(0, noise_px, (len(self.obj), 2))
+        return cal.Detection(pts.astype(np.float32), self.ids, self.cfg.marker_count, (720, 540), None, 2)
+
+    def check(self, saved, R, t, noise_px=0.2):
+        det = self.detection(R, t, noise_px)
+        live = cal.solve_board_pose(det, self.board, self.K, self.D)
+        return cal.check_reference(saved.R, saved.t, saved.rms_px, live, self.cfg, live_det=det, K=self.K, D=self.D)
+
+    def saved(self):
+        # Setup averages ~3 s of frames: less noise than one live check (5 frames).
+        return cal.solve_board_pose(self.detection(self.R, self.t, 0.12), self.board, self.K, self.D)
+
+    def test_a_still_camera_is_not_moved(self):
+        checks = [self.check(self.saved(), self.R, self.t) for _ in range(300)]
+        self.assertEqual(sum(c.moved for c in checks), 0)
+        self.assertLess(max(c.move.image_shift_px for c in checks), cal.SETUP_MOVED_IMAGE_SHIFT_PX / 2)
+        # What it replaced: the pose rule on the same checks fired most of the time.
+        old = [c.move.translation_mm > cal.SETUP_MOVED_TRANSLATION_MM
+               or c.move.rotation_deg > cal.SETUP_MOVED_ROTATION_DEG for c in checks]
+        self.assertGreater(np.mean(old), 0.4)
+
+    def test_a_small_turn_or_sideways_shift_is_moved(self):
+        for turn_deg in (0.25, 0.5, 2.0):
+            turn, _ = cv2.Rodrigues(np.radians([0, turn_deg, 0]))
+            checks = [self.check(self.saved(), turn @ self.R, turn @ self.t) for _ in range(50)]
+            self.assertTrue(all(c.moved for c in checks), turn_deg)
+        shifted = [self.check(self.saved(), self.R, self.t - np.array([0.008, 0, 0])) for _ in range(50)]
+        self.assertTrue(all(c.moved for c in shifted))
+
+    def test_the_limit_scales_with_the_image_width(self):
+        self.assertAlmostEqual(cal.image_shift_limit_px(720), cal.SETUP_MOVED_IMAGE_SHIFT_PX)
+        self.assertAlmostEqual(cal.image_shift_limit_px(1280), cal.SETUP_MOVED_IMAGE_SHIFT_PX * 1280 / 720)
+
+
 class DiagnoseFrameTest(unittest.TestCase):
     def test_reports_why_a_board_is_or_is_not_usable(self):
         A = cal.BOARD_PRESETS[cal.HANDHELD_PRESET]
