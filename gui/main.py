@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSlider,
     QDoubleSpinBox,
+    QLineEdit,
     QFrame,
     QMessageBox,
     QFileDialog,
@@ -363,11 +364,16 @@ class MainWindow(QWidget):
             sl = QSlider(Qt.Orientation.Horizontal)
             sl.setRange(0, self._image_slider_resolution)
             sl.setEnabled(False)
-            val_lbl = QLabel("—")
+            # Editable: drag the slider, or type an exact value and press
+            # Enter (the slider's 1000 steps can't hit e.g. 8000 µs exactly).
+            val_lbl = QLineEdit("—")
             val_lbl.setMinimumWidth(64)
+            val_lbl.setMaximumWidth(90)
+            val_lbl.setEnabled(False)
             val_lbl.setAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
             )
+            val_lbl.setToolTip("Type a value and press Enter")
             row.addWidget(sl, stretch=1)
             row.addWidget(val_lbl)
 
@@ -402,6 +408,9 @@ class MainWindow(QWidget):
             }
             sl.valueChanged.connect(
                 lambda v, n=nodename: self._on_image_slider_changed(n, v)
+            )
+            val_lbl.editingFinished.connect(
+                lambda n=nodename: self._on_image_value_typed(n)
             )
 
         hint_row = 1 + (len(slider_params) + 1) // 2
@@ -1128,8 +1137,45 @@ class MainWindow(QWidget):
         if mx <= mn or steps <= 0:
             return
         value = mn + (slider_value / steps) * (mx - mn)
-        meta["label"].setText(f"{value:.4g}")
+        meta["label"].setText(self._format_image_value(node, value))
         self.camera.set_image_param(node, value)
+
+    @staticmethod
+    def _format_image_value(node: str, value: float) -> str:
+        # Exposure in whole µs, so a typed 8000 reads back as "8000".
+        return f"{value:.0f}" if node == "ExposureTime" else f"{value:.4g}"
+
+    def _read_image_param(self, node: str) -> float | None:
+        if node == "ExposureTime":
+            limits = self.camera.get_exposure_time_limits()
+        else:
+            limits = self.camera.get_image_param_limits(node)
+        return None if limits is None else float(limits[2])
+
+    def _on_image_value_typed(self, node: str) -> None:
+        """Apply a value typed in the box next to a slider, then show what the
+        camera actually holds (it clamps to its range and may round to its
+        increment) and move the slider to match."""
+        meta = self._slider_meta.get(node)
+        if meta is None or not meta["slider"].isEnabled():
+            return
+        box, sl = meta["label"], meta["slider"]
+        mn, mx = float(meta["min"]), float(meta["max"])
+        try:
+            value = float(box.text().strip().replace(",", "."))
+        except ValueError:
+            value = None
+        if value is not None and mx > mn:
+            self.camera.set_image_param(node, min(mx, max(mn, value)))
+        actual = self._read_image_param(node)
+        if actual is None:
+            return
+        box.setText(self._format_image_value(node, actual))
+        if mx > mn:
+            t = (actual - mn) / (mx - mn)
+            sl.blockSignals(True)
+            sl.setValue(int(round(min(1.0, max(0.0, t)) * float(meta["steps"]))))
+            sl.blockSignals(False)
 
     # Sliders whose value the camera will silently override while the
     # paired Auto mode isn't "Off" -- see _on_auto_mode_changed.
@@ -1161,6 +1207,7 @@ class MainWindow(QWidget):
                 meta["supported"] = False
                 sl.blockSignals(True)
                 sl.setEnabled(False)
+                lbl.setEnabled(False)
                 lbl.setText("N/A")
                 sl.blockSignals(False)
                 if caption is not None:
@@ -1174,16 +1221,18 @@ class MainWindow(QWidget):
             sl.setRange(0, steps)
             if mx <= mn:
                 sl.setEnabled(False)
-                lbl.setText(f"{cur:.4g}")
+                lbl.setEnabled(False)
+                lbl.setText(self._format_image_value(node, cur))
             else:
                 acquiring = self.state in (
                     AppState.PREVIEWING,
                     AppState.RECORDING,
                 )
                 sl.setEnabled(self._slider_can_tune(node, acquiring))
+                lbl.setEnabled(sl.isEnabled())
                 t = (cur - mn) / (mx - mn)
                 sl.setValue(int(round(min(1.0, max(0.0, t)) * steps)))
-                lbl.setText(f"{cur:.4g}")
+                lbl.setText(self._format_image_value(node, cur))
             if caption is not None:
                 fps = self.camera.get_acquisition_frame_rate()
                 caption.setText(
@@ -1396,8 +1445,10 @@ class MainWindow(QWidget):
             sl = meta["slider"]
             if not meta.get("supported"):
                 sl.setEnabled(False)
+                meta["label"].setEnabled(False)
                 continue
             sl.setEnabled(self._slider_can_tune(node, acquiring))
+            meta["label"].setEnabled(sl.isEnabled())
 
     def _stop_mic_preview(self) -> None:
         if self._mic_preview is not None:

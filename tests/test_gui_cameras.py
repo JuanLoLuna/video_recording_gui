@@ -482,6 +482,35 @@ class MainWindowCameraTests(unittest.TestCase):
         window.tuning_camera_combo.setCurrentIndex(window.tuning_camera_combo.findData(other))
         self.assertEqual(window.camera.serial, other)
 
+    def test_typed_exposure_sets_the_same_exact_value_on_both_cameras(self):
+        window = self.window(BLACKFLY, FIREFLY)
+        window.on_detect_clicked()
+        window.on_preview_clicked()
+        self.assertEqual(window.state, AppState.PREVIEWING, window.status_label.text())
+        pump(0.4)
+        meta = window._slider_meta["ExposureTime"]
+        for slot in window.cameras.slots:
+            window.tuning_camera_combo.setCurrentIndex(window.tuning_camera_combo.findData(slot.serial))
+            auto = window._auto_mode_meta.get("ExposureAuto")
+            if auto is not None and auto["combo"].isEnabled():
+                auto["combo"].setCurrentText("Off")
+            self.assertTrue(meta["label"].isEnabled())
+            meta["label"].setText("8000")
+            meta["label"].editingFinished.emit()
+            self.assertAlmostEqual(window.camera.get_exposure_time_limits()[2], 8000.0)
+            self.assertEqual(meta["label"].text(), "8000")
+            # The slider moved to match the typed value.
+            mn, mx = meta["min"], meta["max"]
+            expected = round((8000.0 - mn) / (mx - mn) * meta["steps"])
+            self.assertEqual(meta["slider"].value(), expected)
+        # Out-of-range and non-numeric input: the box shows what the camera holds.
+        meta["label"].setText("99999999")
+        meta["label"].editingFinished.emit()
+        self.assertEqual(float(meta["label"].text()), round(meta["max"]))
+        meta["label"].setText("abc")
+        meta["label"].editingFinished.emit()
+        self.assertEqual(float(meta["label"].text()), round(meta["max"]))
+
 
 if __name__ == "__main__":
     unittest.main()

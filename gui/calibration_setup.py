@@ -94,6 +94,9 @@ class SetupTaskMixin:
         grid.addWidget(QLabel("Board A"), 0, 0)
         self.setup_board_a = QComboBox()
         self.setup_board_a.addItems(list(cal.SETUP_A_PRESETS))
+        # A-big is the default: on the two-camera rig the Firefly reads the
+        # handheld board A only right where the subject stands.
+        self.setup_board_a.setCurrentText(cal.A_BIG_PRESET)
         self.setup_board_a.setToolTip("A-big has fewer, bigger markers: use it when a camera sees board A small")
         grid.addWidget(self.setup_board_a, 0, 1)
         grid.addWidget(QLabel("Board A measured square"), 1, 0)
@@ -101,7 +104,7 @@ class SetupTaskMixin:
         self.setup_square_a.setRange(5.0, 200.0)
         self.setup_square_a.setDecimals(2)
         self.setup_square_a.setSuffix(" mm")
-        self.setup_square_a.setValue(cal.default_measured_mm(cal.HANDHELD_PRESET))
+        self.setup_square_a.setValue(cal.default_measured_mm(cal.A_BIG_PRESET))
         grid.addWidget(self.setup_square_a, 1, 1)
         self.setup_board_a.currentTextChanged.connect(
             lambda name: self.setup_square_a.setValue(cal.default_measured_mm(name)))

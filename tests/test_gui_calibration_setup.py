@@ -150,9 +150,11 @@ class SessionSetupTests(unittest.TestCase):
         cw.setup_button.click()
         self.assertIs(cw.stack.currentWidget(), cw.page_setup_check)
         self.assertIn("calibrated", cw.setup_cameras_label.text())
-        # The fields default to the rig's measured prints; the rendered boards are nominal size.
+        # Board A defaults to A-big; the fields default to the rig's measured prints
+        # (the rendered boards are nominal size).
+        self.assertEqual(cw.setup_board_a.currentText(), cal.A_BIG_PRESET)
         self.assertEqual((cw.setup_square_a.value(), cw.setup_square_b.value(), cw.setup_marker_g.value()),
-                         (35.86, 35.86, 69.89))
+                         (44.82, 35.86, 69.89))
         cw.setup_board_a.setCurrentText(self.A_NAME)
         cw.setup_square_a.setValue(cal.measured_size_mm(cal.BOARD_PRESETS[self.A_NAME]))
         cw.setup_square_b.setValue(36.0)
