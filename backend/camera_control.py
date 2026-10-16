@@ -13,6 +13,7 @@ import PySpin
 from backend.async_csv_writer import AsyncCsvWriter
 from backend.calibration_store import FINGERPRINT_NODES
 from backend.camera_registry import CameraDescriptor
+from backend.camera_defaults import DEFAULT_EXPOSURE_US, default_gain_db, image_defaults_enabled
 from backend.disk_guard import StreamRate
 from backend.preview_scaling import fit_size
 from backend.spinnaker_system import SharedSystemHolder, default_holder
@@ -244,6 +245,9 @@ class CameraController:
         self.requested_serial = str(serial) if serial else None
         self.serial = self.requested_serial
         self.model = ""
+        # camera_defaults are applied on this controller's first start only, so a
+        # preview restart or a fault recovery keeps whatever was tuned since.
+        self._image_defaults_applied = False
         self.tag = tag
         # The Spinnaker System is shared by every controller in the process;
         # controllers never call GetInstance/ReleaseInstance themselves.
@@ -505,6 +509,9 @@ class CameraController:
             self.cam.Init()
             self._pin_identity()
             self._configure_camera_nodes()
+            if not self._image_defaults_applied and image_defaults_enabled():
+                self._apply_image_defaults()
+            self._image_defaults_applied = True
 
             self.cam.BeginAcquisition()
             self.acquiring = True
@@ -715,6 +722,37 @@ class CameraController:
             if actual >= EXPOSURE_AUTO_LOCK_MIN_FPS:
                 self._force_exposure_auto_off(nodemap)
             self._clamp_exposure_to_frame_period(actual)
+
+    def _apply_image_defaults(self) -> None:
+        """Auto exposure and auto gain off, exposure and gain at camera_defaults (best effort).
+
+        Called before BeginAcquisition, after _configure_camera_nodes (so the exposure is
+        capped to the frame period it set). Never raises: a node a camera lacks is skipped.
+        """
+        nodemap = self.cam.GetNodeMap()
+        for auto in ("ExposureAuto", "GainAuto"):
+            try:
+                node = PySpin.CEnumerationPtr(nodemap.GetNode(auto))
+                if PySpin.IsWritable(node):
+                    node.SetIntValue(node.GetEntryByName("Off").GetValue())
+            except Exception as exc:
+                print(f"{self._log_prefix} could not set {auto} Off: {exc}")
+        targets = [("ExposureTime", DEFAULT_EXPOSURE_US)]
+        gain = default_gain_db(self.serial or "", self.model or "")
+        if gain is not None:
+            targets.append(("Gain", gain))
+        fps = float(self.target_frame_rate or 0)
+        for name, value in targets:
+            try:
+                node = PySpin.CFloatPtr(nodemap.GetNode(name))
+                if not PySpin.IsWritable(node):
+                    continue
+                hi = float(node.GetMax())
+                if name == "ExposureTime" and fps > 0:
+                    hi = min(hi, 1_000_000.0 / fps * EXPOSURE_FRAME_PERIOD_HEADROOM)
+                node.SetValue(min(hi, max(float(node.GetMin()), float(value))))
+            except Exception as exc:
+                print(f"{self._log_prefix} could not set default {name}: {exc}")
 
     def _force_exposure_auto_off(self, nodemap) -> None:
         """Set ExposureAuto to Off if the camera has it (best effort, never raises)."""

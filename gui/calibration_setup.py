@@ -37,7 +37,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from backend import auto_setup
 from backend import calibration as cal
+from backend.camera_defaults import DEFAULT_EXPOSURE_US
 from backend.calibration_store import SetupRecord
 from gui.calibration_common import _Detector, draw_overlay
 from gui.camera_preview import frame_to_qimage
@@ -69,6 +71,8 @@ class SetupTaskMixin:
         self._setup_latest: dict[str, dict] = {}       # serial -> {name: Detection} of the newest frame
         self._setup_frames: dict = {}                   # serial -> newest full-resolution frame (diagnosis)
         self._setup_collect: dict[str, list] | None = None  # serial -> [{name: Detection}] while capturing
+        self._setup_brightness_job = None   # auto_setup on board A, running before a capture
+        self._setup_brightness_note = ""
         self._setup_collect_until = 0.0
         self._setup_collect_for = ""                    # "setup" | "verify"
         self._setup_boards: dict[str, cal.BoardConfig] = {}
@@ -210,8 +214,15 @@ class SetupTaskMixin:
         self.setup_snapshot_button.clicked.connect(self._save_setup_snapshot)
         nav.addWidget(self.setup_snapshot_button)
         nav.addStretch(1)
+        self.setup_auto_brightness = QCheckBox("Set camera brightness from board A first")
+        self.setup_auto_brightness.setChecked(True)
+        self.setup_auto_brightness.setToolTip(
+            f"Before capturing: exposure {DEFAULT_EXPOSURE_US / 1000:g} ms on both cameras, auto exposure and "
+            "auto gain off, and each camera's gain set so board A's white paper reads the same grey level "
+            "(the main window's Auto setup button does the same).")
+        nav.addWidget(self.setup_auto_brightness)
         self.setup_capture_button = QPushButton("Capture setup")
-        self.setup_capture_button.clicked.connect(lambda: self._setup_begin_collect("setup"))
+        self.setup_capture_button.clicked.connect(self._setup_capture_clicked)
         nav.addWidget(self.setup_capture_button)
         self.setup_next_button = QPushButton("Next: verify")
         self.setup_next_button.clicked.connect(self._setup_to_verify)
@@ -299,7 +310,7 @@ class SetupTaskMixin:
         self._setup_update_buttons()
 
     def _setup_update_buttons(self) -> None:
-        collecting = self._setup_collect is not None
+        collecting = self._setup_collect is not None or self._setup_brightness_job is not None
         both_see_a = len(self.slots) == 2 and all(
             (self._setup_latest.get(s.serial) or {}).get("A") is not None
             and self._setup_latest[s.serial]["A"].ok for s in self.slots)
@@ -314,6 +325,8 @@ class SetupTaskMixin:
         self.setup_save_button.setEnabled(bool(self._verify_result and self._verify_result.passed)
                                           and not collecting)
         self.setup_back.setEnabled(not collecting)
+        self.setup_auto_brightness.setVisible(setup_phase)
+        self.setup_auto_brightness.setEnabled(not collecting)
 
     def _setup_go_back(self) -> None:
         if self._setup_phase == "verify":
@@ -332,6 +345,7 @@ class SetupTaskMixin:
             det.stop()
         self._setup_detectors = {}
         self._setup_collect = None
+        self._setup_brightness_job = None
 
     # ------------------------------------------------------------------- live
     def _setup_tick(self) -> None:
@@ -363,11 +377,43 @@ class SetupTaskMixin:
             r_text = ("reference: none seen" if ref is None
                       else f"reference: {_ref_label(ref[0])}, {len(ref[1].ids)} corners")
             self.setup_view_status[slot.serial].setText(f"{a_text}; {r_text}")
+        if self._setup_brightness_job is not None and self._setup_brightness_job.done():
+            self._setup_check_brightness_job()
+            changed = True
         if self._setup_collect is not None and time.monotonic() >= self._setup_collect_until:
             self._setup_finish_collect()
+            if self._setup_brightness_note and self._setup_collect_for == "setup":
+                self.setup_text.setText(self._setup_brightness_note + "\n" + self.setup_text.text())
             changed = True
         if changed:
             self._setup_update_buttons()
+
+    def _setup_capture_clicked(self) -> None:
+        """Capture setup: first the camera brightness from board A (if ticked), then the 3 s capture."""
+        self._setup_brightness_note = ""
+        if not self.setup_auto_brightness.isChecked():
+            self._setup_begin_collect("setup")
+            return
+        cameras = [(slot.label, slot.serial, slot.controller) for slot in self.slots]
+        self._setup_brightness_job = self._pool.submit(
+            auto_setup.auto_setup_cameras, cameras, self._setup_boards["A"], DEFAULT_EXPOSURE_US)
+        self.setup_verdict.setStyleSheet("font-size: 16px; font-weight: 700;")
+        self.setup_verdict.setText("Setting camera brightness from board A… keep still")
+        self.setup_text.setText("")
+        self._setup_update_buttons()
+
+    def _setup_check_brightness_job(self) -> None:
+        job = self._setup_brightness_job
+        if job is None or not job.done():
+            return
+        self._setup_brightness_job = None
+        try:
+            ok, text = auto_setup.summary(job.result())
+            self._setup_brightness_note = ("Brightness: " if ok else "Brightness NOT fully set (capture went ahead): ") + text
+        except Exception as exc:
+            self._setup_brightness_note = f"Brightness not set (capture went ahead): {exc}"
+        # The pose capture does not depend on the brightness, so it always goes ahead.
+        self._setup_begin_collect("setup")
 
     def _setup_begin_collect(self, what: str) -> None:
         self._setup_collect = {slot.serial: [] for slot in self.slots}

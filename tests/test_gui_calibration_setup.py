@@ -32,6 +32,7 @@ if HAVE_QT:
     import backend.spinnaker_system as spinnaker_system
     import test_calibration as synth
     from backend import calibration as cal
+    from backend.camera_defaults import DEFAULT_EXPOSURE_US
     from backend import calibration_store as cs
     from backend.camera_registry import CAMERA_SERIALS_ENV
     from backend.spinnaker_system import SharedSystemHolder
@@ -170,6 +171,14 @@ class SessionSetupTests(unittest.TestCase):
         self.assertTrue(pump_until(lambda: cw._setup_result is not None, timeout=10), cw.setup_text.text())
         self.assertTrue(cw._setup_result.passed, cw.setup_text.text())
         self.assertIn("PASS", cw.setup_verdict.text())
+        # The brightness step ran first (ticked by default) and reports on both cameras;
+        # exposure went to the default with auto exposure and auto gain off.
+        self.assertTrue(cw.setup_auto_brightness.isChecked())
+        self.assertIn("Brightness", cw.setup_text.text())
+        for slot in window._slots():
+            self.assertIn(slot.label, cw.setup_text.text())
+            self.assertAlmostEqual(slot.controller.get_exposure_time_limits()[2], DEFAULT_EXPOSURE_US)
+            self.assertEqual(slot.controller.get_enum_param("GainAuto")[0], "Off")
         self.assertAlmostEqual(cw._setup_result.baseline_mm, self.true_baseline_mm,
                                delta=self.true_baseline_mm * 0.02)
         self.assertTrue(all(cw._setup_refs[s] is not None for s in (FIREFLY[0], BLACKFLY[0])))

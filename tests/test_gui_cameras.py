@@ -511,6 +511,60 @@ class MainWindowCameraTests(unittest.TestCase):
         meta["label"].editingFinished.emit()
         self.assertEqual(float(meta["label"].text()), round(meta["max"]))
 
+    # ------------------------------------------------- image defaults, auto setup
+    def settings(self, serial):
+        cam = next(c for c in self.cameras if c.serial == serial)
+        return cam._nodemap._settings
+
+    def test_cameras_start_with_the_chosen_image_settings(self):
+        window = self.window(BLACKFLY, FIREFLY)
+        window.on_detect_clicked()
+        window.on_preview_clicked()
+        self.assertEqual(window.state, AppState.PREVIEWING, window.status_label.text())
+        for serial, gain in ((FIREFLY[0], 2.5), (BLACKFLY[0], 3.4)):
+            st = self.settings(serial)
+            self.assertEqual(st["ExposureAuto"].entry.name, "Off")
+            self.assertEqual(st["GainAuto"].entry.name, "Off")
+            self.assertEqual(st["ExposureTime"].value, 8000.0)
+            self.assertEqual(st["Gain"].value, gain)
+        # Only on the first start: a preview restart keeps what was tuned since.
+        self.settings(FIREFLY[0])["Gain"].value = 7.0
+        window.on_preview_clicked()
+        window.on_preview_clicked()
+        self.assertEqual(window.state, AppState.PREVIEWING)
+        self.assertEqual(self.settings(FIREFLY[0])["Gain"].value, 7.0)
+
+    def test_image_defaults_can_be_switched_off(self):
+        os.environ["SLEEVE_VIDEO_GUI_NO_IMAGE_DEFAULTS"] = "1"
+        self.addCleanup(os.environ.pop, "SLEEVE_VIDEO_GUI_NO_IMAGE_DEFAULTS", None)
+        window = self.window(FIREFLY)
+        window.on_detect_clicked()
+        window.on_preview_clicked()
+        self.assertEqual(self.settings(FIREFLY[0])["GainAuto"].entry.name, "Continuous")
+        self.assertNotEqual(self.settings(FIREFLY[0])["ExposureTime"].value, 8000.0)
+
+    def test_auto_setup_button_reports_a_missing_board(self):
+        window = self.window(BLACKFLY, FIREFLY)
+        window.on_detect_clicked()
+        self.assertFalse(window.auto_setup_button.isEnabled())   # needs a running preview
+        window.on_preview_clicked()
+        pump(0.4)
+        self.assertTrue(window.auto_setup_button.isEnabled())
+        for serial in (FIREFLY[0], BLACKFLY[0]):
+            self.settings(serial)["ExposureTime"].value = 3000.0
+        window.auto_setup_button.click()
+        self.assertFalse(window.auto_setup_button.isEnabled())   # busy
+        end = time.monotonic() + 10
+        while window._auto_setup_job is not None and time.monotonic() < end:
+            pump(0.1)
+        self.assertIsNone(window._auto_setup_job)
+        text = window.auto_setup_label.text()
+        self.assertIn("incomplete", text)
+        self.assertIn("board A not found", text)
+        self.assertTrue(window.auto_setup_button.isEnabled())
+        for serial in (FIREFLY[0], BLACKFLY[0]):   # exposure went back to the default first
+            self.assertEqual(self.settings(serial)["ExposureTime"].value, 8000.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -86,6 +86,9 @@ from backend.power_keepalive import (
 )
 
 from backend.compression_policy import describe_policy, suggested_compression
+from backend import auto_setup
+from backend import calibration as cal_core
+from backend.camera_defaults import DEFAULT_EXPOSURE_US
 from backend.calibration_store import (
     CalibrationStore,
     assess_camera,
@@ -317,6 +320,30 @@ class MainWindow(QWidget):
         self.tuning_camera_combo.currentIndexChanged.connect(self._on_tuning_camera_changed)
         self.tuning_camera_row.setVisible(False)
         setup_inner.addWidget(self.tuning_camera_row)
+
+        # One-button auto setup (backend/auto_setup.py): exposure to the default, gain
+        # from board A's white paper, on every camera. Board A must rest at its spot.
+        auto_row = QWidget()
+        auto_layout = QHBoxLayout(auto_row)
+        auto_layout.setContentsMargins(0, 0, 0, 0)
+        self.auto_setup_button = QPushButton("Auto setup cameras (board A in view)")
+        self.auto_setup_button.setToolTip(
+            f"Exposure {DEFAULT_EXPOSURE_US / 1000:g} ms, auto exposure and auto gain off, then each camera's "
+            "gain is set so board A's white paper reads the same grey level. Press it right after the "
+            "setup calibration, with board A still at its spot; then remove the board.")
+        self.auto_setup_button.setEnabled(False)
+        self.auto_setup_button.clicked.connect(self._on_auto_setup_clicked)
+        auto_layout.addWidget(self.auto_setup_button)
+        self.auto_setup_label = QLabel("")
+        self.auto_setup_label.setWordWrap(True)
+        self.auto_setup_label.setStyleSheet("color: #555; font-size: 11px;")
+        auto_layout.addWidget(self.auto_setup_label, stretch=1)
+        setup_inner.addWidget(auto_row)
+        self._auto_setup_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="auto-setup")
+        self._auto_setup_job: Future | None = None
+        self._auto_setup_timer = QTimer(self)
+        self._auto_setup_timer.setInterval(200)
+        self._auto_setup_timer.timeout.connect(self._poll_auto_setup)
 
         setup_inner.addWidget(self.camera_tuning_toggle)
 
@@ -1107,6 +1134,47 @@ class MainWindow(QWidget):
             % ("#c62828" if self._rec_blink_on else "#7a1414")
         )
 
+    def _auto_setup_board(self) -> cal_core.BoardConfig:
+        """Board A as the current setup recorded it (measured size), else A-big at its measured size."""
+        setup = self._calibration_store.current_setup()
+        if setup is not None and setup.board:
+            try:
+                return cal_core.BoardConfig.from_dict(setup.board)
+            except (KeyError, TypeError, ValueError):
+                pass
+        return cal_core.with_measured_square(cal_core.BOARD_PRESETS[cal_core.A_BIG_PRESET],
+                                             cal_core.default_measured_mm(cal_core.A_BIG_PRESET))
+
+    def _on_auto_setup_clicked(self) -> None:
+        if self.state != AppState.PREVIEWING or self._auto_setup_job is not None:
+            return
+        board = self._auto_setup_board()
+        cameras = [(slot.label, slot.serial, slot.controller) for slot in self._slots()]
+        if not cameras:
+            return
+        self.auto_setup_label.setText("Setting the cameras from board A…")
+        self._auto_setup_job = self._auto_setup_pool.submit(
+            auto_setup.auto_setup_cameras, cameras, board, DEFAULT_EXPOSURE_US)
+        self._update_camera_tuning_widgets_enabled()
+        self._auto_setup_timer.start()
+
+    def _poll_auto_setup(self) -> None:
+        job = self._auto_setup_job
+        if job is None or not job.done():
+            return
+        self._auto_setup_timer.stop()
+        self._auto_setup_job = None
+        try:
+            ok, text = auto_setup.summary(job.result())
+            if not ok:
+                text = "Auto setup incomplete. " + text
+        except Exception as exc:  # a camera dropped out mid-way
+            text = f"Auto setup failed: {exc}"
+        self.auto_setup_label.setText(text)
+        self._sync_auto_mode_combos_from_camera()
+        self._sync_image_sliders_from_camera()
+        self._update_camera_tuning_widgets_enabled()
+
     def _on_camera_tuning_toggle(self) -> None:
         self._camera_tuning_expanded = not self._camera_tuning_expanded
         self.camera_tuning_panel.setVisible(self._camera_tuning_expanded)
@@ -1431,6 +1499,9 @@ class MainWindow(QWidget):
             self.compression_checkbox.setEnabled(self.state == AppState.PREVIEWING)
 
     def _update_camera_tuning_widgets_enabled(self) -> None:
+        if hasattr(self, "auto_setup_button"):
+            self.auto_setup_button.setEnabled(
+                self.state == AppState.PREVIEWING and self._auto_setup_job is None)
         if not self._slider_meta:
             return
         acquiring = self.state in (AppState.PREVIEWING, AppState.RECORDING)
@@ -2538,6 +2609,7 @@ class MainWindow(QWidget):
             print("Error closing the calibration window:", e)
         self.reference_timer.stop()
         self._reference_pool.shutdown(wait=False, cancel_futures=True)
+        self._auto_setup_pool.shutdown(wait=False, cancel_futures=True)
         try:
             release_keep_awake()
         except Exception as e:
