@@ -1,4 +1,4 @@
-"""One-button auto setup: set each camera's gain from calibration board A (Two-camera setup #2).
+"""One-button auto setup: set each camera's gain from a calibration board (Two-camera setup #2).
 
 Exposure stays fixed (camera_defaults.DEFAULT_EXPOSURE_US); only the gain moves. The
 reference is board A's white paper, still resting at its spot right after the setup
@@ -6,14 +6,23 @@ calibration: it is the same in every session, unlike the scene around it (a blac
 white objects, a bright floor), so the same target gives the same exposure level every
 time. Press it after the setup, then remove the board and record.
 
-Pure logic plus one blocking function for a worker thread; no Qt.
+Two references:
+- board A (setup capture, and the fallback): its white paper must read TARGET_WHITE;
+- each camera's fixed reference board (G1/G2/B1/B2), once the setup has stored how bright it
+  read right after the board A step (brightness_reference.json next to the setups, keyed by
+  the setup id): the button brings it back to that level, with nothing to place. The
+  reference boards never move, so the result does not depend on where board A was left.
+
+Pure logic plus blocking functions for a worker thread; no Qt.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable
 
 import cv2
@@ -28,6 +37,9 @@ TOLERANCE = 8.0
 MAX_ITERATIONS = 6
 MAX_STEP_DB = 12.0
 SATURATED = 250.0
+REFERENCE_FILE = "brightness_reference.json"
+# A reference board's stored level is only usable if it is neither clipped nor too dark.
+REFERENCE_MIN, REFERENCE_MAX = 60.0, 240.0
 FRAMES_PER_MEASURE = 3
 FRAME_SPACING_S = 0.1
 SETTLE_S = 0.3   # after a gain change: let a few frames with the new gain arrive
@@ -58,6 +70,12 @@ def board_white_level(gray: np.ndarray, det: cal.Detection) -> float | None:
     return float(np.percentile(vals, 95)) if vals.size >= 50 else None
 
 
+def measure_white(gray: np.ndarray, board: cal.BoardConfig, detector: cal.BoardDetector | None = None) -> float | None:
+    """The board's white-paper level in one grey frame, or None if the board isn't found."""
+    det = (detector or cal.BoardDetector(board)).detect(gray)
+    return board_white_level(gray, det)
+
+
 def gain_step_db(white: float, target: float = TARGET_WHITE) -> float:
     """How far to move the gain: brightness scales with gain, 20 dB per 10x."""
     if white >= SATURATED:
@@ -69,9 +87,11 @@ def gain_step_db(white: float, target: float = TARGET_WHITE) -> float:
 def auto_gain(serial: str, board: cal.BoardConfig, grab_frame: Callable[[], np.ndarray | None],
               get_gain: Callable[[], float | None], set_gain: Callable[[float], bool],
               gain_limits: tuple[float, float], target: float = TARGET_WHITE,
-              sleep: Callable[[float], None] = time.sleep) -> AutoSetupResult:
-    """Move one camera's gain until board A's white paper reads `target` (+- TOLERANCE). Blocking."""
+              sleep: Callable[[float], None] = time.sleep, board_name: str = "board A",
+              tolerance: float | None = None) -> AutoSetupResult:
+    """Move one camera's gain until the board's white paper reads `target` (+- tolerance). Blocking."""
     detector = cal.BoardDetector(board)
+    tol = TOLERANCE if tolerance is None else tolerance
     lo, hi = gain_limits
     gain = get_gain()
     if gain is None:
@@ -90,32 +110,48 @@ def auto_gain(serial: str, board: cal.BoardConfig, grab_frame: Callable[[], np.n
             if level is not None:
                 levels.append(level)
         if not levels:
-            return AutoSetupResult(serial, False, gain, None, it,
-                                   "board A not found: put it at its spot, whole and in view")
+            where = "put it at its spot, whole and in view" if board_name == "board A" else "is it covered?"
+            return AutoSetupResult(serial, False, gain, None, it, f"{board_name} not found: {where}")
         white = float(np.median(levels))
-        if abs(white - target) <= TOLERANCE:
-            return AutoSetupResult(serial, True, gain, white, it, f"gain {gain:.1f} dB, board white {white:.0f}")
+        if abs(white - target) <= tol:
+            return AutoSetupResult(serial, True, gain, white, it,
+                                   f"gain {gain:.1f} dB, {board_name} white {white:.0f}")
         new = max(lo, min(hi, gain + gain_step_db(white, target)))
         if abs(new - gain) < 0.05:
             what = "add light" if white < target else "reduce the light"
             return AutoSetupResult(serial, False, gain, white, it,
-                                   f"gain at its limit ({gain:.1f} dB) with board white {white:.0f}: {what}")
+                                   f"gain at its limit ({gain:.1f} dB) with {board_name} white {white:.0f}: {what}")
         if not set_gain(new):
             return AutoSetupResult(serial, False, gain, white, it, "camera refused the gain")
         actual = get_gain()
         gain = new if actual is None else actual
         sleep(SETTLE_S)
     return AutoSetupResult(serial, False, gain, white, MAX_ITERATIONS,
-                           f"did not settle (gain {gain:.1f} dB, board white {white:.0f}); press again")
+                           f"did not settle (gain {gain:.1f} dB, {board_name} white {white:.0f}); press again")
+
+
+@dataclass(frozen=True)
+class Target:
+    """What one camera's gain is tuned on: a board, the white level it must read, a name."""
+    board: cal.BoardConfig
+    white: float = TARGET_WHITE
+    name: str = "board A"
+
+    @property
+    def tolerance(self) -> float:
+        return max(6.0, 0.04 * self.white)
 
 
 def auto_setup_cameras(cameras, board: cal.BoardConfig, exposure_us: float,
-                       sleep: Callable[[float], None] = time.sleep) -> list[tuple[str, AutoSetupResult]]:
+                       sleep: Callable[[float], None] = time.sleep,
+                       targets: dict | None = None) -> list[tuple[str, AutoSetupResult]]:
     """Every camera: auto exposure/gain off, exposure to `exposure_us` (capped to the frame
-    period), then auto_gain from board A. `cameras`: (label, serial, CameraController).
-    Blocking: run it in a worker. Used by the main window's button and the setup capture."""
+    period), then auto_gain on its target (`targets`: serial -> Target; default board A at
+    TARGET_WHITE). `cameras`: (label, serial, CameraController). Blocking: run it in a worker.
+    Used by the main window's button and the setup capture."""
     out = []
     for label, serial, ctl in cameras:
+        target = (targets or {}).get(serial) or Target(board)
         ctl.set_enum_param("ExposureAuto", "Off")
         ctl.set_enum_param("GainAuto", "Off")
         limits = ctl.get_exposure_time_limits()
@@ -131,9 +167,53 @@ def auto_setup_cameras(cameras, board: cal.BoardConfig, exposure_us: float,
             return None if lim is None else float(lim[2])
 
         sleep(SETTLE_S)  # frames with the new exposure
-        out.append((label, auto_gain(serial, board, ctl.get_latest_frame, get_gain,
+        out.append((label, auto_gain(serial, target.board, ctl.get_latest_frame, get_gain,
                                      lambda v, ctl=ctl: ctl.set_image_param("Gain", v),
-                                     (float(gl[0]), float(gl[1])), sleep=sleep)))
+                                     (float(gl[0]), float(gl[1])), target=target.white, sleep=sleep,
+                                     board_name=target.name, tolerance=target.tolerance)))
+    return out
+
+
+# --------------------------------------------------------------------------
+# Reference-board brightness, stored per setup
+# --------------------------------------------------------------------------
+
+def reference_path(root) -> Path:
+    return Path(root) / REFERENCE_FILE
+
+
+def save_reference(root, setup_id: str, cameras: dict) -> None:
+    """cameras: serial -> {"name", "board" (BoardConfig dict), "white", "gain_db", "exposure_us"}.
+    Only usable levels (REFERENCE_MIN..REFERENCE_MAX) are kept. Replaces any older file."""
+    keep = {s: c for s, c in cameras.items()
+            if c and c.get("white") is not None and REFERENCE_MIN <= float(c["white"]) <= REFERENCE_MAX}
+    path = reference_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"setup_id": setup_id, "cameras": keep}, indent=1))
+    tmp.replace(path)
+
+
+def load_reference(root, setup_id: str | None) -> dict:
+    """serial -> stored entry, for this setup only (a newer setup makes the file stale)."""
+    try:
+        data = json.loads(reference_path(root).read_text())
+    except (OSError, ValueError):
+        return {}
+    if not setup_id or data.get("setup_id") != setup_id:
+        return {}
+    return data.get("cameras") or {}
+
+
+def targets_from_reference(reference: dict) -> dict:
+    """serial -> Target on that camera's reference board, from load_reference()."""
+    out = {}
+    for serial, entry in reference.items():
+        try:
+            out[serial] = Target(cal.BoardConfig.from_dict(entry["board"]), float(entry["white"]),
+                                 f"reference {entry.get('name', 'board')}")
+        except (KeyError, TypeError, ValueError):
+            continue
     return out
 
 

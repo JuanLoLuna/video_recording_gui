@@ -79,3 +79,76 @@ class AutoGainTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+G2 = cal.BOARD_PRESETS[cal.REFERENCE_PRESETS[3]]
+
+
+class FakeController:
+    """Just enough of CameraController for auto_setup_cameras, over a FakeCam scene."""
+
+    def __init__(self, cam):
+        self.cam, self.exposure, self.enums = cam, 3000.0, {}
+
+    def set_enum_param(self, name, entry):
+        self.enums[name] = entry
+        return True
+
+    def get_exposure_time_limits(self):
+        return (10.0, 30000.0, self.exposure)
+
+    def get_image_param_limits(self, name):
+        return (self.cam.limits[0], self.cam.limits[1], self.cam.gain) if name == "Gain" else None
+
+    def set_image_param(self, name, value):
+        if name == "ExposureTime":
+            self.exposure = value
+            return True
+        return self.cam.set(value)
+
+    def get_latest_frame(self):
+        return self.cam.frame()
+
+
+class ReferenceTest(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_store_is_per_setup_and_keeps_only_usable_levels(self):
+        entry = {"name": "G2", "board": G2.to_dict(), "white": 150.0, "gain_db": 2.0, "exposure_us": 8000.0}
+        au.save_reference(self.tmp.name, "20261016_154306",
+                          {"A": entry, "B": dict(entry, white=252.0), "C": dict(entry, white=None)})
+        ref = au.load_reference(self.tmp.name, "20261016_154306")
+        self.assertEqual(set(ref), {"A"})                     # clipped and missing levels dropped
+        self.assertEqual(au.load_reference(self.tmp.name, "20261017_090000"), {})   # newer setup: stale
+        self.assertEqual(au.load_reference(self.tmp.name, None), {})
+        t = au.targets_from_reference(ref)["A"]
+        self.assertEqual((t.white, t.name, t.board), (150.0, "reference G2", G2))
+
+    def test_button_restores_the_stored_reference_level(self):
+        # Session 1: the reference board read 150 at the gain board A chose. Session 2: the light
+        # dimmed to 70 %: the gain goes up until the reference board reads 150 again (+3.1 dB).
+        def scene(scale):
+            R, t = synth.pose_looking_at_board(1.2, (20, 0, 0), (0.0, 0.0), G2)
+            cam = FakeCam(4.0)
+            img = synth.render_scene([(G2, R, t)], D=np.zeros(5), background=40).astype(np.float32)
+            cam.scene = img / img.max() * 150.0 / 10 ** (4.0 / 20) * scale   # 150 at 4 dB, full light
+            return cam
+        cam = scene(0.7)
+        results = au.auto_setup_cameras([("Firefly", "A", FakeController(cam))], BOARD, 8000.0,
+                                        sleep=lambda s: None, targets={"A": au.Target(G2, 150.0, "reference G2")})
+        (label, r), = results
+        self.assertTrue(r.ok, r)
+        self.assertIn("reference G2", r.message)
+        self.assertAlmostEqual(r.gain_db, 4.0 + 20 * np.log10(1 / 0.7), delta=0.5)
+
+    def test_camera_without_a_reference_falls_back_to_board_a(self):
+        ctl = FakeController(FakeCam(0.0))
+        (label, r), = au.auto_setup_cameras([("Blackfly", "B", ctl)], BOARD, 8000.0,
+                                            sleep=lambda s: None, targets={})
+        self.assertTrue(r.ok, r)
+        self.assertIn("board A", r.message)
+        self.assertEqual(ctl.exposure, 8000.0)
+        self.assertEqual(ctl.enums, {"ExposureAuto": "Off", "GainAuto": "Off"})

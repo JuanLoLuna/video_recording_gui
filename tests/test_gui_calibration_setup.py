@@ -195,6 +195,13 @@ class SessionSetupTests(unittest.TestCase):
         cw.setup_save_button.click()
         self.assertIs(cw.stack.currentWidget(), cw.page_home)
         self.assertIn("Setup saved", cw.saved_label.text())
+        # Saving also stores (or says why not) each camera's reference-board brightness, tied to this setup.
+        self.assertIn("rightness reference", cw.saved_label.text())
+        from backend import auto_setup
+        saved_id = window._calibration_store.current_setup().id
+        ref_file = auto_setup.reference_path(window._calibration_store.root)
+        if ref_file.exists():
+            self.assertEqual(json.loads(ref_file.read_text())["setup_id"], saved_id)
         log = window._calibration_store.root / "diagnostics" / "setup_log.jsonl"
         entries = [json.loads(line) for line in log.read_text().splitlines()]
         self.assertEqual([e["phase"] for e in entries][-2:], ["setup", "verify"])

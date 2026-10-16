@@ -326,11 +326,12 @@ class MainWindow(QWidget):
         auto_row = QWidget()
         auto_layout = QHBoxLayout(auto_row)
         auto_layout.setContentsMargins(0, 0, 0, 0)
-        self.auto_setup_button = QPushButton("Auto setup cameras (board A in view)")
+        self.auto_setup_button = QPushButton("Auto setup cameras")
         self.auto_setup_button.setToolTip(
             f"Exposure {DEFAULT_EXPOSURE_US / 1000:g} ms, auto exposure and auto gain off, then each camera's "
-            "gain is set so board A's white paper reads the same grey level. Press it right after the "
-            "setup calibration, with board A still at its spot; then remove the board.")
+            "gain is set so its reference board reads as bright as right after the last setup calibration "
+            "(nothing to place). A camera without a stored reference uses board A instead: put board A at "
+            "its spot first.")
         self.auto_setup_button.setEnabled(False)
         self.auto_setup_button.clicked.connect(self._on_auto_setup_clicked)
         auto_layout.addWidget(self.auto_setup_button)
@@ -1152,9 +1153,14 @@ class MainWindow(QWidget):
         cameras = [(slot.label, slot.serial, slot.controller) for slot in self._slots()]
         if not cameras:
             return
-        self.auto_setup_label.setText("Setting the cameras from board A…")
+        setup = self._calibration_store.current_setup()
+        targets = auto_setup.targets_from_reference(
+            auto_setup.load_reference(self._calibration_store.root, None if setup is None else setup.id))
+        uses = "the reference boards" if len(targets) == len(cameras) else (
+            "board A" if not targets else "the reference boards (board A where none is stored)")
+        self.auto_setup_label.setText(f"Setting the cameras from {uses}…")
         self._auto_setup_job = self._auto_setup_pool.submit(
-            auto_setup.auto_setup_cameras, cameras, board, DEFAULT_EXPOSURE_US)
+            auto_setup.auto_setup_cameras, cameras, board, DEFAULT_EXPOSURE_US, targets=targets)
         self._update_camera_tuning_widgets_enabled()
         self._auto_setup_timer.start()
 

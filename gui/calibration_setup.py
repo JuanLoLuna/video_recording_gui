@@ -73,6 +73,7 @@ class SetupTaskMixin:
         self._setup_collect: dict[str, list] | None = None  # serial -> [{name: Detection}] while capturing
         self._setup_brightness_job = None   # auto_setup on board A, running before a capture
         self._setup_brightness_note = ""
+        self._setup_brightness_ok: dict = {}   # serial -> True when board A set its gain this capture
         self._setup_collect_until = 0.0
         self._setup_collect_for = ""                    # "setup" | "verify"
         self._setup_boards: dict[str, cal.BoardConfig] = {}
@@ -391,6 +392,7 @@ class SetupTaskMixin:
     def _setup_capture_clicked(self) -> None:
         """Capture setup: first the camera brightness from board A (if ticked), then the 3 s capture."""
         self._setup_brightness_note = ""
+        self._setup_brightness_ok = {}
         if not self.setup_auto_brightness.isChecked():
             self._setup_begin_collect("setup")
             return
@@ -408,7 +410,9 @@ class SetupTaskMixin:
             return
         self._setup_brightness_job = None
         try:
-            ok, text = auto_setup.summary(job.result())
+            results = job.result()
+            self._setup_brightness_ok = {r.serial: r.ok for _, r in results}
+            ok, text = auto_setup.summary(results)
             self._setup_brightness_note = ("Brightness: " if ok else "Brightness NOT fully set (capture went ahead): ") + text
         except Exception as exc:
             self._setup_brightness_note = f"Brightness not set (capture went ahead): {exc}"
@@ -597,6 +601,35 @@ class SetupTaskMixin:
         self.setup_text.setText(f"Snapshot saved to {folder} (send the whole folder).\n" + "\n".join(lines))
 
     # ------------------------------------------------------------------- save
+    def _save_brightness_reference(self, setup_id: str) -> str:
+        """Store how bright each camera's reference board reads now, right after the board A
+        brightness step, so the Auto setup button can restore it later without board A.
+        Returns a note for the saved label. Never raises."""
+        entries = {}
+        try:
+            for slot in self.slots:
+                ref = self._setup_refs.get(slot.serial)
+                frame = self._setup_frames.get(slot.serial)
+                if ref is None or frame is None or not self._setup_brightness_ok.get(slot.serial):
+                    continue
+                cfg = self._setup_boards[ref[0]]
+                gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                white = auto_setup.measure_white(gray, cfg)
+                gain = slot.controller.get_image_param_limits("Gain")
+                expo = slot.controller.get_exposure_time_limits()
+                entries[slot.serial] = {
+                    "name": _ref_label(ref[0]), "board": cfg.to_dict(), "white": white,
+                    "gain_db": None if gain is None else float(gain[2]),
+                    "exposure_us": None if expo is None else float(expo[2])}
+            auto_setup.save_reference(self.store.root, setup_id, entries)
+        except Exception as exc:
+            print(f"[calibration] brightness reference not saved: {exc}")
+            return " Brightness reference not saved."
+        kept = auto_setup.load_reference(self.store.root, setup_id)
+        missing = [s.label for s in self.slots if s.serial not in kept]
+        return (" Brightness reference saved for both cameras." if not missing else
+                f" No brightness reference for {', '.join(missing)}: Auto setup will use board A for it.")
+
     def _save_setup(self) -> None:
         result, verify = self._setup_result, self._verify_result
         if result is None or verify is None or not verify.passed:
@@ -627,6 +660,7 @@ class SetupTaskMixin:
             self.setup_verdict.setText("Could not save the setup")
             self.setup_text.setText(f"{exc}\nPress Save setup to try again.")
             return
+        ref_note = self._save_brightness_reference(record.id)
         self._stop_setup_detectors()
         self.ui_timer.stop()
         self.on_saved()
@@ -634,5 +668,5 @@ class SetupTaskMixin:
         self.saved_label.setText(
             f"Setup saved: {path}" + ("" if not no_ref else
                                       f". No reference board for {', '.join(no_ref)}: redo the setup after the "
-                                      "next Detect."))
+                                      "next Detect.") + ref_note)
         self._go(self.page_home)
