@@ -152,3 +152,21 @@ class ReferenceTest(unittest.TestCase):
         self.assertIn("board A", r.message)
         self.assertEqual(ctl.exposure, 8000.0)
         self.assertEqual(ctl.enums, {"ExposureAuto": "Off", "GainAuto": "Off"})
+
+
+class GainLimitTest(unittest.TestCase):
+    def test_too_bright_at_zero_gain_but_unclipped_counts_as_set(self):
+        # The rig's Firefly: board A at 219 with the gain already at 0 dB.
+        cam = FakeCam(2.0, scene_scale=219 / 120)
+        r = cam.run()
+        self.assertTrue(r.ok, r)
+        self.assertEqual(r.gain_db, 0.0)
+        self.assertAlmostEqual(r.white_level, 219, delta=4)
+        self.assertIn("its limit", r.message)
+
+    def test_band_edges(self):
+        self.assertTrue(au.acceptable_at_limit(219, 200))
+        self.assertFalse(au.acceptable_at_limit(240, 200))   # near clipping
+        self.assertFalse(au.acceptable_at_limit(130, 200))   # too dark
+        self.assertTrue(au.acceptable_at_limit(180, 150))    # reference target 150: up to 187
+        self.assertFalse(au.acceptable_at_limit(190, 150))

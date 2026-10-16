@@ -37,6 +37,11 @@ TOLERANCE = 8.0
 MAX_ITERATIONS = 6
 MAX_STEP_DB = 12.0
 SATURATED = 250.0
+# At a gain limit, a white level in this band still counts as set: well exposed, not clipped
+# (on the rig the Firefly's board A read 219 at 0 dB, its lowest gain).
+ACCEPT_LOW_FRACTION = 0.7      # of the target
+ACCEPT_HIGH_FRACTION = 1.25    # of the target, and never above ACCEPT_HIGH_MAX
+ACCEPT_HIGH_MAX = 235.0
 REFERENCE_FILE = "brightness_reference.json"
 # A reference board's stored level is only usable if it is neither clipped nor too dark.
 REFERENCE_MIN, REFERENCE_MAX = 60.0, 240.0
@@ -74,6 +79,11 @@ def measure_white(gray: np.ndarray, board: cal.BoardConfig, detector: cal.BoardD
     """The board's white-paper level in one grey frame, or None if the board isn't found."""
     det = (detector or cal.BoardDetector(board)).detect(gray)
     return board_white_level(gray, det)
+
+
+def acceptable_at_limit(white: float, target: float) -> bool:
+    """A gain limit stopped the loop: is the white level still well exposed and unclipped?"""
+    return ACCEPT_LOW_FRACTION * target <= white <= min(ACCEPT_HIGH_MAX, ACCEPT_HIGH_FRACTION * target)
 
 
 def gain_step_db(white: float, target: float = TARGET_WHITE) -> float:
@@ -118,6 +128,9 @@ def auto_gain(serial: str, board: cal.BoardConfig, grab_frame: Callable[[], np.n
                                    f"gain {gain:.1f} dB, {board_name} white {white:.0f}")
         new = max(lo, min(hi, gain + gain_step_db(white, target)))
         if abs(new - gain) < 0.05:
+            if acceptable_at_limit(white, target):
+                return AutoSetupResult(serial, True, gain, white, it,
+                                       f"gain {gain:.1f} dB (its limit), {board_name} white {white:.0f}")
             what = "add light" if white < target else "reduce the light"
             return AutoSetupResult(serial, False, gain, white, it,
                                    f"gain at its limit ({gain:.1f} dB) with {board_name} white {white:.0f}: {what}")
