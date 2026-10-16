@@ -170,3 +170,22 @@ class GainLimitTest(unittest.TestCase):
         self.assertFalse(au.acceptable_at_limit(130, 200))   # too dark
         self.assertTrue(au.acceptable_at_limit(180, 150))    # reference target 150: up to 187
         self.assertFalse(au.acceptable_at_limit(190, 150))
+
+
+class LaggingFramesTest(unittest.TestCase):
+    """The app's newest frame can lag the camera: frames show the gain set several grabs ago."""
+
+    def test_waits_for_frames_with_the_new_gain(self):
+        cam = FakeCam(2.5, scene_scale=210 / 120)      # the rig's Firefly: board at 210 at 0 dB
+        history = []
+
+        def lagging_frame(delay=10):
+            history.append(cam.gain)
+            seen = history[max(0, len(history) - 1 - delay)]
+            return np.clip(cam.scene * 10 ** (seen / 20), 0, 255).astype(np.uint8)
+
+        r = au.auto_gain("S", BOARD, lagging_frame, lambda: cam.gain, cam.set, cam.limits,
+                         sleep=lambda s: None)
+        self.assertTrue(r.ok, r)                        # not "reduce the light" on a stale clipped frame
+        self.assertEqual(r.gain_db, 0.0)
+        self.assertAlmostEqual(r.white_level, 210, delta=5)

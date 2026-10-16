@@ -48,6 +48,14 @@ REFERENCE_MIN, REFERENCE_MAX = 60.0, 240.0
 FRAMES_PER_MEASURE = 3
 FRAME_SPACING_S = 0.1
 SETTLE_S = 0.3   # after a gain change: let a few frames with the new gain arrive
+# The newest frame the app hands out can lag the camera by a second or more (the stream
+# buffer holds seconds of frames, and the setup page's detectors keep the CPU busy). After a
+# gain change, re-measure until the level moves to what the new gain predicts (or is no
+# longer clipped), at most WAIT_CHECKS x WAIT_STEP_S, before deciding anything: deciding on
+# a stale, clipped frame stopped the Firefly at 0 dB with "reduce the light" on the rig.
+WAIT_CHECKS = 15
+WAIT_STEP_S = 0.2
+WAIT_MATCH = 0.15   # within 15 % of the predicted level
 
 
 @dataclass(frozen=True)
@@ -94,6 +102,23 @@ def gain_step_db(white: float, target: float = TARGET_WHITE) -> float:
     return max(-MAX_STEP_DB, min(MAX_STEP_DB, step))
 
 
+def _wait_for_level(grab_frame, detector, before: float, predicted: float,
+                    sleep: Callable[[float], None]) -> None:
+    """Return once a frame shows the gain change took effect (see WAIT_CHECKS), or on timeout."""
+    for _ in range(WAIT_CHECKS):
+        frame = grab_frame()
+        if frame is not None:
+            gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            level = board_white_level(gray, detector.detect(gray))
+            if level is not None:
+                if before >= SATURATED and predicted < before:
+                    if level < SATURATED:        # was clipped: any unclipped reading is new
+                        return
+                elif abs(level - min(predicted, 255.0)) <= WAIT_MATCH * max(predicted, 1.0):
+                    return
+        sleep(WAIT_STEP_S)
+
+
 def auto_gain(serial: str, board: cal.BoardConfig, grab_frame: Callable[[], np.ndarray | None],
               get_gain: Callable[[], float | None], set_gain: Callable[[float], bool],
               gain_limits: tuple[float, float], target: float = TARGET_WHITE,
@@ -137,8 +162,10 @@ def auto_gain(serial: str, board: cal.BoardConfig, grab_frame: Callable[[], np.n
         if not set_gain(new):
             return AutoSetupResult(serial, False, gain, white, it, "camera refused the gain")
         actual = get_gain()
+        predicted = white * 10 ** (((new if actual is None else actual) - gain) / 20.0)
         gain = new if actual is None else actual
         sleep(SETTLE_S)
+        _wait_for_level(grab_frame, detector, white, predicted, sleep)
     return AutoSetupResult(serial, False, gain, white, MAX_ITERATIONS,
                            f"did not settle (gain {gain:.1f} dB, {board_name} white {white:.0f}); press again")
 
