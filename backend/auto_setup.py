@@ -257,8 +257,20 @@ def targets_from_reference(reference: dict) -> dict:
     return out
 
 
-def summary(results: list[tuple[str, AutoSetupResult]]) -> tuple[bool, str]:
-    """(all ok, one line per camera) for a status label."""
+GAIN_DRIFT_WARN_DB = 2.0
+
+
+def summary(results: list[tuple[str, AutoSetupResult]], reference: dict | None = None) -> tuple[bool, str]:
+    """(all ok, one line per camera) for a status label. With the stored `reference`
+    (load_reference), a gain more than GAIN_DRIFT_WARN_DB from the setup's gain is flagged:
+    usually a shadow on the reference board, or a changed light."""
     ok = all(r.ok for _, r in results)
-    text = " · ".join(f"{label}: {'OK, ' if r.ok else ''}{r.message}" for label, r in results)
-    return ok, text
+    parts = []
+    for label, r in results:
+        part = f"{label}: {'OK, ' if r.ok else ''}{r.message}"
+        ref_gain = ((reference or {}).get(r.serial) or {}).get("gain_db")
+        if r.ok and r.gain_db is not None and ref_gain is not None and abs(r.gain_db - ref_gain) > GAIN_DRIFT_WARN_DB:
+            part += (f" (CHECK: {abs(r.gain_db - ref_gain):.1f} dB {'above' if r.gain_db > ref_gain else 'below'} "
+                     "the setup's gain; is something shadowing the reference board, or did the light change?)")
+        parts.append(part)
+    return ok, " · ".join(parts)

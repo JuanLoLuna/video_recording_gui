@@ -189,3 +189,15 @@ class LaggingFramesTest(unittest.TestCase):
         self.assertTrue(r.ok, r)                        # not "reduce the light" on a stale clipped frame
         self.assertEqual(r.gain_db, 0.0)
         self.assertAlmostEqual(r.white_level, 210, delta=5)
+
+
+class SummaryTest(unittest.TestCase):
+    def test_flags_a_gain_far_from_the_setup(self):
+        r_ok = au.AutoSetupResult("A", True, 4.9, 98.0, 2, "gain 4.9 dB, reference G2 white 98")
+        r_near = au.AutoSetupResult("B", True, 3.5, 115.0, 2, "gain 3.5 dB, reference G1 white 115")
+        ok, text = au.summary([("Firefly", r_ok), ("Blackfly", r_near)],
+                              {"A": {"gain_db": 1.9}, "B": {"gain_db": 2.7}})
+        self.assertTrue(ok)
+        self.assertIn("CHECK: 3.0 dB above the setup's gain", text)
+        self.assertEqual(text.count("CHECK"), 1)          # 0.8 dB is within the 2 dB allowance
+        self.assertNotIn("CHECK", au.summary([("Firefly", r_ok)])[1])   # no reference: no check

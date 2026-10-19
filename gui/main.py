@@ -1171,7 +1171,9 @@ class MainWindow(QWidget):
         self._auto_setup_timer.stop()
         self._auto_setup_job = None
         try:
-            ok, text = auto_setup.summary(job.result())
+            setup = self._calibration_store.current_setup()
+            reference = auto_setup.load_reference(self._calibration_store.root, None if setup is None else setup.id)
+            ok, text = auto_setup.summary(job.result(), reference)
             if not ok:
                 text = "Auto setup incomplete. " + text
         except Exception as exc:  # a camera dropped out mid-way
