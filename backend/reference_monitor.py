@@ -80,7 +80,8 @@ def measure_references(targets, grab_frame: Callable[[str], np.ndarray | None],
     for t in targets:
         averaged = cal.average_detections(seen[t.serial])
         live = None if averaged is None else cal.solve_board_pose(averaged, detectors[t.serial].board, t.K, t.D)
-        out[t.serial] = None if live is None else cal.check_reference(t.R, t.t, t.rms_px, live, t.board)
+        out[t.serial] = None if live is None else cal.check_reference(
+            t.R, t.t, t.rms_px, live, t.board, live_det=averaged, K=t.K, D=t.D)
     return out
 
 

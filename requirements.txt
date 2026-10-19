@@ -6,6 +6,7 @@ opencv-python>=4.9
 pandas>=2.2
 sounddevice>=0.5
 soundfile>=0.12
+pyserial>=3.5   # Raspberry Pi camera trigger (backend/pi_trigger_client.py)
 nidaqmx>=1.0; platform_system == "Windows"
 
 # Manually install PySpin

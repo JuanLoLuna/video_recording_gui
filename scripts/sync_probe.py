@@ -9,6 +9,18 @@ instructions: docs/runbooks/2026-10-05-sync-probe-step1.md
     python scripts/sync_probe.py nodes                     # GPIO / trigger / timestamp nodes, ~10 s
     python scripts/sync_probe.py skew                      # 30 and 60 fps, 10 min each
     python scripts/sync_probe.py skew --fps 60 --seconds 60   # quick check
+    python scripts/sync_probe.py trigger                   # both cameras on the Raspberry Pi trigger
+
+TRIGGER (plan Part A, option H2): both cameras are put in hardware-trigger
+mode on the line wired to the Pi (default: Firefly Line2, Blackfly S Line3;
+override with --line SERIAL=LINE), armed, and then the Pi
+(pi_trigger/pi_trigger_server.py, found automatically over USB serial) sends
+the pulses. Reports, per camera: frames vs pulses sent (missed triggers),
+frames that arrived BEFORE the pulses started (stray triggers = wiring noise),
+and the frame-interval jitter from the camera's own clock; per pair: the gap
+between the two cameras' frames of the same pulse. The cameras are ALWAYS put
+back in free-running mode at the end, also when the run fails -- a camera left
+in trigger mode would make the recorder wait for pulses that never come.
 
 NODES (read-only except the Line/Trigger *selectors*, which are put back): per
 camera, every GPIO line with its allowed LineMode / LineSource / format, the
@@ -54,6 +66,7 @@ from pathlib import Path
 from multi_camera_probe import (
     GRAB_TIMEOUT_MS,
     _read_str,
+    _set_enum,
     configure,
     count_frame_gaps,
     percentile,
@@ -79,6 +92,12 @@ CAMERA_NODES = (
     "ExposureAuto", "ExposureTime", "ExposureMode", "TriggerMode", "DeviceLinkThroughputLimit",
 )
 LINE_NODES = ("LineMode", "LineSource", "LineFormat", "LineInverter", "LineStatus", "V3_3Enable")
+# Which camera input the Pi's pulse is wired to, by model (see the wiring runbook):
+# Firefly S JST pin 3 (white) = Line2; Blackfly S Hirose pin 1 (green) = Line3.
+DEFAULT_TRIGGER_LINES = {"Firefly": "Line2", "Blackfly": "Line3"}
+# Exposure is capped to this fraction of the trigger period: the Firefly has no
+# TriggerOverlap, so exposure + readout must end before the next pulse.
+TRIGGER_EXPOSURE_FRACTION = 0.5
 TRIGGER_NODES = ("TriggerMode", "TriggerSource", "TriggerActivation", "TriggerOverlap", "TriggerDelay")
 
 
@@ -214,6 +233,68 @@ def arrival_jitter_ms(host_arrivals: list[float], mapped: list[float],
         "note": f"relative to the fastest frame, after the first {start_burst_s:g} s; "
                 "spread = how noisy system_time is as a clock",
     }
+
+
+def interval_stats_us(ticks: list[int], tick_s: float, period_s: float) -> dict:
+    """Frame-to-frame intervals on the camera's own clock vs the trigger period."""
+    dt = [(b - a) * tick_s for a, b in zip(ticks, ticks[1:]) if b > a]
+    if not dt:
+        return {}
+    dev = [(d - period_s) * 1e6 for d in dt]
+    missed = sum(1 for d in dt if d > 1.5 * period_s)
+    return {
+        "mean_period_us": statistics.fmean(dt) * 1e6,
+        "std_us": statistics.pstdev(dt) * 1e6,
+        "max_abs_dev_us": max(abs(x) for x in dev if abs(x) < 0.5 * period_s * 1e6) if any(
+            abs(x) < 0.5 * period_s * 1e6 for x in dev) else None,
+        "intervals_over_1_5_periods": missed,
+    }
+
+
+def paired_gaps_us(mapped_a: list[float], mapped_b: list[float], period_s: float) -> dict:
+    """Same-pulse gap between two triggered cameras: B frame minus the nearest A frame, in us.
+
+    With a shared trigger the gap is a constant offset (the two models start
+    exposing at slightly different delays after the edge, and their chunk
+    timestamps may mark different moments) plus noise; free-running it is
+    anything up to half a period.
+    """
+    offsets = phase_offsets(mapped_a, mapped_b, period_s)
+    if not offsets:
+        return {}
+    gaps = [d * 1e6 for _, d in offsets]
+    mean = statistics.fmean(gaps)
+    spread = [abs(g - mean) for g in gaps]
+    return {
+        "pairs": len(gaps),
+        "mean_gap_us": mean,
+        "abs_gap_us_p50": percentile([abs(g) for g in gaps], 0.5),
+        "abs_gap_us_p99": percentile([abs(g) for g in gaps], 0.99),
+        "abs_gap_us_max": max(abs(g) for g in gaps),
+        "spread_us_p99": percentile(spread, 0.99),
+        "spread_us_max": max(spread),
+    }
+
+
+def trigger_report(result: dict, runs, fps: float, pulses_sent: int | None, before_start: dict) -> dict:
+    """Add the trigger-specific numbers to an analyse() result (mutates and returns it)."""
+    period = 1.0 / fps
+    mapped = {}
+    for run in runs:
+        cam = result["cameras"][run.serial]
+        fit = fit_clock(run.latches) if run.latches else None
+        tick_s = fit.slope if fit is not None else 1e-9
+        ticks = [t for _, _, t in run.frames if t is not None]
+        cam["frames_before_start"] = before_start.get(run.serial, 0)
+        cam["pulses_sent"] = pulses_sent
+        cam["missed_triggers"] = None if pulses_sent is None else pulses_sent - len(run.frames)
+        cam["intervals"] = interval_stats_us(ticks, tick_s, period)
+        mapped[run.serial] = ([fit.to_host(t) for t in ticks] if fit is not None
+                              else [h for h, _, _ in run.frames])
+    if len(runs) >= 2:
+        a, b = runs[0].serial, runs[1].serial
+        result["trigger_pair"] = {"a": a, "b": b, **paired_gaps_us(mapped[a], mapped[b], period)}
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -495,8 +576,8 @@ def analyse(runs: list[CamRun], fps: float) -> dict:
     return result
 
 
-def write_raw(out_dir: Path, runs: list[CamRun], fps: float, offsets) -> None:
-    tag = f"{fps:g}fps"
+def write_raw(out_dir: Path, runs: list[CamRun], fps: float, offsets, tag_prefix: str = "") -> None:
+    tag = f"{tag_prefix}{fps:g}fps"
     for run in runs:
         with open(out_dir / f"{tag}_{run.serial}_frames.csv", "w", newline="") as f:
             w = csv.writer(f)
@@ -580,6 +661,174 @@ def run_skew(PySpin, system, serials: list[str], fps: float, seconds: float, out
     return result
 
 
+def set_trigger(PySpin, cam, line: str, fps: float) -> dict:
+    """Hardware trigger on `line` (rising edge, FrameStart); exposure capped for the trigger period."""
+    nm = cam.GetNodeMap()
+    _set_enum(PySpin, nm, "TriggerMode", "Off")  # trigger settings are only writable with the mode off
+    enable = PySpin.CBooleanPtr(nm.GetNode("AcquisitionFrameRateEnable"))
+    if PySpin.IsWritable(enable):
+        enable.SetValue(False)  # the pulses set the rate now
+    _set_enum(PySpin, nm, "LineSelector", line)
+    _set_enum(PySpin, nm, "LineMode", "Input")  # Firefly lines are bidirectional; input-only lines ignore this
+    _set_enum(PySpin, nm, "TriggerSelector", "FrameStart")
+    if not _set_enum(PySpin, nm, "TriggerSource", line):
+        raise RuntimeError(f"TriggerSource {line} not accepted")
+    _set_enum(PySpin, nm, "TriggerActivation", "RisingEdge")
+    overlap = _set_enum(PySpin, nm, "TriggerOverlap", "ReadOut")  # Blackfly S only
+    exposure = PySpin.CFloatPtr(nm.GetNode("ExposureTime"))
+    cap_us = TRIGGER_EXPOSURE_FRACTION * 1e6 / fps
+    if PySpin.IsWritable(exposure) and float(exposure.GetValue()) > cap_us:
+        exposure.SetValue(max(float(exposure.GetMin()), cap_us))
+    if not _set_enum(PySpin, nm, "TriggerMode", "On"):
+        raise RuntimeError("TriggerMode On not accepted")
+    applied = {name: _read_str(PySpin, nm, name)
+               for name in ("TriggerMode", "TriggerSelector", "TriggerSource", "TriggerActivation", "TriggerOverlap")}
+    applied["exposure_us"] = float(exposure.GetValue()) if PySpin.IsReadable(exposure) else None
+    applied["overlap_set"] = overlap
+    if applied["TriggerMode"] != "On" or applied["TriggerSource"] != line:
+        raise RuntimeError(f"trigger not applied: {applied}")
+    return applied
+
+
+def clear_trigger(PySpin, cam) -> None:
+    """Back to free-running, as the recorder expects. Never raises."""
+    try:
+        nm = cam.GetNodeMap()
+        _set_enum(PySpin, nm, "TriggerMode", "Off")
+        enable = PySpin.CBooleanPtr(nm.GetNode("AcquisitionFrameRateEnable"))
+        if PySpin.IsWritable(enable):
+            enable.SetValue(True)
+    except Exception as exc:
+        print(f"    !! could not put a camera back to free-running: {exc} -- power-cycle it before recording")
+
+
+def trigger_line_for(model: str, overrides: dict, serial: str) -> str:
+    if serial in overrides:
+        return overrides[serial]
+    for key, line in DEFAULT_TRIGGER_LINES.items():
+        if key.lower() in model.lower():
+            return line
+    raise RuntimeError(f"no trigger line known for {model} #{serial}: pass --line {serial}=LineN")
+
+
+def run_trigger(PySpin, system, serials: list[str], fps: float, seconds: float, out_dir: Path,
+                pi, line_overrides: dict, pulse_ms: float) -> dict:
+    cam_list = system.GetCameras()
+    runs: list[CamRun] = []
+    stop = threading.Event()
+    threads: list[threading.Thread] = []
+    pulses_sent = None
+    before_start: dict = {}
+    applied_by_serial: dict = {}
+    pi.stop()  # no pulses while the cameras are being configured
+    try:
+        for serial in serials:
+            cam = cam_list.GetBySerial(serial)
+            cam.Init()
+            run = CamRun(serial=serial, cam=cam)
+            info = configure(PySpin, cam, fps)
+            run.model = info.model
+            line = trigger_line_for(info.model, line_overrides, serial)
+            applied = set_trigger(PySpin, cam, line, fps)
+            applied_by_serial[serial] = {"line": line, **applied}
+            run.applied_fps = fps  # the trigger sets the rate
+            run.latch_supported = latch_supported(PySpin, cam)
+            print(f"    {serial} {info.model}: trigger {applied['TriggerSource']} {applied['TriggerActivation']}, "
+                  f"overlap {applied['TriggerOverlap']}, exposure {fmt(applied['exposure_us'], '.0f')} us, "
+                  f"link={info.speed}")
+            runs.append(run)
+
+        for run in runs:
+            run.cam.BeginAcquisition()
+        for run in runs:
+            t = threading.Thread(target=grab_loop, args=(run, stop), daemon=True)
+            t.start()
+            threads.append(t)
+        for _ in range(3):
+            for run in runs:
+                if run.latch_supported:
+                    try:
+                        latch_once(PySpin, run)
+                    except Exception as exc:
+                        run.latch_errors += 1
+                        run.last_error = f"latch: {exc}"
+            time.sleep(0.05)
+        lt = threading.Thread(target=latch_loop, args=(PySpin, runs, stop, LATCH_INTERVAL_S), daemon=True)
+        lt.start()
+        threads.append(lt)
+
+        time.sleep(1.0)  # armed, no pulses: any frame now is a stray trigger
+        for run in runs:
+            before_start[run.serial] = len(run.frames)
+            if run.frames:
+                print(f"    !! {run.serial}: {len(run.frames)} frame(s) before the pulses started "
+                      "(stray triggers: check ground and wiring)")
+            run.frames.clear()
+
+        started = pi.start(fps, pulse_ms)
+        print(f"    Pi: {started.get('actual_hz', 0):.6f} Hz, pulse {pulse_ms:g} ms")
+        deadline = time.monotonic() + seconds
+        next_report = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+            if time.monotonic() >= next_report:
+                left = deadline - time.monotonic()
+                counts = ", ".join(f"{r.serial}: {len(r.frames)} frames" for r in runs)
+                print(f"    {left / 60:.1f} min left -- {counts}")
+                next_report += 30.0
+        stopped = pi.stop()
+        pulses_sent = stopped.get("pulses_sent")
+        time.sleep(0.5)  # the last frames in flight
+    finally:
+        try:
+            pi.stop()
+        except Exception as exc:
+            print(f"    !! could not stop the Pi: {exc}")
+        stop.set()
+        for t in threads:
+            t.join(timeout=5.0)
+        for run in runs:
+            try:
+                run.cam.EndAcquisition()
+            except Exception:
+                pass
+            clear_trigger(PySpin, run.cam)
+            try:
+                run.cam.DeInit()
+            except Exception:
+                pass
+            run.cam = None
+        cam_list.Clear()
+
+    result = analyse(runs, fps)
+    result["trigger_settings"] = applied_by_serial
+    trigger_report(result, runs, fps, pulses_sent, before_start)
+    write_raw(out_dir, runs, fps, result.pop("_offsets", None), tag_prefix="trigger_")
+    return result
+
+
+def print_trigger(result: dict) -> None:
+    print(f"\n--- triggered @ {result['fps_requested']:g} Hz ---")
+    for serial, cam in result["cameras"].items():
+        iv = cam.get("intervals") or {}
+        missed = cam.get("missed_triggers")
+        ok = (cam["frame_gaps"] == 0 and cam["incomplete"] == 0 and cam["errors"] == 0
+              and missed in (0, None) and cam.get("frames_before_start", 0) == 0)
+        print(f"  {cam['model']} #{serial}: {cam['frames']} frames for {cam.get('pulses_sent')} pulses "
+              f"(missed {fmt(missed, 'd') if missed is not None else '-'}), "
+              f"before start {cam.get('frames_before_start', 0)}, gaps {cam['frame_gaps']}, "
+              f"incomplete {cam['incomplete']}, errors {cam['errors']}  -> {'OK' if ok else 'PROBLEM'}")
+        if iv:
+            print(f"    frame interval (camera clock): mean {iv['mean_period_us']:.2f} us, std {iv['std_us']:.2f} us, "
+                  f"max deviation {fmt(iv['max_abs_dev_us'], '.2f')} us, intervals > 1.5 periods: "
+                  f"{iv['intervals_over_1_5_periods']}")
+    tp = result.get("trigger_pair") or {}
+    if tp.get("pairs"):
+        print(f"  Same-pulse gap (#{tp['b']} minus #{tp['a']}): mean {tp['mean_gap_us']:+.1f} us (constant offset), "
+              f"spread p99 {tp['spread_us_p99']:.1f} us, max {tp['spread_us_max']:.1f} us; "
+              f"|gap| p99 {tp['abs_gap_us_p99']:.1f} us over {tp['pairs']} pairs")
+
+
 def fmt(value, spec=".2f") -> str:
     return "-" if value is None else format(value, spec)
 
@@ -653,12 +902,18 @@ def discover(PySpin, system) -> list[str]:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="command", required=True)
-    for name in ("nodes", "skew"):
+    for name in ("nodes", "skew", "trigger"):
         p = sub.add_parser(name)
         p.add_argument("--serials", nargs="+", help="camera serials, camera A first (default: every camera found)")
         p.add_argument("--out-dir", default="probe_output")
-    sub.choices["skew"].add_argument("--fps", type=float, nargs="+", default=[30.0, 60.0])
-    sub.choices["skew"].add_argument("--seconds", type=float, default=600.0, help="per fps (default 600 = 10 min)")
+    for name in ("skew", "trigger"):
+        sub.choices[name].add_argument("--fps", type=float, nargs="+", default=[30.0, 60.0])
+        sub.choices[name].add_argument("--seconds", type=float, default=600.0, help="per fps (default 600 = 10 min)")
+    trig = sub.choices["trigger"]
+    trig.add_argument("--trigger-port", help="the Pi's trigger COM port (default: found automatically)")
+    trig.add_argument("--line", nargs="+", default=[], metavar="SERIAL=LINE",
+                      help="trigger input per camera (default: Firefly Line2, Blackfly Line3)")
+    trig.add_argument("--pulse-ms", type=float, default=1.0)
     args = ap.parse_args(argv)
 
     import PySpin
@@ -708,6 +963,8 @@ def _run(PySpin, args, out_dir: Path) -> int:
             for cam in summary["cameras"]:
                 print_nodes(cam)
             out = out_dir / "nodes.json"
+        elif args.command == "trigger":
+            return _run_trigger(PySpin, system, serials, args, out_dir, summary)
         else:
             if len(serials) < 2:
                 print(f"skew needs two cameras; have {serials}")
@@ -733,6 +990,49 @@ def _run(PySpin, args, out_dir: Path) -> int:
         return 0
     finally:
         system.ReleaseInstance()
+
+
+def _run_trigger(PySpin, system, serials, args, out_dir: Path, summary: dict) -> int:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from backend.pi_trigger_client import PiTrigger, find_port
+
+    try:
+        overrides = dict(item.split("=", 1) for item in args.line)
+    except ValueError:
+        print(f"--line expects SERIAL=LINE, got {args.line}")
+        return 2
+    try:
+        pi = PiTrigger.open(args.trigger_port) if args.trigger_port else find_port()
+    except Exception as exc:
+        print(f"Could not open {args.trigger_port}: {exc}")
+        return 2
+    if pi is None:
+        print("No Raspberry Pi trigger found on any USB serial port. Is the Pi plugged into this laptop and booted "
+              "(about 30 s)? Is pyserial installed (pip install pyserial)?")
+        return 2
+    try:
+        hello = pi.ping()
+        print(f"Pi trigger on {pi.port}: version {hello.get('version')}")
+        summary["pi"] = {"port": pi.port, "ping": hello}
+        summary["runs"] = []
+        for n, fps in enumerate(args.fps, 1):
+            print(f"\n[{n}/{len(args.fps)}] both cameras on the Pi trigger @ {fps:g} Hz for {args.seconds / 60:.1f} min")
+            try:
+                result = run_trigger(PySpin, system, serials[:2], fps, args.seconds, out_dir, pi, overrides,
+                                     args.pulse_ms)
+            except Exception as exc:
+                print(f"    run failed: {exc.__class__.__name__}: {exc}")
+                return 1
+            summary["runs"].append(result)
+            time.sleep(2.0)
+        for result in summary["runs"]:
+            print_trigger(result)
+    finally:
+        pi.close()
+    with open(out_dir / "summary.json", "w") as f:
+        json.dump(summary, f, indent=2, default=str)
+    print(f"\nWrote {out_dir}  -- bring this whole folder back.")
+    return 0
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ if HAVE_QT:
     import backend.spinnaker_system as spinnaker_system
     import test_calibration as synth
     from backend import calibration as cal
+    from backend.camera_defaults import DEFAULT_EXPOSURE_US
     from backend import calibration_store as cs
     from backend.camera_registry import CAMERA_SERIALS_ENV
     from backend.spinnaker_system import SharedSystemHolder
@@ -150,9 +151,11 @@ class SessionSetupTests(unittest.TestCase):
         cw.setup_button.click()
         self.assertIs(cw.stack.currentWidget(), cw.page_setup_check)
         self.assertIn("calibrated", cw.setup_cameras_label.text())
-        # The fields default to the rig's measured prints; the rendered boards are nominal size.
+        # Board A defaults to A-big; the fields default to the rig's measured prints
+        # (the rendered boards are nominal size).
+        self.assertEqual(cw.setup_board_a.currentText(), cal.A_BIG_PRESET)
         self.assertEqual((cw.setup_square_a.value(), cw.setup_square_b.value(), cw.setup_marker_g.value()),
-                         (35.86, 35.86, 69.89))
+                         (44.82, 35.86, 69.89))
         cw.setup_board_a.setCurrentText(self.A_NAME)
         cw.setup_square_a.setValue(cal.measured_size_mm(cal.BOARD_PRESETS[self.A_NAME]))
         cw.setup_square_b.setValue(36.0)
@@ -168,6 +171,14 @@ class SessionSetupTests(unittest.TestCase):
         self.assertTrue(pump_until(lambda: cw._setup_result is not None, timeout=10), cw.setup_text.text())
         self.assertTrue(cw._setup_result.passed, cw.setup_text.text())
         self.assertIn("PASS", cw.setup_verdict.text())
+        # The brightness step ran first (ticked by default) and reports on both cameras;
+        # exposure went to the default with auto exposure and auto gain off.
+        self.assertTrue(cw.setup_auto_brightness.isChecked())
+        self.assertIn("Brightness", cw.setup_text.text())
+        for slot in window._slots():
+            self.assertIn(slot.label, cw.setup_text.text())
+            self.assertAlmostEqual(slot.controller.get_exposure_time_limits()[2], DEFAULT_EXPOSURE_US)
+            self.assertEqual(slot.controller.get_enum_param("GainAuto")[0], "Off")
         self.assertAlmostEqual(cw._setup_result.baseline_mm, self.true_baseline_mm,
                                delta=self.true_baseline_mm * 0.02)
         self.assertTrue(all(cw._setup_refs[s] is not None for s in (FIREFLY[0], BLACKFLY[0])))
@@ -184,6 +195,13 @@ class SessionSetupTests(unittest.TestCase):
         cw.setup_save_button.click()
         self.assertIs(cw.stack.currentWidget(), cw.page_home)
         self.assertIn("Setup saved", cw.saved_label.text())
+        # Saving also stores (or says why not) each camera's reference-board brightness, tied to this setup.
+        self.assertIn("rightness reference", cw.saved_label.text())
+        from backend import auto_setup
+        saved_id = window._calibration_store.current_setup().id
+        ref_file = auto_setup.reference_path(window._calibration_store.root)
+        if ref_file.exists():
+            self.assertEqual(json.loads(ref_file.read_text())["setup_id"], saved_id)
         log = window._calibration_store.root / "diagnostics" / "setup_log.jsonl"
         entries = [json.loads(line) for line in log.read_text().splitlines()]
         self.assertEqual([e["phase"] for e in entries][-2:], ["setup", "verify"])

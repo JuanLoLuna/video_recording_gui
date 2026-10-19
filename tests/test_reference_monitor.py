@@ -95,11 +95,15 @@ class MeasureTest(unittest.TestCase):
         still = rm.measure_references(self.targets, lambda s: self.frame, sleep=sleeps.append)
         self.assertEqual(len(sleeps), rm.FRAMES_PER_CHECK - 1)
         self.assertFalse(still["A"].moved)
+        # Decided from the image shift of the live corners, not the pose difference.
+        self.assertIsNotNone(still["A"].move.image_shift_px)
+        self.assertLess(still["A"].move.image_shift_px, still["A"].move.image_shift_limit_px)
 
         turn, _ = cv2.Rodrigues(np.radians([1.5, 0, 0]))
         moved_frame = synth.render_scene([(B1, turn @ self.R, turn @ self.t)])
         moved = rm.measure_references(self.targets, lambda s: moved_frame, sleep=lambda s: None)
         self.assertTrue(moved["A"].moved)
+        self.assertGreater(moved["A"].move.image_shift_px, moved["A"].move.image_shift_limit_px)
 
         blank = np.full((540, 720), 90, np.uint8)
         self.assertIsNone(rm.measure_references(self.targets, lambda s: blank, sleep=lambda s: None)["A"])

@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSlider,
     QDoubleSpinBox,
+    QLineEdit,
     QFrame,
     QMessageBox,
     QFileDialog,
@@ -85,6 +86,9 @@ from backend.power_keepalive import (
 )
 
 from backend.compression_policy import describe_policy, suggested_compression
+from backend import auto_setup
+from backend import calibration as cal_core
+from backend.camera_defaults import DEFAULT_EXPOSURE_US
 from backend.calibration_store import (
     CalibrationStore,
     assess_camera,
@@ -317,6 +321,31 @@ class MainWindow(QWidget):
         self.tuning_camera_row.setVisible(False)
         setup_inner.addWidget(self.tuning_camera_row)
 
+        # One-button auto setup (backend/auto_setup.py): exposure to the default, gain
+        # from board A's white paper, on every camera. Board A must rest at its spot.
+        auto_row = QWidget()
+        auto_layout = QHBoxLayout(auto_row)
+        auto_layout.setContentsMargins(0, 0, 0, 0)
+        self.auto_setup_button = QPushButton("Auto setup cameras")
+        self.auto_setup_button.setToolTip(
+            f"Exposure {DEFAULT_EXPOSURE_US / 1000:g} ms, auto exposure and auto gain off, then each camera's "
+            "gain is set so its reference board reads as bright as right after the last setup calibration "
+            "(nothing to place). A camera without a stored reference uses board A instead: put board A at "
+            "its spot first.")
+        self.auto_setup_button.setEnabled(False)
+        self.auto_setup_button.clicked.connect(self._on_auto_setup_clicked)
+        auto_layout.addWidget(self.auto_setup_button)
+        self.auto_setup_label = QLabel("")
+        self.auto_setup_label.setWordWrap(True)
+        self.auto_setup_label.setStyleSheet("color: #555; font-size: 11px;")
+        auto_layout.addWidget(self.auto_setup_label, stretch=1)
+        setup_inner.addWidget(auto_row)
+        self._auto_setup_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="auto-setup")
+        self._auto_setup_job: Future | None = None
+        self._auto_setup_timer = QTimer(self)
+        self._auto_setup_timer.setInterval(200)
+        self._auto_setup_timer.timeout.connect(self._poll_auto_setup)
+
         setup_inner.addWidget(self.camera_tuning_toggle)
 
         self.camera_tuning_panel = QWidget()
@@ -363,11 +392,16 @@ class MainWindow(QWidget):
             sl = QSlider(Qt.Orientation.Horizontal)
             sl.setRange(0, self._image_slider_resolution)
             sl.setEnabled(False)
-            val_lbl = QLabel("—")
+            # Editable: drag the slider, or type an exact value and press
+            # Enter (the slider's 1000 steps can't hit e.g. 8000 µs exactly).
+            val_lbl = QLineEdit("—")
             val_lbl.setMinimumWidth(64)
+            val_lbl.setMaximumWidth(90)
+            val_lbl.setEnabled(False)
             val_lbl.setAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
             )
+            val_lbl.setToolTip("Type a value and press Enter")
             row.addWidget(sl, stretch=1)
             row.addWidget(val_lbl)
 
@@ -402,6 +436,9 @@ class MainWindow(QWidget):
             }
             sl.valueChanged.connect(
                 lambda v, n=nodename: self._on_image_slider_changed(n, v)
+            )
+            val_lbl.editingFinished.connect(
+                lambda n=nodename: self._on_image_value_typed(n)
             )
 
         hint_row = 1 + (len(slider_params) + 1) // 2
@@ -1098,6 +1135,54 @@ class MainWindow(QWidget):
             % ("#c62828" if self._rec_blink_on else "#7a1414")
         )
 
+    def _auto_setup_board(self) -> cal_core.BoardConfig:
+        """Board A as the current setup recorded it (measured size), else A-big at its measured size."""
+        setup = self._calibration_store.current_setup()
+        if setup is not None and setup.board:
+            try:
+                return cal_core.BoardConfig.from_dict(setup.board)
+            except (KeyError, TypeError, ValueError):
+                pass
+        return cal_core.with_measured_square(cal_core.BOARD_PRESETS[cal_core.A_BIG_PRESET],
+                                             cal_core.default_measured_mm(cal_core.A_BIG_PRESET))
+
+    def _on_auto_setup_clicked(self) -> None:
+        if self.state != AppState.PREVIEWING or self._auto_setup_job is not None:
+            return
+        board = self._auto_setup_board()
+        cameras = [(slot.label, slot.serial, slot.controller) for slot in self._slots()]
+        if not cameras:
+            return
+        setup = self._calibration_store.current_setup()
+        targets = auto_setup.targets_from_reference(
+            auto_setup.load_reference(self._calibration_store.root, None if setup is None else setup.id))
+        uses = "the reference boards" if len(targets) == len(cameras) else (
+            "board A" if not targets else "the reference boards (board A where none is stored)")
+        self.auto_setup_label.setText(f"Setting the cameras from {uses}…")
+        self._auto_setup_job = self._auto_setup_pool.submit(
+            auto_setup.auto_setup_cameras, cameras, board, DEFAULT_EXPOSURE_US, targets=targets)
+        self._update_camera_tuning_widgets_enabled()
+        self._auto_setup_timer.start()
+
+    def _poll_auto_setup(self) -> None:
+        job = self._auto_setup_job
+        if job is None or not job.done():
+            return
+        self._auto_setup_timer.stop()
+        self._auto_setup_job = None
+        try:
+            setup = self._calibration_store.current_setup()
+            reference = auto_setup.load_reference(self._calibration_store.root, None if setup is None else setup.id)
+            ok, text = auto_setup.summary(job.result(), reference)
+            if not ok:
+                text = "Auto setup incomplete. " + text
+        except Exception as exc:  # a camera dropped out mid-way
+            text = f"Auto setup failed: {exc}"
+        self.auto_setup_label.setText(text)
+        self._sync_auto_mode_combos_from_camera()
+        self._sync_image_sliders_from_camera()
+        self._update_camera_tuning_widgets_enabled()
+
     def _on_camera_tuning_toggle(self) -> None:
         self._camera_tuning_expanded = not self._camera_tuning_expanded
         self.camera_tuning_panel.setVisible(self._camera_tuning_expanded)
@@ -1128,8 +1213,45 @@ class MainWindow(QWidget):
         if mx <= mn or steps <= 0:
             return
         value = mn + (slider_value / steps) * (mx - mn)
-        meta["label"].setText(f"{value:.4g}")
+        meta["label"].setText(self._format_image_value(node, value))
         self.camera.set_image_param(node, value)
+
+    @staticmethod
+    def _format_image_value(node: str, value: float) -> str:
+        # Exposure in whole µs, so a typed 8000 reads back as "8000".
+        return f"{value:.0f}" if node == "ExposureTime" else f"{value:.4g}"
+
+    def _read_image_param(self, node: str) -> float | None:
+        if node == "ExposureTime":
+            limits = self.camera.get_exposure_time_limits()
+        else:
+            limits = self.camera.get_image_param_limits(node)
+        return None if limits is None else float(limits[2])
+
+    def _on_image_value_typed(self, node: str) -> None:
+        """Apply a value typed in the box next to a slider, then show what the
+        camera actually holds (it clamps to its range and may round to its
+        increment) and move the slider to match."""
+        meta = self._slider_meta.get(node)
+        if meta is None or not meta["slider"].isEnabled():
+            return
+        box, sl = meta["label"], meta["slider"]
+        mn, mx = float(meta["min"]), float(meta["max"])
+        try:
+            value = float(box.text().strip().replace(",", "."))
+        except ValueError:
+            value = None
+        if value is not None and mx > mn:
+            self.camera.set_image_param(node, min(mx, max(mn, value)))
+        actual = self._read_image_param(node)
+        if actual is None:
+            return
+        box.setText(self._format_image_value(node, actual))
+        if mx > mn:
+            t = (actual - mn) / (mx - mn)
+            sl.blockSignals(True)
+            sl.setValue(int(round(min(1.0, max(0.0, t)) * float(meta["steps"]))))
+            sl.blockSignals(False)
 
     # Sliders whose value the camera will silently override while the
     # paired Auto mode isn't "Off" -- see _on_auto_mode_changed.
@@ -1161,6 +1283,7 @@ class MainWindow(QWidget):
                 meta["supported"] = False
                 sl.blockSignals(True)
                 sl.setEnabled(False)
+                lbl.setEnabled(False)
                 lbl.setText("N/A")
                 sl.blockSignals(False)
                 if caption is not None:
@@ -1174,16 +1297,18 @@ class MainWindow(QWidget):
             sl.setRange(0, steps)
             if mx <= mn:
                 sl.setEnabled(False)
-                lbl.setText(f"{cur:.4g}")
+                lbl.setEnabled(False)
+                lbl.setText(self._format_image_value(node, cur))
             else:
                 acquiring = self.state in (
                     AppState.PREVIEWING,
                     AppState.RECORDING,
                 )
                 sl.setEnabled(self._slider_can_tune(node, acquiring))
+                lbl.setEnabled(sl.isEnabled())
                 t = (cur - mn) / (mx - mn)
                 sl.setValue(int(round(min(1.0, max(0.0, t)) * steps)))
-                lbl.setText(f"{cur:.4g}")
+                lbl.setText(self._format_image_value(node, cur))
             if caption is not None:
                 fps = self.camera.get_acquisition_frame_rate()
                 caption.setText(
@@ -1382,6 +1507,9 @@ class MainWindow(QWidget):
             self.compression_checkbox.setEnabled(self.state == AppState.PREVIEWING)
 
     def _update_camera_tuning_widgets_enabled(self) -> None:
+        if hasattr(self, "auto_setup_button"):
+            self.auto_setup_button.setEnabled(
+                self.state == AppState.PREVIEWING and self._auto_setup_job is None)
         if not self._slider_meta:
             return
         acquiring = self.state in (AppState.PREVIEWING, AppState.RECORDING)
@@ -1396,8 +1524,10 @@ class MainWindow(QWidget):
             sl = meta["slider"]
             if not meta.get("supported"):
                 sl.setEnabled(False)
+                meta["label"].setEnabled(False)
                 continue
             sl.setEnabled(self._slider_can_tune(node, acquiring))
+            meta["label"].setEnabled(sl.isEnabled())
 
     def _stop_mic_preview(self) -> None:
         if self._mic_preview is not None:
@@ -2487,6 +2617,7 @@ class MainWindow(QWidget):
             print("Error closing the calibration window:", e)
         self.reference_timer.stop()
         self._reference_pool.shutdown(wait=False, cancel_futures=True)
+        self._auto_setup_pool.shutdown(wait=False, cancel_futures=True)
         try:
             release_keep_awake()
         except Exception as e:

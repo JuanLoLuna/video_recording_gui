@@ -19,7 +19,7 @@ that script's layout.
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Sequence
 
 import cv2
@@ -52,9 +52,19 @@ VERIFY_MIN_DEPTH_CHANGE_M = 0.15
 # "suspect" (lens probably touched).
 SUSPECT_REPROJECTION_RMS_PX = 1.0
 # Fixed-board drift check: the camera moved if its pose relative to the board
-# changed by more than either of these since the setup was captured.
+# changed by more than either of these since the setup was captured. Used only
+# when no live corners are available (compare_poses on its own): on the rig's
+# small, distant reference boards (~90-110 px wide) the board's tilt alone is
+# estimated to ~0.7-0.9 deg, so 0.5 deg fired on a still camera most of the time.
 SETUP_MOVED_TRANSLATION_MM = 5.0
 SETUP_MOVED_ROTATION_DEG = 0.5
+# What the live check uses instead: how far (mean, px) the reference board's live
+# corners sit from where the SAVED pose puts them -- the image error a stale
+# setup would add. In px of a 720-wide image, scaled to the camera's width.
+# 1.5 px catches a ~0.1 deg turn or a ~5 mm sideways shift at 2.5-4 m; corner
+# noise on a still camera gives ~0.1-0.3 px. A move along the line of sight
+# barely shifts the image, and barely matters for triangulation either.
+SETUP_MOVED_IMAGE_SHIFT_PX = 1.5
 
 MIN_MARKERS = 4
 MIN_CORNERS = 6
@@ -816,10 +826,27 @@ def verify_setup(det_a: Detection, pose_a: BoardPose, K_a, D_a,
 class MoveCheck:
     translation_mm: float
     rotation_deg: float
+    # Set by check_reference when it has the live corners: then it alone decides.
+    image_shift_px: float | None = None
+    image_shift_limit_px: float | None = None
 
     @property
     def moved(self) -> bool:
+        if self.image_shift_px is not None and self.image_shift_limit_px is not None:
+            return self.image_shift_px > self.image_shift_limit_px
         return self.translation_mm > SETUP_MOVED_TRANSLATION_MM or self.rotation_deg > SETUP_MOVED_ROTATION_DEG
+
+
+def image_shift_px(saved_R, saved_t, det: "Detection", board, K: np.ndarray, D: np.ndarray) -> float:
+    """Mean distance (px) between a detection's corners and where the saved pose projects them."""
+    rvec, _ = cv2.Rodrigues(np.asarray(saved_R, dtype=np.float64))
+    proj, _ = cv2.projectPoints(det.object_points(board).astype(np.float64), rvec,
+                                np.asarray(saved_t, dtype=np.float64).reshape(3), K, D)
+    return float(np.mean(np.linalg.norm(proj.reshape(-1, 2) - det.corners.reshape(-1, 2), axis=1)))
+
+
+def image_shift_limit_px(image_width: int) -> float:
+    return SETUP_MOVED_IMAGE_SHIFT_PX * float(image_width) / 720.0
 
 
 def compare_poses(saved: BoardPose, live: BoardPose, board_centre_m: Sequence[float]) -> MoveCheck:
@@ -855,7 +882,9 @@ class ReferenceCheck:
         return self.move.moved
 
 
-def check_reference(saved_R, saved_t, saved_rms_px: float, live: BoardPose, cfg: BoardConfig) -> ReferenceCheck:
+def check_reference(saved_R, saved_t, saved_rms_px: float, live: BoardPose, cfg: BoardConfig,
+                    live_det: "Detection | None" = None, K: np.ndarray | None = None,
+                    D: np.ndarray | None = None) -> ReferenceCheck:
     """Compare a camera's live pose to its reference board with the pose saved at setup.
 
     `live` should come from several averaged frames (average_detections): one
@@ -866,8 +895,12 @@ def check_reference(saved_R, saved_t, saved_rms_px: float, live: BoardPose, cfg:
     saved = BoardPose(R=np.asarray(saved_R, dtype=float), t=np.asarray(saved_t, dtype=float).reshape(3),
                       rms_px=float(saved_rms_px), n_corners=0)
     limit = max(SUSPECT_REPROJECTION_RMS_PX, 2.0 * float(saved_rms_px))
-    return ReferenceCheck(move=compare_poses(saved, live, cfg.centre_m), rms_px=live.rms_px,
-                          suspect=live.rms_px > limit)
+    move = compare_poses(saved, live, cfg.centre_m)
+    if live_det is not None and K is not None and D is not None:
+        # "Moved" = the image error the saved setup would now make (see SETUP_MOVED_IMAGE_SHIFT_PX).
+        move = replace(move, image_shift_px=image_shift_px(saved.R, saved.t, live_det, make_board(cfg), K, D),
+                       image_shift_limit_px=image_shift_limit_px(live_det.image_size[0]))
+    return ReferenceCheck(move=move, rms_px=live.rms_px, suspect=live.rms_px > limit)
 
 
 def diagnose_frame(frame: np.ndarray, boards: dict) -> dict:
