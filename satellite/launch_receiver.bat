@@ -15,4 +15,10 @@ if not defined THALAMUS_PYTHON set THALAMUS_PYTHON=C:\thalamus_venv\Scripts\pyth
 set HERE=%~dp0
 set CERTS=%HERE%certs
 echo Using %THALAMUS_PYTHON%
+if not exist "%THALAMUS_PYTHON%" (
+  echo ERROR: %THALAMUS_PYTHON% not found. Open the Anaconda prompt, run "conda activate thalamus", then run this file from there.
+  pause
+  exit /b 1
+)
 "%THALAMUS_PYTHON%" -m thalamus.pipeline -C -c "%HERE%configs\receiver.json" -p 50070 -u 50071 -d 50072 --ca "%CERTS%\ca.pem" --cert "%CERTS%\thalamus.internal.pem" --key "%CERTS%\thalamus.internal-key.pem"
+if errorlevel 1 pause
