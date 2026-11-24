@@ -14,11 +14,15 @@ if not defined THALAMUS_PYTHON if defined CONDA_PREFIX if exist "%CONDA_PREFIX%\
 if not defined THALAMUS_PYTHON set THALAMUS_PYTHON=C:\thalamus_venv\Scripts\python.exe
 set HERE=%~dp0
 set CERTS=%HERE%certs
+REM Local changes go in configs\receiver.local.json (git ignores it); used instead of receiver.json if present.
+set CONFIG=%HERE%configs\receiver.json
+if exist "%HERE%configs\receiver.local.json" set CONFIG=%HERE%configs\receiver.local.json
+echo Config %CONFIG%
 echo Using %THALAMUS_PYTHON%
 if not exist "%THALAMUS_PYTHON%" (
   echo ERROR: %THALAMUS_PYTHON% not found. Open the Anaconda prompt, run "conda activate thalamus", then run this file from there.
   pause
   exit /b 1
 )
-"%THALAMUS_PYTHON%" -m thalamus.pipeline -C -c "%HERE%configs\receiver.json" -p 50070 -u 50071 -d 50072 --ca "%CERTS%\ca.pem" --cert "%CERTS%\thalamus.internal.pem" --key "%CERTS%\thalamus.internal-key.pem"
+"%THALAMUS_PYTHON%" -m thalamus.pipeline -C -c "%CONFIG%" -p 50070 -u 50071 -d 50072 --ca "%CERTS%\ca.pem" --cert "%CERTS%\thalamus.internal.pem" --key "%CERTS%\thalamus.internal-key.pem"
 if errorlevel 1 pause

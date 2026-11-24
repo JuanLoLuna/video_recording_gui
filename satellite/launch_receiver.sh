@@ -8,5 +8,6 @@ set -euo pipefail
 THALAMUS_VENV="${THALAMUS_VENV:-$HOME/thalamus_venv}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CERTS="${THALAMUS_CERTS:-$HERE/certs}"
-exec "$THALAMUS_VENV/bin/python" -m thalamus.pipeline -C -c "$HERE/configs/receiver.json" -p 50070 -u 50071 -d 50072 \
+CONFIG="$HERE/configs/receiver.json"; [[ -f "$HERE/configs/receiver.local.json" ]] && CONFIG="$HERE/configs/receiver.local.json"
+exec "$THALAMUS_VENV/bin/python" -m thalamus.pipeline -C -c "$CONFIG" -p 50070 -u 50071 -d 50072 \
   --ca "$CERTS/ca.pem" --cert "$CERTS/thalamus.internal.pem" --key "$CERTS/thalamus.internal-key.pem"

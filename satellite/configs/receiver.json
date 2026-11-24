@@ -23,7 +23,7 @@
     {
       "name": "storage",
       "type": "STORAGE2",
-      "Output File": "C:/thalamus_recordings/EDIT_ME_session",
+      "Output File": "C:/thalamus_recordings/sat_test",
       "Compress Analog": false,
       "Compress Video": false,
       "Simple Copy": false,
