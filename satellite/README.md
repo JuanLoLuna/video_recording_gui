@@ -45,6 +45,11 @@ certificates from `satellite/certs/` (copy the three .pem files from the satelli
 folder). The receiver needs `pip install thalamus-contrib` as well. Use the same Thalamus and contrib versions on both
 computers (1.0.53 / 0.0.12 is the known-working pair).
 
+Viewing on the receiver: Thalamus 1.0.53's image viewer cannot show H264 frames (ticking View on `sat_cam1`
+crashes the preview with `UnboundLocalError: ... 'format'` in image_viewer.py; the stream itself keeps flowing and
+STORAGE2 still records). For a picture, run `sat_cam1_preview`, a second REMOTE node that pulls the uncompressed
+`thorcam1` (about 20 MB/s at 1280x1024, 15 frames per second, 8-bit), and tick View on it.
+
 The webcam (FFMPEG) instructions below remain for other cameras (`configs/satellite.json`, `configs/satellite_linux.json`;
 start with `THALAMUS_CONFIG=... launch_satellite.sh`). On the satellite, the firewall rule is for port 50050, not 50060.
 
