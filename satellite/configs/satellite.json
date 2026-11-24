@@ -1,0 +1,16 @@
+{
+  "nodes": [
+    {
+      "name": "cam1",
+      "type": "FFMPEG",
+      "Input Format": "dshow",
+      "Input Name": "video=EDIT_ME_CAMERA_NAME",
+      "Options": {
+        "framerate": "30",
+        "video_size": "1280x720"
+      },
+      "Running": false,
+      "View": false
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "nodes": [
+    {
+      "name": "cam1",
+      "type": "FFMPEG",
+      "Input Format": "v4l2",
+      "Input Name": "/dev/video0",
+      "Options": {
+        "framerate": "30",
+        "video_size": "1280x720"
+      },
+      "Running": false,
+      "View": false
+    }
+  ]
+}

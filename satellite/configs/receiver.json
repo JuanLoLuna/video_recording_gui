@@ -1,0 +1,32 @@
+{
+  "nodes": [
+    {
+      "name": "sat_cam1",
+      "type": "REMOTE",
+      "Address": "192.168.50.10:50060",
+      "Node": "cam1",
+      "Probe Frequency": 10.0,
+      "Probe Size": 128,
+      "Running": false,
+      "View": false
+    },
+    {
+      "name": "storage",
+      "type": "STORAGE2",
+      "Output File": "C:/thalamus_recordings/EDIT_ME_session",
+      "Compress Analog": false,
+      "Compress Video": false,
+      "Simple Copy": false,
+      "Sources": [
+        {
+          "Node": "sat_cam1",
+          "Time Series": true,
+          "Image": true,
+          "Motion": false,
+          "Text": false
+        }
+      ],
+      "Running": false
+    }
+  ]
+}
