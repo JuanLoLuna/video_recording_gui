@@ -13,12 +13,39 @@ read from upstream commit a0b4c991 (source copy at /home/airflow/proc/Thalamus).
 
 | Computer | Address | Config | Thalamus ports (gRPC / user interface / dotnet) |
 |---|---|---|---|
-| Satellite (camera) | 192.168.50.10 | `configs/satellite.json` | 50060 / 50061 / 50062, opened to the network (`--open`) |
+| Satellite (camera, Linux, nsu-pesar-20) | 192.168.50.10 | `configs/satellite_thorcam.json` | 50050 / 50051 / 50052, opened to the network (`--open`), TLS |
 | Receiving laptop | 192.168.50.20 | `configs/receiver.json` | 50070 / 50071 / 50072, local only |
 
 The receiving laptop already runs the Sleeve laptop clock service on port 50050,
 so its Thalamus must not use the default 50050-50052; that is why it uses 50070-50072.
 (gRPC = the network protocol Thalamus uses between computers.)
+
+## Current satellite: Thorlabs camera, Jarl's route (verified 2026-11-24)
+
+The satellite (nsu-pesar-20, Ubuntu 24.04, user bijanadmin) has a Thorlabs DCC1240M camera, sold by IDS as
+UI-124xSE-M. It is not a webcam (no /dev/video*) and has no GenTL driver, so the FFMPEG and GENICAM nodes cannot
+open it. Jarl set it up on 2026-10-09 with:
+
+- IDS uEye driver 4.96.1 (packages `ueye-*`, services `ueyeusbdrc`, `ueyeethdrc`).
+- Python environment `~/venv-thalamus`: thalamus-neuro 1.0.53 + **thalamus-contrib 0.0.12** (pip). Contrib adds the
+  **THORCAM** node (reads the camera through the uEye driver) and **MEDIA_CONVERTER** (H264 encoder), loaded with `-C`.
+- TLS: `~/certs/` holds `ca.pem`, `thalamus.internal.pem`, `thalamus.internal-key.pem` (server name `thalamus.internal`,
+  client certificates required). The receiver must use certificates from the same authority.
+
+`launch_satellite.sh` now starts exactly that: Jarl's environment, `-C`, `--open`, the certificates and
+`configs/satellite_thorcam.json` (copy of Jarl's `~/sink.json`; nodes renamed `thorcam1` and `thorcam1_h264`,
+1280x1024, 15 frames per second, exposure 66.6 ms, H264 quality 5, quantization 23). `DRY_RUN=1` prints the command.
+After the window opens, tick **Running** on `thorcam1` (Thalamus starts every node switched off).
+Verified 2026-11-24 with Jarl's own command: live image in the node's view window. Not yet verified: the renamed
+config, and the H264 node producing output (it showed no output bytes while no receiver was connected).
+
+Receiver: `configs/receiver.json` pulls `thorcam1_h264` from `192.168.50.10:50050`. `launch_receiver.*` add `-C` and the
+certificates from `satellite/certs/` (copy the three .pem files from the satellite's `~/certs`; git ignores that
+folder). The receiver needs `pip install thalamus-contrib` as well. Use the same Thalamus and contrib versions on both
+computers (1.0.53 / 0.0.12 is the known-working pair).
+
+The webcam (FFMPEG) instructions below remain for other cameras (`configs/satellite.json`, `configs/satellite_linux.json`;
+start with `THALAMUS_CONFIG=... launch_satellite.sh`). On the satellite, the firewall rule is for port 50050, not 50060.
 
 ## Where each config key came from
 

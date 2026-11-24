@@ -1,0 +1,38 @@
+{
+  "nodes": [
+    {
+      "name": "thorcam1",
+      "type": "THORCAM",
+      "Running": false,
+      "View": true,
+      "Desired": {
+        "AcquisitionFrameRate": 14.997947649269046,
+        "ExposureTime": 66620.91228070176,
+        "Gain": 0.0,
+        "Height": 1024,
+        "HeightMax": 1024,
+        "OffsetX": 0,
+        "OffsetY": 0,
+        "Width": 1280,
+        "WidthMax": 1280
+      },
+      "Camera": "UI124xSE-M:4103305000"
+    },
+    {
+      "name": "thorcam1_h264",
+      "type": "MEDIA_CONVERTER",
+      "Source": "thorcam1",
+      "Video Format": "H264",
+      "Video Quality": 5,
+      "Quantization": 23,
+      "Video Width": 0,
+      "Video Height": 0,
+      "Complete Frames": false,
+      "Audio Format": "Passthrough",
+      "Audio Bit Rate": 0,
+      "Audio Sample Rate": 0,
+      "Audio Index": -1,
+      "View": false
+    }
+  ]
+}

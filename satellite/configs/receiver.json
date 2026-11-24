@@ -3,8 +3,8 @@
     {
       "name": "sat_cam1",
       "type": "REMOTE",
-      "Address": "192.168.50.10:50060",
-      "Node": "cam1",
+      "Address": "192.168.50.10:50050",
+      "Node": "thorcam1_h264",
       "Probe Frequency": 10.0,
       "Probe Size": 128,
       "Running": false,
