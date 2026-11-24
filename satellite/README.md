@@ -36,8 +36,9 @@ open it. Jarl set it up on 2026-10-09 with:
 `configs/satellite_thorcam.json` (copy of Jarl's `~/sink.json`; nodes renamed `thorcam1` and `thorcam1_h264`,
 1280x1024, 15 frames per second, exposure 66.6 ms, H264 quality 5, quantization 23). `DRY_RUN=1` prints the command.
 After the window opens, tick **Running** on `thorcam1` (Thalamus starts every node switched off).
-Verified 2026-11-24 with Jarl's own command: live image in the node's view window. Not yet verified: the renamed
-config, and the H264 node producing output (it showed no output bytes while no receiver was connected).
+Verified 2026-11-24 with Jarl's own command: live image in the node's view window. Verified 2026-11-24 16:00 with
+this launcher and the renamed config: live image on `thorcam1`. Not yet verified: the H264 node producing output
+(it showed no output bytes while no receiver was connected), and any receiver connecting.
 
 Receiver: `configs/receiver.json` pulls `thorcam1_h264` from `192.168.50.10:50050`. `launch_receiver.*` add `-C` and the
 certificates from `satellite/certs/` (copy the three .pem files from the satellite's `~/certs`; git ignores that
