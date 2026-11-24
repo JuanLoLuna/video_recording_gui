@@ -154,6 +154,29 @@ median interval (count and first 20), estimated dropped frames, and drift and ji
 `time - remote_time`. The two clocks (receiving laptop and satellite) are unrelated, so that difference is
 not a true latency; only its drift and scatter are meaningful. Tests: `python -m unittest tests.test_satellite_stream_check`.
 
+## Storing the incoming video: receiver_service.py
+
+Run inside the laptop's `thalamus` conda env while `launch_receiver.bat` is running and `sat_cam1` is Running:
+
+    python satellite\receiver_service.py start  --output-dir D:\recordings --serial 4103305000
+    python satellite\receiver_service.py stop   --output-dir D:\recordings
+    python satellite\receiver_service.py status --output-dir D:\recordings
+
+Options: `--address localhost:50070`, `--certs satellite\certs`, `--expected-fps 15`, `--bytes-per-hour 7.2e9`.
+`start` checks free disk (backend/disk_guard; refuses when critical, `--force` overrides), points `storage` at
+`D\.incomplete\sat<serial>\recording_YYYYMMDD_HHMMSS_sat<serial>` and sets `Running`. `stop` sets `Running`
+false, waits for the file to stop growing, runs the stream check, converts the H264 to mp4 without re-encoding (`satellite/h264_to_mp4.py`, in a child process; needs `pip install av` in the Thalamus env), and
+only then moves finished files into `D`: `<stem>-0000.mp4`, `<stem>.thalamus`, `<stem>.thalamus.json`,
+`<stem>_stream_check.txt/.json`, and last `<stem>_satellite_manifest.json`. If the mp4 step fails the raw
+recording is kept and the error is in the manifest. Each command writes `D\receiver_service_last.json`.
+Tests (fake Thalamus): `python -m unittest tests.test_receiver_service`.
+
+UNVERIFIED (never run against a real Thalamus): the `ThalamusControl` connection (ThalamusThread over TLS, setting
+properties by `setitem` and waiting for the acknowledgement); that setting `Output File` then `Running` makes STORAGE2
+open the new file; the name of the `.json` sidecar STORAGE2 writes (both `<file>.json` and `<stem>.json` are tried);
+which keys a REMOTE
+node exposes for Connected status; clean exit of the process (it ends with `os._exit`).
+
 ## Open items (UNVERIFIED unless stated)
 
 - UNVERIFIED: which Thalamus version Jarl's computer runs. Both ends should use the same version; the

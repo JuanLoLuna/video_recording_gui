@@ -105,6 +105,43 @@ def iter_image_records(path):
                    first(img, 8), first(img, 9)), stats
 
 
+def iter_image_payloads(path):
+    """Yield (frame, stats) for every image record, where frame is a dict with
+    node, time (Image.time if set, else the record time; ticks), width, height,
+    format (number) and data (the image planes, as a list of bytes). Used by
+    satellite/h264_to_mp4.py. Same reader and stop conditions as
+    iter_image_records."""
+    stats = {"records": 0, "other_records": 0, "truncated": False}
+    with open(path, "rb") as f:
+        while True:
+            head = f.read(8)
+            if len(head) < 8:
+                break
+            size, = struct.unpack(">Q", head)
+            if size > MAX_RECORD:
+                stats["truncated"] = True
+                break
+            data = f.read(size)
+            if len(data) < size:
+                stats["truncated"] = True
+                break
+            stats["records"] += 1
+            try:
+                rec = parse_message(data)
+                if 6 not in rec:
+                    stats["other_records"] += 1
+                    continue
+                img = parse_message(rec[6][0])
+            except (ValueError, IndexError):
+                stats["truncated"] = True
+                break
+            first = lambda d, k: d[k][0] if k in d else 0
+            yield {"node": bytes(rec[5][0]).decode("utf-8", "replace") if 5 in rec else "",
+                   "time": first(img, 8) or first(rec, 4),
+                   "width": first(img, 2), "height": first(img, 3), "format": first(img, 4),
+                   "data": [bytes(p) for p in img.get(1, [])]}, stats
+
+
 # ------------------------------------------------------------- statistics core
 def _pct(sorted_vals, q):
     if not sorted_vals:
