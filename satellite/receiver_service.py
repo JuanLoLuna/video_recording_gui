@@ -685,7 +685,9 @@ class ReceiverService:
             tmin = min(delays) / 1e6
             sync["transfer_delay_min_ms"] = tmin
             tol = fit["uncertainty_ms"] if fit["uncertainty_ms"] is not None else 1.0
-            if tmin < -tol:
+            # Not synced: the fallback line is fitted to the fastest arrivals, so a negative minimum
+            # delay is expected by construction; only check it with a real clock mapping.
+            if tmin < -tol and sync["synced"]:
                 fit["warnings"].append("transfer_delay_min_ms %.2f is negative beyond the uncertainty "
                                        "(%.2f ms): mapping may be wrong" % (tmin, tol))
             elif tmin > 200 and sync["synced"]:

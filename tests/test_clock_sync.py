@@ -250,6 +250,35 @@ class ServerExeTests(unittest.TestCase):
             self.assertIn("SERVER-EXE", text)
 
 
+class HttpTailTests(unittest.TestCase):
+    def serve(self, d):
+        srv = cl.start_http(d, "127.0.0.1", 0)
+        self.addCleanup(srv.shutdown)
+        return "http://127.0.0.1:%d/" % srv.server_address[1]
+
+    def test_tail_keeps_header_and_last_rows_across_days(self):
+        import urllib.request
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "20260101").mkdir()
+            (Path(d) / "20260101" / "x_analog.csv").write_text("seq,v\n0,a\n1,b\n2,c\n")
+            (Path(d) / "20260102").mkdir()
+            (Path(d) / "20260102" / "x_analog.csv").write_text("seq,v\n3,d\n4,e\n")
+            base = self.serve(d)
+            get = lambda q: urllib.request.urlopen(base + "x_analog.csv" + q, timeout=5).read().decode()  # noqa: E731
+            self.assertEqual(get("?tail=3"), "seq,v\n2,c\n3,d\n4,e\n")
+            self.assertEqual(get("?tail=1"), "seq,v\n4,e\n")
+            self.assertEqual(get("?tail=99999999"), get(""))          # capped, here larger than the file
+            self.assertEqual(get(""), "seq,v\n0,a\n1,b\n2,c\n3,d\n4,e\n")   # no parameter: everything
+            self.assertEqual(get("?tail=abc"), get(""))              # invalid: ignored
+
+    def test_tail_cap(self):
+        self.assertEqual(cl.parse_tail("tail=999999999"), cl.MAX_TAIL)
+        self.assertEqual(cl.parse_tail("tail=0"), 1)
+        self.assertIsNone(cl.parse_tail(""))
+        body = b"h\n" + b"".join(b"%d\n" % i for i in range(30000))
+        self.assertEqual(len(cl.tail_of(body, cl.MAX_TAIL).splitlines()), cl.MAX_TAIL + 1)
+
+
 @unittest.skipUnless(HAVE_GRPC, "grpc / thalamus-neuro not installed")
 class ServerTests(unittest.TestCase):
     def test_ping_and_analog_end_to_end(self):

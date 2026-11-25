@@ -366,6 +366,23 @@ class SyncStopTests(unittest.TestCase):
         self.assertLess(m["sync"]["transfer_delay_min_ms"], -400)
         self.assertTrue(any("negative beyond" in w for w in m["sync"]["warnings"]), m["sync"])
 
+    def test_negative_delay_check_skipped_when_not_synced(self):
+        # fallback line is fitted to the fastest arrivals, so a negative minimum delay is no evidence
+        orig = rs.fallback_fit
+
+        def shifted_fit(frames):
+            fit = orig(frames)
+            fit["offset_at_x0_ns"] += 2_000_000  # mapped time 2 ms late -> delays about -2 ms
+            return fit
+        rs.fallback_fit = shifted_fit
+        try:
+            res, m = self.run_stop(clock_log_url="u", fetch_clock=lambda *a: ("l", self.analog[:1], []))
+        finally:
+            rs.fallback_fit = orig
+        self.assertFalse(m["sync"]["synced"])
+        self.assertLess(m["sync"]["transfer_delay_min_ms"], -1.5)
+        self.assertFalse(any("negative beyond" in w for w in res["warnings"] + m["sync"]["warnings"]), m["sync"])
+
     def test_large_transfer_delay_warns(self):
         def shifted(d):
             return [dict(r, server_steady_ns=int(r["server_steady_ns"]) + d) for r in self.analog]

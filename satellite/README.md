@@ -208,6 +208,26 @@ line: includes the smallest transfer delay, no wall time).
 Offline: `python3 satellite/clock_logger.py analyze DIR` writes `report.txt/json` comparing CURRENT, CURRENT-STEADY, NEW and SERVER-EXE.
 A recording that spans midnight still works (the server joins the last 3 day folders).
 
+## Satellite window (phase 1)
+
+One small window instead of typing the receiver_service commands. It does NOT launch the receiver Thalamus or the clock
+service yet: start those as before (`clock_server.py` or server.exe, then `launch_receiver.bat` with `sat_cam1` Running), then in the
+`thalamus66` env:
+
+    python satellite\satellite_window.py
+
+The status line has a coloured dot: **green** = synced (clock fit with its uncertainty and the clock-log label), receiver connected,
+and while recording the file is growing; **orange** = starting/stopping, or the clock log's newest sample is over 10 s old, or the
+recording file has not grown for 3 s; **red** = not synced, clock log unreachable, or receiver not reachable (details in grey under it).
+One button starts or stops a recording (stop takes seconds: it converts the video and syncs the clock); a line below shows the result
+(frames, `synced +-x ms` or `NOT synced: reason`, output folder). The grey box is where the preview comes in phase 2. Closing the
+window while recording asks "Stop recording?".
+
+Settings live in `satellite/configs/window.local.json` (git-ignored, created with defaults on first run, opened by the "Settings..."
+button, applied after a restart); every key is described at the top of `satellite_window.py`. Logic without Qt is in
+`satellite/window_logic.py`; tests: `python -m unittest tests.test_window_logic`. Headless check:
+`QT_QPA_PLATFORM=offscreen python satellite/satellite_window.py --screenshot out.png --quit-after 5`.
+
 ## Open items (UNVERIFIED unless stated)
 
 - UNVERIFIED: which Thalamus version Jarl's computer runs. Both ends should use the same version; the

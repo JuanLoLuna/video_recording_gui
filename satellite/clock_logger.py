@@ -681,6 +681,26 @@ SERVE_NAME_RE = re.compile(r"^(?:[A-Za-z0-9_-]+_(?:analog|ping)\.csv|events\.log
 DAY_RE = re.compile(r"^\d{8}$")
 
 
+MAX_TAIL = 20000
+
+
+def tail_of(body, n):
+    """Header line (CSV) plus the last n data lines of `body` (bytes)."""
+    lines = body.splitlines(keepends=True)
+    return b"".join(lines[:1] + lines[1:][-n:]) if n > 0 else lines[0] if lines else b""
+
+
+def parse_tail(query):
+    """N from a 'tail=N' query string, capped at MAX_TAIL; None when absent or invalid."""
+    for part in query.split("&"):
+        if part.startswith("tail="):
+            try:
+                return max(1, min(int(part[5:]), MAX_TAIL))
+            except ValueError:
+                return None
+    return None
+
+
 def served_files(base, name, max_days=3):
     """Bytes of `name` for the HTTP server: base/name and the same file in the last max_days day
     folders (YYYYMMDD) of base, oldest first; the header line of a CSV is kept only once."""
@@ -703,13 +723,17 @@ def served_files(base, name, max_days=3):
 def make_handler(base):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            name = self.path.split("?", 1)[0].lstrip("/")
+            name, _, query = self.path.partition("?")
+            name = name.lstrip("/")
+            tail = parse_tail(query)
             if name == "":
                 names = sorted({p.name for d in [Path(base)] + [q for q in Path(base).glob("[0-9]" * 8) if q.is_dir()]
                                 for p in d.iterdir() if SERVE_NAME_RE.match(p.name)}) if Path(base).is_dir() else []
                 body = ("\n".join(names) + "\n").encode()
             elif SERVE_NAME_RE.match(name):
                 body = served_files(base, name)
+                if body is not None and tail is not None and name.endswith(".csv"):
+                    body = tail_of(body, tail)
             else:
                 body = None
             if body is None:
