@@ -225,6 +225,7 @@ this window started are stopped; anything it found running is left alone. Set `s
 turn the auto-start off.
 The receiver Thalamus runs with no window of its own (Qt offscreen platform); its messages go to `satellite/logs/receiver.log`.
 Set `show_thalamus_window` to true to see its window again for troubleshooting.
+The **Preview: on/off** button stops the preview stream completely (no cost) and is remembered (`preview_enabled`).
 
 The status line has a coloured dot: **green** = synced (clock fit with its uncertainty and the clock-log label), receiver connected,
 camera on, and while recording the file is growing; **orange** = a setup step running, starting/stopping, camera off, the clock log's

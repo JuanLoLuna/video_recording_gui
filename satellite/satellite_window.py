@@ -31,6 +31,7 @@ the "Settings..." button opens it in the OS editor; changes apply after restarti
                      off screen (Qt offscreen platform), messages only in satellite/logs/receiver.log  false
   start_clock_server start satellite/clock_server.py when nothing answers on clock_server_port  true
   receiver_config_template  receiver Thalamus config to copy (relative to satellite/)            "configs/receiver.json"
+  preview_enabled    picture on/off (the "Preview" button changes it; off = image stream not subscribed)   true
   preview_max_fps    keyframes decoded per second for the picture (0 = no preview); the picture comes
                      from the H264 node sat_cam1 over the receiver connection, 640 px wide, grey   1
   clock_server_port  laptop port of the clock service (Sleeve server.exe uses 50050)            50050
@@ -97,7 +98,9 @@ class Controller:
         self.service_states: dict = {}
         self.make_services()
         fps = float(settings.get("preview_max_fps", 1) or 0)
-        self.preview = pv.PreviewWorker(self.control, rs.CAMERA_NODE, fps) if fps > 0 else None
+        self.settings_path = wl.SETTINGS_PATH
+        self.preview = pv.PreviewWorker(self.control, rs.CAMERA_NODE, fps,
+                                        enabled=bool(settings.get("preview_enabled", True))) if fps > 0 else None
         self.last_receiver_poll = -1e9
         self.last_clock_poll = -1e9
         self.receiver_error = None
@@ -111,6 +114,16 @@ class Controller:
         self.result_line = None      # (level, text) of the last start/stop
         self.close_after_stop = False
         self.settings_warning = None
+
+    def set_preview(self, on: bool):
+        """Preview button: off unsubscribes the image stream completely; the choice is remembered."""
+        if not self.preview:
+            return
+        self.preview.set_enabled(on)
+        self.settings["preview_enabled"] = bool(on)
+        warn = wl.update_setting("preview_enabled", bool(on), self.settings_path)
+        if warn:
+            self.settings_warning = warn
 
     def start(self):
         if self.preview:
@@ -306,7 +319,8 @@ class Controller:
         states = dict(self.service_states)
         service_errors = [st["text"] for st in states.values() if st["state"] == "error"]
         snap = self.preview.snapshot() if self.preview else None
-        stream = pl.stream_status(self.camera_on, snap["fps"], snap["frame_age_s"]) if snap else None
+        stream = (pl.stream_status(self.camera_on, snap["fps"], snap["frame_age_s"])
+                  if snap and snap["enabled"] else None)
         level, text = wl.decide_status({
             "busy": self.busy, "receiver_connected": self.connected, "recording": recording,
             "elapsed_s": (now - self.rec_t0) if self.rec_t0 is not None else 0,
@@ -368,10 +382,14 @@ def build_window(ctrl: Controller, settings_path: Path):
             self.button = QPushButton()
             self.button.setMinimumHeight(40)
             self.button.clicked.connect(ctrl.toggle)
+            self.preview_btn = QPushButton()
+            self.preview_btn.setEnabled(ctrl.preview is not None)
+            self.preview_btn.clicked.connect(self.toggle_preview)
             self.settings_btn = QPushButton("Settings…")
             self.settings_btn.clicked.connect(self.open_settings)
             row = QHBoxLayout()
             row.addWidget(self.button, 1)
+            row.addWidget(self.preview_btn)
             row.addWidget(self.settings_btn)
             self.path_label = QLabel("Settings file: %s" % settings_path)
             self.path_label.setStyleSheet("color: #777; font-size: 11px;")
@@ -403,8 +421,20 @@ def build_window(ctrl: Controller, settings_path: Path):
             self.show_preview(v.get("preview"))
             self.maybe_close()
 
+        def toggle_preview(self):
+            if ctrl.preview:
+                ctrl.set_preview(not ctrl.preview.enabled)
+                self.shown_seq = -1
+                self.refresh()
+
         def show_preview(self, snap):
-            if snap is None:
+            on = bool(snap and snap["enabled"])
+            self.preview_btn.setText("Preview: on" if on else "Preview: off")
+            if snap is None or not on:
+                self.caption.setText("")
+                self.shown_seq = -1
+                self.preview.setPixmap(QPixmap())
+                self.preview.setText("preview off")
                 return
             age = snap["picture_age_s"]
             self.caption.setText(pl.picture_caption(age, snap["error"]))
@@ -478,6 +508,7 @@ def main(argv=None) -> int:
     from thalamus.qt import QApplication, QTimer
     app = QApplication(sys.argv[:1])
     ctrl = Controller(settings)
+    ctrl.settings_path = settings_path
     ctrl.settings_warning = warning
     ctrl.start()
     win = build_window(ctrl, settings_path)

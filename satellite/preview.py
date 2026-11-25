@@ -46,14 +46,17 @@ class PreviewWorker:
     def __init__(self, control, node: str, max_fps: float = 1.0, width: int = 640, *,
                  clock: Callable[[], float] = time.monotonic,
                  decode: Callable = decode_keyframe,
-                 make_request: Optional[Callable] = None):
+                 make_request: Optional[Callable] = None, enabled: bool = True):
         self.control, self.node, self.width = control, node, width
         self.clock, self.decode = clock, decode
         self.make_request = make_request or self._default_request
         self.limiter = pl.RateLimiter(max_fps)
         self.meter = pl.FpsMeter()
         self.lock = threading.Lock()
-        self.error: Optional[str] = "not subscribed yet"
+        self.error: Optional[str] = None       # why the stream failed (stream error, wrong format, decode)
+        self.conn_error: Optional[str] = "receiver not connected"   # only while there is no connection
+        self.enabled = enabled
+        self._sub_t: Optional[float] = None    # when the current subscription was made
         self.picture = None            # (w, h, stride, bytes)
         self.picture_t: Optional[float] = None
         self.picture_seq = 0
@@ -73,9 +76,26 @@ class PreviewWorker:
 
     def stop(self) -> None:
         self.stop_flag.set()
-        fut = self._fut
+        self._unsubscribe()
+
+    def _unsubscribe(self) -> None:
+        fut, self._fut = self._fut, None
         if fut is not None:
             fut.cancel()
+        self._sub_t = None
+
+    def set_enabled(self, on: bool) -> None:
+        """Off = cancel the image subscription (no receive, no decode) and forget the picture;
+        on = the supervisor subscribes again within a second."""
+        with self.lock:
+            self.enabled = bool(on)
+            if not on:
+                self.picture, self.picture_t, self.error = None, None, None
+                self.meter = pl.FpsMeter()
+        if not on:
+            self._unsubscribe()
+        else:
+            self._last_try = -1e9
 
     # -- supervisor: (re)subscribe, rate limited
     def _supervise(self) -> None:
@@ -86,11 +106,16 @@ class PreviewWorker:
                 self._set_error("preview supervisor: %s" % exc)
 
     def supervise_once(self, now: float) -> None:
+        if not self.enabled:
+            return
         c = self.control
         thread = getattr(c, "_thread", None)
         if not getattr(c, "connected", False) or thread is None or getattr(thread, "loop", None) is None:
-            self._set_error("receiver not connected")
+            with self.lock:
+                self.conn_error = "receiver not connected"
             return
+        with self.lock:
+            self.conn_error = None   # connected now: this text must never outlive the connection
         alive = self._fut is not None and not self._fut.done() and self._sub_thread is thread
         if alive:
             return
@@ -100,6 +125,9 @@ class PreviewWorker:
             return
         self._last_try = now
         self._sub_thread = thread
+        with self.lock:
+            self._sub_t = now
+            self.error = None        # a new subscription starts without the old stream's error
         self._fut = asyncio.run_coroutine_threadsafe(self._consume(thread), thread.loop)
 
     def _default_request(self):
@@ -121,6 +149,9 @@ class PreviewWorker:
     # -- per frame (runs on the Thalamus loop: keep it cheap)
     def on_image(self, fmt: int, data: bytes, now: float) -> None:
         with self.lock:
+            if not self.enabled:
+                return
+            self.conn_error = None   # frames are flowing, so there is a connection
             self.meter.add(now)
             if fmt != pl.H264_FORMAT:
                 self.error = "node %r delivers image format %s, not H264" % (self.node, fmt)
@@ -154,10 +185,27 @@ class PreviewWorker:
         with self.lock:
             self.error = msg
 
+    def reason(self, now: float) -> Optional[str]:
+        """Why there is no (fresh) picture, from the real state; call with the lock held."""
+        if not self.enabled:
+            return "preview off"
+        if self.conn_error:
+            return self.conn_error
+        if self.error:
+            return self.error
+        age = self.meter.age_s(now)
+        if age is not None and age <= pl.NO_FRAMES_S:
+            return None
+        if self._sub_t is None:
+            return "subscribing to %s" % self.node
+        if now - self._sub_t > pl.NO_FRAMES_S:
+            return "no frames from %s (satellite not reachable?)" % self.node
+        return "waiting for frames from %s" % self.node
+
     def snapshot(self, now: Optional[float] = None) -> dict:
         now = self.clock() if now is None else now
         with self.lock:
-            return {"fps": self.meter.fps(now), "frame_age_s": self.meter.age_s(now),
+            return {"enabled": self.enabled, "fps": self.meter.fps(now), "frame_age_s": self.meter.age_s(now),
                     "picture": self.picture, "picture_seq": self.picture_seq,
                     "picture_age_s": None if self.picture_t is None else now - self.picture_t,
-                    "error": self.error}
+                    "error": self.reason(now)}

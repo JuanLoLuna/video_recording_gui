@@ -156,6 +156,100 @@ class WorkerLogicTests(unittest.TestCase):
         self.assertEqual(w.snapshot(100.0)["error"], "receiver not connected")
 
 
+class SilentStub:
+    """image() subscribes fine but never delivers a frame (cable unplugged)."""
+    def __init__(self):
+        self.calls = 0
+
+    def image(self, request):
+        self.calls += 1
+
+        async def never():
+            await asyncio.sleep(3600)
+            yield None
+        return never()
+
+
+class ReasonTests(unittest.TestCase):
+    def setUp(self):
+        import preview
+        self.loop = asyncio.new_event_loop()
+        threading.Thread(target=self.loop.run_forever, daemon=True).start()
+        self.addCleanup(lambda: self.loop.call_soon_threadsafe(self.loop.stop))
+        self.t = [1000.0]
+        self.th = type("Th", (), {})()
+        self.th.loop, self.th.stub = self.loop, SilentStub()
+        self.control = FakeControl()                  # starts NOT connected, like the window at startup
+        self.w = preview.PreviewWorker(self.control, "sat_cam1", 1.0, clock=lambda: self.t[0],
+                                       make_request=lambda: None)
+        self.addCleanup(lambda: (self.w.stop(), time.sleep(0.2)))   # let the cancelled task finish first
+
+    def connect(self):
+        self.control._thread, self.control.connected = self.th, True
+
+    def test_reason_follows_real_state_not_a_stale_one(self):
+        self.w.supervise_once(self.t[0])
+        self.assertEqual(self.w.snapshot()["error"], "receiver not connected")
+        self.connect()                                # receiver connects afterwards (the laptop case)
+        self.t[0] += 1
+        self.w.supervise_once(self.t[0])
+        time.sleep(0.2)
+        self.assertEqual(self.th.stub.calls, 1)
+        reason = self.w.snapshot()["error"]
+        self.assertNotIn("not connected", reason)     # this was the wrong text on the laptop
+        self.assertEqual(reason, "waiting for frames from sat_cam1")
+        self.t[0] += 6                                # nothing arrives for more than 5 s
+        self.assertEqual(self.w.snapshot()["error"], "no frames from sat_cam1 (satellite not reachable?)")
+        self.assertEqual(pl.picture_caption(None, self.w.snapshot()["error"]),
+                         "no picture (no frames from sat_cam1 (satellite not reachable?))")
+        self.w.on_image(12, P, self.t[0])             # a frame arrives: reason disappears
+        self.assertIsNone(self.w.snapshot()["error"])
+
+    def test_disconnect_after_connect_is_reported_again(self):
+        self.connect()
+        self.w.supervise_once(self.t[0])
+        self.control.connected = False
+        self.t[0] += 1
+        self.w.supervise_once(self.t[0])
+        self.assertEqual(self.w.snapshot()["error"], "receiver not connected")
+
+    def test_off_unsubscribes_and_on_resubscribes(self):
+        self.connect()
+        self.w.supervise_once(self.t[0])
+        time.sleep(0.2)
+        fut = self.w._fut
+        self.w.set_enabled(False)
+        time.sleep(0.2)
+        self.assertTrue(fut.cancelled() or fut.done())
+        self.assertIsNone(self.w._fut)
+        snap = self.w.snapshot()
+        self.assertEqual((snap["enabled"], snap["error"], snap["picture"]), (False, "preview off", None))
+        self.w.on_image(12, SPS + PPS + IDR, self.t[0])    # frames of a stale callback are ignored
+        self.assertTrue(self.w.q.empty())
+        self.t[0] += 1
+        self.w.supervise_once(self.t[0])                   # disabled: no new subscription
+        self.assertEqual(self.th.stub.calls, 1)
+        self.w.set_enabled(True)
+        self.t[0] += 1
+        self.w.supervise_once(self.t[0])
+        time.sleep(0.2)
+        self.assertEqual(self.th.stub.calls, 2)
+        self.assertTrue(self.w.snapshot()["enabled"])
+
+    def test_choice_is_saved_without_touching_other_keys(self):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "w.json"
+            p.write_text(json.dumps({"serial": "7", "my_note": 1}))
+            self.assertIsNone(wl.update_setting("preview_enabled", False, p))
+            self.assertEqual(json.loads(p.read_text()), {"serial": "7", "my_note": 1, "preview_enabled": False})
+            self.assertIs(wl.load_settings(p)[0]["preview_enabled"], False)
+            self.assertIs(wl.DEFAULTS["preview_enabled"], True)
+            p.write_text("{broken")
+            self.assertIn("could not save", wl.update_setting("preview_enabled", True, p))
+            self.assertEqual(p.read_text(), "{broken")
+
+
 @unittest.skipUnless(HAVE_AV and shutil.which("ffmpeg"), "PyAV or ffmpeg not available")
 class DecodeTests(unittest.TestCase):
     @classmethod

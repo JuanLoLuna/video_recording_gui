@@ -36,6 +36,7 @@ DEFAULTS = {
     "receiver_config_template": "configs/receiver.json",
     "clock_server_port": 50050,
     "preview_max_fps": 1,
+    "preview_enabled": True,
 }
 PREFERRED_LABEL = "router"
 CLOCK_TAIL_S = 120          # seconds of clock-log rows kept for the fit
@@ -73,6 +74,21 @@ def save_settings(settings: dict, path: Path | str = SETTINGS_PATH) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, path)
+
+
+def update_setting(key: str, value, path: Path | str = SETTINGS_PATH) -> Optional[str]:
+    """Change one key in the settings file, keeping everything else the user wrote (the file is re-read, not
+    rebuilt from memory). Returns a warning text when it could not be saved."""
+    path = Path(path)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else dict(DEFAULTS)
+        if not isinstance(data, dict):
+            raise ValueError("top level is not an object")
+        data[key] = value
+        save_settings(data, path)
+    except (OSError, ValueError) as exc:
+        return "could not save %s to %s: %s" % (key, path, exc)
+    return None
 
 
 def clock_log_url(settings: dict) -> str:
