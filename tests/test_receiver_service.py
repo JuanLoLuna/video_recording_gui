@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "satellite"))
 sys.path.insert(0, str(ROOT / "tests"))
 import receiver_service as rs  # noqa: E402
 from test_satellite_stream_check import _record  # noqa: E402
+from test_clock_sync import synth_clock_log  # noqa: E402
 
 Usage = namedtuple("Usage", "total used free")
 T0 = datetime(2026, 11, 24, 10, 30, 12)
@@ -256,6 +257,145 @@ class StopTests(unittest.TestCase):
         rc = rs.main(["--serial", "4103305000", "--verify-start-s", "0", "start", "--output-dir", str(self.out)], control=self.c)
         self.assertEqual(rc, 0)
         self.assertTrue((self.out / "receiver_service_last.json").is_file())
+
+
+
+class SyncStopTests(unittest.TestCase):
+    """stop with a clock log: the fetch is replaced by a function returning synthetic rows."""
+    N = 30
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.out = Path(self.tmp.name) / "rec"
+        self.addCleanup(self.tmp.cleanup)
+        self.c = FakeControl()
+        self.staging = self.out / ".incomplete" / "sat4103305000"
+        self.stem = "recording_20261124_103012_sat4103305000"
+        self.raw = self.staging / (self.stem + ".20261124.1")
+        self.analog, self.ping, self.base, self.off = synth_clock_log(trailer=False)
+
+    def frames(self):
+        """Satellite steady c, laptop arrival = true laptop steady + 3 ms + a little delay."""
+        out = []
+        for i in range(self.N):
+            c = self.base + 100_000_000_000 + i * 66_666_667
+            out.append(_record("sat_cam1", int(c + self.off(c) + 3_000_000 + (i % 5) * 400_000), int(c),
+                               w=1280, h=1024, fmt=12))
+        return b"".join(out)
+
+    def run_stop(self, **kw):
+        svc = make_service(self.c, **kw)
+        self.assertTrue(svc.start(self.out, started_at=T0)["ok"])
+        self.raw.write_bytes(self.frames())
+        (self.staging / (self.stem + ".20261124.1.json")).write_text("{}")
+        res = svc.stop(self.out, stable_s=0.5, poll_s=0.1)
+        self.assertTrue(res["ok"], res)
+        m = json.loads((self.out / (self.stem + "_satellite_manifest.json")).read_text())
+        return res, m
+
+    def read_sync(self):
+        import csv
+        with open(self.out / (self.stem + "_satellite_sync.csv"), newline="") as f:
+            return list(csv.DictReader(f))
+
+    def test_synced_csv_and_manifest(self):
+        calls = []
+
+        def fetch(url, label, timeout):
+            calls.append((url, label))
+            return "laptop", self.analog, self.ping
+        res, m = self.run_stop(clock_log_url="http://x:50061/", fetch_clock=fetch)
+        self.assertEqual(calls, [("http://x:50061/", None)])
+        rows = self.read_sync()
+        self.assertEqual(len(rows), self.N)
+        self.assertEqual(list(rows[0]), rs.SYNC_COLS)
+        sy = m["sync"]
+        self.assertTrue(sy["synced"], sy)
+        self.assertEqual(sy["method"], "analog+half-rtt")
+        self.assertEqual(sy["csv"], self.stem + "_satellite_sync.csv")
+        self.assertAlmostEqual(sy["drift_ppm"], 12.0, delta=1.0)
+        self.assertEqual(sy["clock_label"], "laptop")
+        for k in ("offset_at_start_ns", "uncertainty_ms", "samples", "span_s", "clock_instance_ids",
+                  "transfer_delay_min_ms"):
+            self.assertIn(k, sy)
+        self.assertAlmostEqual(sy["offset_at_start_ns"], self.off(self.base + 100e9), delta=1e6)
+        # arrival minus mapped time is about the 3 ms built into the frames
+        self.assertAlmostEqual(sy["transfer_delay_min_ms"], 3.0, delta=1.0)
+        self.assertEqual(sy["warnings"], [])
+        r = rows[0]
+        c0 = self.base + 100_000_000_000
+        self.assertEqual(int(r["satellite_steady_ns"]), c0)
+        self.assertAlmostEqual(int(r["laptop_steady_ns"]) - c0, self.off(c0), delta=1e6)
+        self.assertEqual(int(r["laptop_wall_ns"]) - int(r["laptop_steady_ns"]), int(1.8e18))
+        self.assertIn("sync_csv", m["files"])
+
+    def test_no_clock_url_falls_back(self):
+        res, m = self.run_stop()
+        sy = m["sync"]
+        self.assertFalse(sy["synced"])
+        self.assertEqual(sy["method"], "arrival-min (no clock service)")
+        self.assertIn("no --clock-log-url", sy["reason"])
+        rows = self.read_sync()
+        self.assertEqual(len(rows), self.N)
+        self.assertEqual(rows[0]["laptop_wall_ns"], "")
+        # fallback line contains the smallest transfer delay, so arrival - mapped is about 0
+        self.assertLess(abs(sy["transfer_delay_min_ms"]), 1.0)
+        self.assertTrue(any("not synced" in w for w in res["warnings"]))
+
+    def test_fetch_failure_does_not_break_stop(self):
+        def fetch(url, label, timeout):
+            raise OSError("connection refused")
+        res, m = self.run_stop(clock_log_url="http://x:50061/", fetch_clock=fetch)
+        self.assertTrue(m["mp4"]["ok"])
+        self.assertTrue((self.out / (self.stem + ".thalamus")).is_file())
+        self.assertFalse(m["sync"]["synced"])
+        self.assertIn("connection refused", m["sync"]["reason"])
+        self.assertEqual(len(self.read_sync()), self.N)
+
+    def test_clock_log_too_short_falls_back(self):
+        res, m = self.run_stop(clock_log_url="u", fetch_clock=lambda *a: ("l", self.analog[:1], []))
+        self.assertFalse(m["sync"]["synced"])
+        self.assertIn("not enough clock samples", m["sync"]["reason"])
+
+    def test_wrong_clock_warns(self):
+        # clock log 500 ms ahead of the true offset: frames seem to arrive before they were sent
+        def shifted(d):
+            return [dict(r, server_steady_ns=int(r["server_steady_ns"]) + d) for r in self.analog]
+        res, m = self.run_stop(clock_log_url="u", fetch_clock=lambda *a: ("l", shifted(500_000_000), self.ping))
+        self.assertTrue(m["sync"]["synced"])
+        self.assertLess(m["sync"]["transfer_delay_min_ms"], -400)
+        self.assertTrue(any("negative beyond" in w for w in m["sync"]["warnings"]), m["sync"])
+
+    def test_large_transfer_delay_warns(self):
+        def shifted(d):
+            return [dict(r, server_steady_ns=int(r["server_steady_ns"]) + d) for r in self.analog]
+        res, m = self.run_stop(clock_log_url="u", fetch_clock=lambda *a: ("l", shifted(-500_000_000), self.ping))
+        self.assertGreater(m["sync"]["transfer_delay_min_ms"], 400)
+        self.assertTrue(any("over 200 ms" in w for w in m["sync"]["warnings"]), m["sync"])
+
+    def test_cli_args(self):
+        a = rs.build_parser().parse_args(["--clock-log-url", "http://h:50061/", "--clock-label", "laptop", "stop"])
+        self.assertEqual((a.clock_log_url, a.clock_label), ("http://h:50061/", "laptop"))
+
+    def test_fetch_clock_log_against_local_http_server(self):
+        import threading
+        from http.server import ThreadingHTTPServer
+        import clock_logger as cl
+        d = Path(self.tmp.name) / "log"
+        d.mkdir()
+        (d / "laptop_analog.csv").write_text(",".join(cl.ANALOG_COLS) + "\n1,2,3,4\n")
+        (d / "laptop_ping.csv").write_text(",".join(cl.PING_COLS) + "\n1,2,,,5,,,\n")
+        (d / "secret.txt").write_text("no")
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), cl.make_handler(d))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        url = "http://127.0.0.1:%d/" % srv.server_address[1]
+        label, a, p = rs.fetch_clock_log(url, None, 5)
+        self.assertEqual(label, "laptop")
+        self.assertEqual(a[0]["server_steady_ns"], "4")
+        self.assertEqual(p[0]["t2"], "")
+        with self.assertRaises(Exception):
+            rs._http_get(url + "secret.txt", 5)
 
 
 class HelperTests(unittest.TestCase):

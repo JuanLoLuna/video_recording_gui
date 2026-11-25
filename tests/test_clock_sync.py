@@ -152,6 +152,104 @@ class AnalyzeDirTests(unittest.TestCase):
             self.assertLess(vr["current_steady"]["max_ms"], 5.0)
 
 
+def synth_clock_log(trailer, n_s=300, drift_ppm=12.0, offset_ns=4.2e14, seed=5, spikes=True):
+    """Analog and ping rows (dicts, as csv.DictReader gives them) for a server whose steady clock is
+    client + offset_ns + drift. Delays are random positive (exponential) with occasional spikes."""
+    rng = np.random.default_rng(seed)
+    base = 91_000_000_000_000
+    off = lambda c: offset_ns + drift_ppm * 1e-6 * (c - base)  # noqa: E731
+    analog, ping = [], []
+    for i in range(n_s):
+        c_send = base + i * 1_000_000_000
+        d = 400_000 + rng.exponential(1.2e6) + (30e6 if spikes and i % 17 == 0 else 0)
+        analog.append({"seq": i, "client_mono_ns": int(c_send + d), "server_wall_ns": int(1.8e18 + c_send + off(c_send)),
+                       "server_steady_ns": int(c_send + off(c_send))})  # server stamps at send
+    for i in range(n_s * 5):
+        t1 = base + i * 200_000_000
+        out_d = 300_000 + rng.exponential(1e6) + (20e6 if spikes and i % 23 == 0 else 0)
+        back_d = 300_000 + rng.exponential(1e6)
+        t2 = int(t1 + out_d + off(t1))
+        t3 = t2 + 20_000
+        t4 = int(t3 - off(t1) + back_d)
+        if trailer:
+            o, r = cl.offset_rtt(t1, t2, t3, t4)
+            ping.append({"seq": i, "t1": t1, "t2": t2, "t3": t3, "t4": t4, "rtt_ns": int(r),
+                         "offset_ns": f"{o:.1f}", "instance_id": "00000000000000ab"})
+        else:
+            ping.append({"seq": i, "t1": t1, "t2": "", "t3": "", "t4": t4, "rtt_ns": "",
+                         "offset_ns": "", "instance_id": ""})
+    return analog, ping, base, off
+
+
+class ServerExeTests(unittest.TestCase):
+    def test_server_exe_recovers_offset_and_drift(self):
+        analog, ping, base, off = synth_clock_log(trailer=False)
+        d = cl._arrays_from_rows(analog, ping)
+        out, fn = cl.fit_server_exe(d["client"], d["steady"], d["rtt_client"])
+        self.assertAlmostEqual(out["slope_ppm"], 12.0, delta=1.0)
+        t = np.linspace(base + 10e9, base + 290e9, 50)
+        err = (fn(t) - t) - off(t)
+        self.assertLess(float(np.max(np.abs(err))) / 1e6, 1.0)
+        self.assertEqual(out["n_kept"], 30)
+
+    def test_fit_mapping_uses_analog_without_trailer(self):
+        analog, ping, base, off = synth_clock_log(trailer=False)
+        fit = cl.fit_mapping(analog, ping)
+        self.assertEqual(fit["method"], "analog+half-rtt")
+        self.assertEqual(fit["instance_ids"], {})
+        self.assertAlmostEqual(fit["drift_ppm"], 12.0, delta=1.0)
+        c = [base + 100_000_000_000]
+        err = cl.map_client_to_server(fit, c)[0] - c[0] - off(c[0])
+        self.assertLess(abs(err) / 1e6, 1.0)
+        self.assertGreater(fit["uncertainty_ms"], 0)
+        self.assertAlmostEqual(fit["wall_minus_steady_median_ns"], 1.8e18, delta=1e3)
+
+    def test_fit_mapping_uses_pings_with_trailer(self):
+        analog, ping, base, off = synth_clock_log(trailer=True)
+        fit = cl.fit_mapping(analog, ping)
+        self.assertEqual(fit["method"], "pings")
+        self.assertEqual(list(fit["instance_ids"]), ["00000000000000ab"])
+        self.assertAlmostEqual(fit["drift_ppm"], 12.0, delta=1.0)
+        c = [base + 200_000_000_000]
+        err = cl.map_client_to_server(fit, c)[0] - c[0] - off(c[0])
+        self.assertLess(abs(err) / 1e6, 1.0)
+
+    def test_too_few_trailer_pings_fall_back_to_analog(self):
+        analog, ping, _b, _o = synth_clock_log(trailer=True)
+        fit = cl.fit_mapping(analog, ping[:150])   # 30 s of trailer pings: under 6 windows? 3 windows
+        self.assertEqual(fit["method"], "analog+half-rtt")
+
+    def test_too_little_data_raises(self):
+        analog, ping, _b, _o = synth_clock_log(trailer=False)
+        with self.assertRaises(ValueError):
+            cl.fit_mapping(analog[:1], [])
+
+    def test_served_files_joins_day_folders(self):
+        with tempfile.TemporaryDirectory() as d:
+            for day, rows in (("20261124", "1\n2\n"), ("20261125", "3\n4\n5")):
+                (Path(d) / day).mkdir()
+                (Path(d) / day / "x_analog.csv").write_text("h\n" + rows)
+            # last row of the newest file has no newline (half written): dropped
+            self.assertEqual(cl.served_files(d, "x_analog.csv"), b"h\n1\n2\n3\n4\n")
+            self.assertIsNone(cl.served_files(d, "y_ping.csv"))
+
+    def test_analyze_dir_reports_server_exe(self):
+        with tempfile.TemporaryDirectory() as d:
+            analog, ping, _b, _o = synth_clock_log(trailer=False)
+            with open(Path(d) / "s_analog.csv", "w") as f:
+                f.write(",".join(cl.ANALOG_COLS) + "\n")
+                for r in analog:
+                    f.write(",".join(str(r[c]) for c in cl.ANALOG_COLS) + "\n")
+            with open(Path(d) / "s_ping.csv", "w") as f:
+                f.write(",".join(cl.PING_COLS) + "\n")
+                for r in ping:
+                    f.write(",".join(str(r[c]) for c in cl.PING_COLS) + "\n")
+            rep, text = cl.analyze_dir(d)
+            self.assertAlmostEqual(rep["labels"]["s"]["server_exe"]["slope_ppm"], 12.0, delta=1.0)
+            self.assertNotIn("new", rep["labels"]["s"])
+            self.assertIn("SERVER-EXE", text)
+
+
 @unittest.skipUnless(HAVE_GRPC, "grpc / thalamus-neuro not installed")
 class ServerTests(unittest.TestCase):
     def test_ping_and_analog_end_to_end(self):

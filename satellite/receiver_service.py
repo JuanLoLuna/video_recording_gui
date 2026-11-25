@@ -7,6 +7,7 @@ Run inside the laptop's Thalamus conda env, while satellite/launch_receiver.bat 
   python satellite/receiver_service.py stop   [--output-dir D]
   python satellite/receiver_service.py status [--output-dir D]
   common options: --address localhost:50070  --certs satellite/certs
+  clock sync at stop: --clock-log-url http://<satellite>:50061/ [--clock-label LABEL]
 
 `start` points the receiver's STORAGE2 node `storage` at a staging file under
 <D>/.incomplete/<camera tag>/ and sets its `Running` true. `stop` sets `Running` false,
@@ -17,7 +18,16 @@ stream to mp4 (satellite/h264_to_mp4.py, needs `pip install av`), and only then 
   recording_YYYYMMDD_HHMMSS_sat<serial>.thalamus         (raw Thalamus recording, STORAGE2 file)
   recording_YYYYMMDD_HHMMSS_sat<serial>.thalamus.json    (its config sidecar, if STORAGE2 wrote one)
   recording_YYYYMMDD_HHMMSS_sat<serial>_stream_check.txt / .json
+  recording_YYYYMMDD_HHMMSS_sat<serial>_satellite_sync.csv        (one row per frame, clock mapping)
   recording_YYYYMMDD_HHMMSS_sat<serial>_satellite_manifest.json   (written last)
+
+Clock sync (plan step 3): with --clock-log-url, `stop` fetches the clock log that
+satellite/clock_logger.py serves on the satellite (<label>_analog.csv, <label>_ping.csv), fits the
+satellite-steady -> laptop-steady mapping (clock_logger.fit_mapping) and writes the sync CSV
+(frame_index, satellite_steady_ns, laptop_steady_ns, laptop_wall_ns, arrival_laptop_steady_ns) plus a
+`sync` block in the manifest. Without the option, or if the fetch or fit fails, stop still succeeds
+and the sync block says "not synced" with the reason; the CSV then holds the fallback estimate
+"arrival-min (no clock service)" (min-filtered time - remote_time line, no wall time).
 
 Every command also writes its result to <D>/receiver_service_last.json. Exit code is 0 on
 success, 1 on a refused or failed command.
@@ -31,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import csv
 import io
 import json
 import os
@@ -39,6 +50,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -48,6 +60,7 @@ for _p in (str(_HERE.parent), str(_HERE)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import clock_logger  # noqa: E402
 import stream_check  # noqa: E402
 from backend.disk_guard import (  # noqa: E402
     assess_disk,
@@ -70,6 +83,12 @@ STREAM_NODE = "sat_cam1"  # node name inside the recording (the Sources entry of
 DEFAULT_FPS = 15.0
 # H264 1280x1024 at 15 fps measured about 2 MB/s (7.2e9 B/h); overridable.
 DEFAULT_BYTES_PER_HOUR = 7_200_000_000
+CLOCK_PAD_NS = 120 * 10**9      # clock-log rows kept around the recording's remote_time range
+CLOCK_MIN_SPAN_NS = 60 * 10**9  # need at least this much clock-log time, else use all rows
+CLOCK_TIMEOUT_S = 15.0
+FALLBACK_METHOD = "arrival-min (no clock service)"
+SYNC_COLS = ["frame_index", "satellite_steady_ns", "laptop_steady_ns", "laptop_wall_ns",
+             "arrival_laptop_steady_ns"]
 STATE_FILE = "receiver_session.json"
 LAST_RESULT_FILE = "receiver_service_last.json"
 SCHEMA_VERSION = 1
@@ -262,6 +281,66 @@ def find_sidecar(raw: Path, stem: str) -> Optional[Path]:
     return None
 
 
+# ---------------------------------------------------------------- clock sync
+def _http_get(url: str, timeout: float) -> str:
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def fetch_clock_log(url: str, label: Optional[str] = None, timeout: float = CLOCK_TIMEOUT_S):
+    """Fetch <label>_analog.csv and <label>_ping.csv from the satellite's clock_logger HTTP server.
+    label None: use the only label listed at the root. Returns (label, analog_rows, ping_rows)."""
+    base = url if url.endswith("/") else url + "/"
+    if not label:
+        names = _http_get(base, timeout).split()
+        labels = sorted(n[:-len("_analog.csv")] for n in names if n.endswith("_analog.csv"))
+        if len(labels) != 1:
+            raise ServiceError("clock log lists %s label(s) %s; choose one with --clock-label"
+                               % (len(labels), labels))
+        label = labels[0]
+    rows = {}
+    for kind in ("analog", "ping"):
+        text = _http_get("%s%s_%s.csv" % (base, label, kind), timeout)
+        rows[kind] = list(csv.DictReader(io.StringIO(text)))
+    return label, rows["analog"], rows["ping"]
+
+
+def read_frames(raw: Path, node: str) -> list:
+    """[(arrival time, remote_time)] in ns, one per image record of `node`, in file order."""
+    return [(itime or rtime, rem)
+            for (n, rtime, _w, _h, _f, itime, rem), _st in stream_check.iter_image_records(raw) if n == node]
+
+
+def window_rows(analog, ping, lo, hi):
+    """Clock-log rows covering [lo, hi] (satellite steady ns) plus CLOCK_PAD_NS each side.
+    Widens to all rows when that gives under CLOCK_MIN_SPAN_NS of analog time. -> (a, p, widened)"""
+    a = [r for r in analog if lo - CLOCK_PAD_NS <= int(r["client_mono_ns"]) <= hi + CLOCK_PAD_NS]
+    p = [r for r in ping if str(r["t1"]) != "" and lo - CLOCK_PAD_NS <= int(r["t1"]) <= hi + CLOCK_PAD_NS]
+    span = (int(a[-1]["client_mono_ns"]) - int(a[0]["client_mono_ns"])) if len(a) > 1 else 0
+    if span >= CLOCK_MIN_SPAN_NS:
+        return a, p, False
+    return analog, ping, True
+
+
+def fallback_fit(frames) -> dict:
+    """Mapping from the recording alone: y = time - remote_time per frame, the minimum per 10 s
+    window (least delayed frame), Theil-Sen line. Includes the smallest transfer delay."""
+    import numpy as np
+    pts = [(rem, t - rem) for t, rem in frames if rem]
+    if len(pts) < 2:
+        raise ValueError("fewer than 2 frames with remote_time")
+    x = np.array([p[0] for p in pts], dtype=np.float64)
+    y = np.array([p[1] for p in pts], dtype=np.float64)
+    x0, y0 = float(x[0]), float(y[0])
+    k = clock_logger.select_max_per_window(x - x0, -(y - y0))  # max of -y = min of y
+    slope, icpt = clock_logger.theil_sen((x - x0)[k], (y - y0)[k])
+    return {"method": FALLBACK_METHOD, "slope": float(slope), "drift_ppm": float(slope * 1e6),
+            "uncertainty_ms": None, "n_samples": int(k.size), "n_rows": len(pts),
+            "span_s": float(x.max() - x.min()) / 1e9, "x0_ns": int(round(x0)),
+            "offset_at_x0_ns": y0 + icpt, "wall_minus_steady_median_ns": None,
+            "instance_ids": {}, "wall_jumps": 0, "warnings": []}
+
+
 # ---------------------------------------------------------------- the service
 class ReceiverService:
     def __init__(self, control: ThalamusControlBase, *, storage_node: str = STORAGE_NODE,
@@ -274,7 +353,10 @@ class ReceiverService:
                  disk_usage: Callable[[str], Any] = shutil.disk_usage,
                  runner: Callable[..., Any] = subprocess.run,
                  log: Callable[[str], None] = print,
-                 verify_start_s: float = 10.0):
+                 verify_start_s: float = 10.0,
+                 clock_log_url: Optional[str] = None, clock_label: Optional[str] = None,
+                 clock_timeout_s: float = CLOCK_TIMEOUT_S,
+                 fetch_clock: Callable[..., Any] = fetch_clock_log):
         self.control = control
         self.storage_node = storage_node
         self.camera_node = camera_node
@@ -289,6 +371,8 @@ class ReceiverService:
         # After Running=True, wait up to this long for STORAGE2's file to appear (0 = don't check).
         # Thalamus 1.0.66 once accepted Running=True without ever opening a file (2026-11-24).
         self.verify_start_s = verify_start_s
+        self.clock_log_url, self.clock_label = clock_log_url, clock_label
+        self.clock_timeout_s, self.fetch_clock = clock_timeout_s, fetch_clock
 
     # -- paths
     def session_paths(self, output_dir: Path, started_at: datetime) -> SessionPaths:
@@ -476,6 +560,8 @@ class ReceiverService:
 
         # (a) stream check, in staging
         check = self._stream_check(raw, staging, state)
+        # (a2) clock mapping, in staging (never fails the stop)
+        sync = self._clock_sync(raw, staging, stem, state["stream_node"], result)
         # (b) mp4, in staging
         mp4_tmp = staging / (stem + "-0000.mp4.part")
         mux = self._mux(raw, mp4_tmp, mux_timeout_s)
@@ -495,6 +581,11 @@ class ReceiverService:
                 dst = output_dir / name
                 replace_with_retry(Path(src), dst)
                 files[key] = self._file_info(dst)
+        if sync.get("csv_tmp"):
+            dst = output_dir / (stem + "_satellite_sync.csv")
+            replace_with_retry(Path(sync.pop("csv_tmp")), dst)
+            files["sync_csv"] = self._file_info(dst)
+            sync["csv"] = dst.name
         raw_dst = output_dir / (stem + ".thalamus")
         replace_with_retry(raw, raw_dst)  # rename keeps the modification time
         files["raw"] = self._file_info(raw_dst)
@@ -517,6 +608,7 @@ class ReceiverService:
             "stream_check": {k: check.get(k) for k in ("verdict", "reasons", "dropped_frames", "error")},
             "mp4": {"ok": mux["ok"], "error": mux.get("error"), "command": mux.get("command"),
                     "conversion": mux.get("conversion")},
+            "sync": sync,
             "files": files, "versions": installed_versions(),
             "warnings": state.get("warnings", []) + result["warnings"],
         }
@@ -530,6 +622,81 @@ class ReceiverService:
         result.update({"manifest": str(manifest_path), "files": files, "frames": check.get("frames"),
                        "fps": check.get("fps"), "verdict": check.get("verdict"),
                        "mp4_ok": mux["ok"], "mp4_error": mux.get("error")})
+
+    def _clock_sync(self, raw: Path, staging: Path, stem: str, node: str, result: dict) -> dict:
+        """Map every frame's satellite steady time to the laptop clock. Returns the manifest's
+        `sync` block (plus csv_tmp, the staged CSV). Any failure is recorded in the block."""
+        sync: dict = {"synced": False, "method": FALLBACK_METHOD, "clock_log_url": self.clock_log_url,
+                      "warnings": []}
+        try:
+            frames = read_frames(raw, node)
+        except Exception as exc:
+            sync["reason"] = "could not read frames: %s: %s" % (type(exc).__name__, exc)
+            return sync
+        stamped = [r for _t, r in frames if r]
+        fit = None
+        if not self.clock_log_url:
+            sync["reason"] = "no --clock-log-url given"
+        elif not stamped:
+            sync["reason"] = "frames carry no remote_time"
+        else:
+            try:
+                label, analog, ping = self.fetch_clock(self.clock_log_url, self.clock_label,
+                                                       self.clock_timeout_s)
+                a, p, widened = window_rows(analog, ping, min(stamped), max(stamped))
+                if widened:
+                    sync["warnings"].append("clock log has under 60 s of samples around the recording; "
+                                            "used all %d rows" % len(analog))
+                fit = clock_logger.fit_mapping(a, p)
+                fit["warnings"] = sync["warnings"] + fit["warnings"]
+                sync.update({"synced": True, "clock_label": label})
+            except Exception as exc:  # network, parsing, too little data: the recording is safe anyway
+                sync["reason"] = "clock log unusable: %s: %s" % (type(exc).__name__, exc)
+        if fit is None:
+            try:
+                fit = fallback_fit(frames)
+            except Exception as exc:
+                sync["reason"] += "; fallback failed: %s" % exc
+                result["warnings"].append("clock sync: " + sync["reason"])
+                return sync
+            fit["warnings"] = sync["warnings"]
+        mapped = clock_logger.map_client_to_server(fit, [r for _t, r in frames if r])
+        it = iter(mapped)
+        wall_off = fit["wall_minus_steady_median_ns"]
+        csv_path = staging / (stem + "_satellite_sync.csv")
+        delays = []
+        with open(csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(SYNC_COLS)
+            for i, (t, rem) in enumerate(frames):
+                if not rem:
+                    w.writerow([i, "", "", "", t])
+                    continue
+                m = next(it)
+                delays.append(t - m)
+                w.writerow([i, rem, m, "" if wall_off is None else m + int(round(wall_off)), t])
+        sync.update({"method": fit["method"], "drift_ppm": fit["drift_ppm"],
+                     "offset_at_start_ns": clock_logger.map_client_to_server(fit, [min(stamped)])[0] - min(stamped),
+                     "uncertainty_ms": fit["uncertainty_ms"], "samples": fit["n_samples"],
+                     "rows_used": fit["n_rows"], "span_s": fit["span_s"],
+                     "clock_instance_ids": list(fit["instance_ids"]),
+                     "wall_minus_steady_median_ns": wall_off, "csv_tmp": str(csv_path)})
+        if delays:
+            tmin = min(delays) / 1e6
+            sync["transfer_delay_min_ms"] = tmin
+            tol = fit["uncertainty_ms"] if fit["uncertainty_ms"] is not None else 1.0
+            if tmin < -tol:
+                fit["warnings"].append("transfer_delay_min_ms %.2f is negative beyond the uncertainty "
+                                       "(%.2f ms): mapping may be wrong" % (tmin, tol))
+            elif tmin > 200 and sync["synced"]:
+                fit["warnings"].append("transfer_delay_min_ms %.1f is over 200 ms: mapping may be wrong "
+                                       "or the laptop and server.exe clocks differ" % tmin)
+        sync["warnings"] = fit["warnings"]
+        if not sync["synced"]:
+            result["warnings"].append("clock sync: not synced (%s); fallback estimate written" % sync["reason"])
+        for wmsg in sync["warnings"]:
+            result["warnings"].append("clock sync: " + wmsg)
+        return sync
 
     @staticmethod
     def _file_info(p: Path) -> dict:
@@ -635,6 +802,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--bytes-per-hour", type=float, default=DEFAULT_BYTES_PER_HOUR)
     ap.add_argument("--verify-start-s", type=float, default=10.0,
                     help="seconds to wait for the recording file after start (0 = don't check)")
+    ap.add_argument("--clock-log-url", help="satellite clock_logger HTTP server, e.g. http://192.168.50.10:50061/ "
+                    "(stop maps the frames' satellite time to laptop time with it)")
+    ap.add_argument("--clock-label", help="label in the clock log (default: the only one found)")
+    ap.add_argument("--clock-timeout", type=float, default=CLOCK_TIMEOUT_S, help="seconds for each clock-log fetch")
     sub = ap.add_subparsers(dest="command", required=True)
     s = sub.add_parser("start")
     s.add_argument("--output-dir", required=True)
@@ -653,7 +824,8 @@ def main(argv=None, control: Optional[ThalamusControlBase] = None) -> int:
     control = control or ThalamusControl(a.address, a.certs)
     svc = ReceiverService(control, expected_fps=a.expected_fps,
                           bytes_per_hour=int(a.bytes_per_hour), camera_serial=a.serial,
-                          verify_start_s=a.verify_start_s)
+                          verify_start_s=a.verify_start_s, clock_log_url=a.clock_log_url,
+                          clock_label=a.clock_label, clock_timeout_s=a.clock_timeout)
     if a.command == "start":
         res = svc.start(a.output_dir, force=a.force)
     elif a.command == "stop":

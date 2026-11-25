@@ -177,6 +177,37 @@ open the new file; the name of the `.json` sidecar STORAGE2 writes (both `<file>
 which keys a REMOTE
 node exposes for Connected status; clean exit of the process (it ends with `os._exit`).
 
+## Clock sync (plan step 3)
+
+Maps each frame's satellite time (`remote_time`, the satellite's steady clock) to the laptop's steady and wall clocks.
+The clock service is Jarl's `server.exe` on the laptop (port 50050, the one the phones use); `clock_server.py` is only a test tool.
+
+On the satellite (its Thalamus 1.0.66 venv has grpc and numpy; `satellite_lan.sh up` opens TCP 50061):
+
+    ~/venv-thalamus-new/bin/python satellite/clock_logger.py --server laptop=192.168.50.20:50050 --out ~/clock_log --duration-s 0 --serve-port 50061
+
+It logs forever (one subfolder `~/clock_log/YYYYMMDD` per day) and serves the CSVs read-only on port 50061.
+On the laptop, add the URL to the receiver service (global option, before `stop`):
+
+    python satellite\receiver_service.py --clock-log-url http://192.168.50.10:50061/ stop --output-dir D:\recordings
+
+`--clock-label LABEL` is needed only if the logger measures several servers. server.exe needs Windows Firewall to allow
+inbound TCP 50050 from the satellite's network. Works with or without the `CLK1` ping trailer: with it the pings give the
+mapping ("pings"), without it the analog stream plus half the ping round trip does ("analog+half-rtt", about 0.1 to 0.8 ms
+off against a cable reference).
+
+At stop, `<stem>_satellite_sync.csv` has one row per frame: `frame_index`, `satellite_steady_ns` (remote_time),
+`laptop_steady_ns` (mapped), `laptop_wall_ns` (mapped plus the median Wall minus steady of the server; blank without clock
+service), `arrival_laptop_steady_ns` (`time`, when the frame reached the laptop). The manifest `sync` block holds `synced`,
+`method`, `drift_ppm` (satellite clock against laptop clock), `offset_at_start_ns` (laptop steady minus satellite steady at the
+first frame), `uncertainty_ms`, `samples`, `span_s`, `clock_instance_ids`, `transfer_delay_min_ms` and `warnings`.
+`transfer_delay_min_ms` = smallest (arrival time minus mapped time) over the frames: it should be small and not negative
+(warning if below minus the uncertainty or above 200 ms). If the clock log cannot be fetched or used, stop still succeeds, `synced`
+is false with a `reason`, and the CSV holds the fallback "arrival-min (no clock service)" (min-filtered `time - remote_time`
+line: includes the smallest transfer delay, no wall time).
+Offline: `python3 satellite/clock_logger.py analyze DIR` writes `report.txt/json` comparing CURRENT, CURRENT-STEADY, NEW and SERVER-EXE.
+A recording that spans midnight still works (the server joins the last 3 day folders).
+
 ## Open items (UNVERIFIED unless stated)
 
 - UNVERIFIED: which Thalamus version Jarl's computer runs. Both ends should use the same version; the

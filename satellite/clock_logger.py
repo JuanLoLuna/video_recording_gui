@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 """Log and compare two ways of mapping the satellite steady clock onto the laptop steady clock.
 
-Runs on the satellite (Linux).  Needs `pip install thalamus-neuro grpcio numpy`; the laptop must
-run satellite/clock_server.py (or, for the CURRENT method only, the Sleeve clock service).
+Runs on the satellite (Linux).  Needs `pip install thalamus-neuro grpcio numpy`.  The laptop runs
+Jarl's server.exe (Thalamus protocol, port 50050, the same one the phones use) or, as a test tool,
+satellite/clock_server.py.  Both work: server.exe's ping replies have no CLK1 trailer (the logger then
+writes ping rows with t1/t4 only and the SERVER-EXE method is used); a server with the trailer gives
+the NEW method as well.
 
 Clocks: satellite = time.monotonic_ns() (Linux CLOCK_MONOTONIC); laptop = time.perf_counter_ns()
 (Windows QueryPerformanceCounter).  Offsets are "server steady minus client steady".
 
 Log (one process measures several server addresses at the same time, e.g. cable and Wi-Fi):
-  python satellite/clock_logger.py --server cable=192.168.50.20:50060 --server wifi=10.1.2.3:50060 \\
-      --out DIR [--duration-s 600] [--pings-per-s 5]
+  python satellite/clock_logger.py --server laptop=192.168.50.20:50050 --out ~/clock_log \\
+      --duration-s 0 --serve-port 50061            (several --server LABEL=HOST:PORT are allowed)
+  Options: --duration-s N (default 0 = until Ctrl+C; then one subfolder DIR/YYYYMMDD per day),
+  --pings-per-s 5, --serve-port PORT / --serve-host 0.0.0.0 (read-only HTTP server for the CSVs and
+  events.log, so the laptop's receiver_service can fetch the clock log at stop; GET / lists the files;
+  a file name at the root returns the same-named files of DIR and its last 3 day folders joined).
   Per label it writes in DIR (flushed after every row):
     <label>_analog.csv  seq, client_mono_ns, server_wall_ns, server_steady_ns   (CURRENT method data)
-    <label>_ping.csv    seq, t1, t2, t3, t4, rtt_ns, offset_ns, instance_id     (NEW method data)
+    <label>_ping.csv    seq, t1, t2, t3, t4, rtt_ns, offset_ns, instance_id     (NEW method data;
+                        t2/t3/rtt/offset/instance_id are blank when the reply has no trailer)
     events.log          stream drops, reconnects, server instance-ID changes (also printed)
   NEW method per ping: t1 = client mono just before send, t4 = client mono on receipt, t2/t3 =
   server steady at receive/send (carried in the Pong payload trailer, layout in clock_server.py).
@@ -24,7 +32,12 @@ Analyze (needs only numpy):
   smart_sleeve_data_processing), CURRENT-STEADY (server steady vs client mono, same fit) and NEW
   (min-RTT ping per 10 s window, Theil-Sen line of offset vs t1), flags Wall jumps and writes
   report.txt and report.json into DIR.  Wall-based predictions are turned into steady time by
-  subtracting the median server (Wall - steady) so all methods are comparable.
+  subtracting the median server (Wall - steady) so all methods are comparable.  It also fits
+  SERVER-EXE (needs no trailer): y = server steady - client arrival over the analog messages, the
+  largest y (least delayed message) per 10 s window, Theil-Sen line, plus half of the 1st percentile
+  of the ping round trips t4 - t1 as one-way delay.
+  fit_mapping() below is what receiver_service.py uses at stop; it picks NEW when there are enough
+  trailer pings, else SERVER-EXE.
   --reference LABEL: compare each method with that label's NEW mapping over the run.
   --truth-zero: compare with the identity mapping (server steady == client steady), for loopback
   tests on one machine where the true offset and drift are exactly 0.
@@ -35,10 +48,13 @@ import csv
 import json
 import logging
 import math
+import re
 import signal
 import struct
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 logger = logging.getLogger("clock_logger")
@@ -212,6 +228,126 @@ def fit_new(t1, rtt, offset, window_ns=WINDOW_NS):
     return out, (lambda t: np.asarray(t, dtype=np.float64) + icpt + slope * (np.asarray(t, dtype=np.float64) - x0))
 
 
+def select_max_per_window(x, y, window_ns=WINDOW_NS):
+    """Indices of the largest y in each window of window_ns of x (windows start at min x)."""
+    import numpy as np
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    if x.size == 0:
+        return np.array([], dtype=int)
+    win = np.floor((x - x.min()) / window_ns).astype(np.int64)
+    keep = []
+    for w in np.unique(win):
+        idx = np.nonzero(win == w)[0]
+        keep.append(idx[np.argmax(y[idx])])
+    return np.array(sorted(keep), dtype=int)
+
+
+def fit_server_exe(client, steady, ping_rtt=None, window_ns=WINDOW_NS):
+    """SERVER-EXE method (no ping trailer needed).
+
+    y = server_steady - client_arrival of each analog message = offset - one-way delay, so the
+    largest y per window is the least delayed message.  Theil-Sen line through those (x and y are
+    centred on the first sample: ns values are ~1e14, float64 would lose digits otherwise), then
+    add the one-way delay estimate = half of the 1st percentile of the ping round trips t4 - t1
+    (client side only; ping_rtt in ns, any rows with t1 and t4).  Same result form as fit_new.
+    """
+    import numpy as np
+    client = np.asarray(client, dtype=np.float64)
+    steady = np.asarray(steady, dtype=np.float64)
+    if client.size < 2:
+        return None
+    order = np.argsort(client)
+    client, steady = client[order], steady[order]
+    x0 = float(client[0])
+    y0 = float(steady[0] - client[0])
+    x = client - x0
+    y = (steady - client) - y0
+    k = select_max_per_window(x, y, window_ns)
+    slope, icpt = theil_sen(x[k], y[k])
+    res = y[k] - (slope * x[k] + icpt)
+    if ping_rtt is not None and len(ping_rtt):
+        half_rtt = float(np.percentile(np.asarray(ping_rtt, dtype=np.float64), 1)) / 2
+    else:
+        half_rtt = 0.0
+    offset0 = y0 + icpt + half_rtt  # offset at x0
+    out = {"n_valid": int(client.size), "n_kept": int(k.size),
+           "slope_ppm": slope * 1e6, "offset_at_start_ms": offset0 / 1e6,
+           "half_rtt_ms": half_rtt / 1e6, "uncertainty_ms_median": half_rtt / 1e6,
+           "uncertainty_ms_max": half_rtt / 1e6}
+    out.update(_resid_stats_ms(res))
+    out["x0_ns"] = x0
+    out["offset0_ns"] = offset0
+    out["slope"] = slope
+    return out, (lambda t: np.asarray(t, dtype=np.float64) + offset0 + slope * (np.asarray(t, dtype=np.float64) - x0))
+
+
+MIN_PING_WINDOWS = 6   # at least 60 s of trailer pings, else fall back to the analog method
+
+
+def fit_mapping(analog_rows, ping_rows):
+    """Mapping satellite steady clock -> laptop steady clock from clock-log rows.
+
+    analog_rows / ping_rows: lists of dicts as csv.DictReader reads the logger's CSVs (values may
+    be strings or numbers).  Uses "pings" (NEW method) when there are at least MIN_PING_WINDOWS
+    windows of trailer pings from one server instance, else "analog+half-rtt" (SERVER-EXE).
+    Returns a dict:
+      method, slope, drift_ppm, uncertainty_ms, n_samples (kept windows), n_rows (rows used),
+      span_s, client_first_ns, client_last_ns, x0_ns, offset_at_x0_ns,
+      wall_minus_steady_median_ns (None without analog rows), instance_ids, wall_jumps, warnings.
+    The mapping is  laptop_steady(c) = c + offset_at_x0_ns + slope * (c - x0_ns)  for a satellite
+    steady time c (use map_client_to_server).  Raises ValueError when there is too little data.
+    """
+    import numpy as np
+    d = _arrays_from_rows(analog_rows, ping_rows)
+    warnings, insts = [], {}
+    fit = None
+    if d["t1"].size:
+        insts = {i: d["inst"].count(i) for i in sorted(set(d["inst"]), key=d["inst"].count, reverse=True)}
+        top = max(insts, key=insts.get)
+        sel = np.array([i == top for i in d["inst"]])
+        if len(insts) > 1:
+            warnings.append("clock server restarted during the log (instance IDs %s); used the most "
+                            "common one" % ", ".join(insts))
+        r = fit_new(d["t1"][sel], d["rtt"][sel], d["offset"][sel])
+        if r and r[0]["n_kept"] >= MIN_PING_WINDOWS:
+            fit = ("pings", r[0], d["t1"][sel])
+    if fit is None:
+        if d["client"].size < 2:
+            raise ValueError("not enough clock samples (%d analog rows, %d trailer pings)"
+                             % (d["client"].size, d["t1"].size))
+        r = fit_server_exe(d["client"], d["steady"], d["rtt_client"])
+        fit = ("analog+half-rtt", r[0], d["client"])
+        if d["rtt_client"].size == 0:
+            warnings.append("no ping round trips in the log: one-way delay not added (error up to a few ms)")
+    method, out, xs = fit
+    if out["n_kept"] < 2:
+        raise ValueError("not enough clock samples: only %d window(s) of data" % out["n_kept"])
+    if method == "pings":
+        slope, off0, x0 = out["slope_ppm"] / 1e6, out["offset_at_start_ms"] * 1e6, out["x0_ns"]
+    else:
+        slope, off0, x0 = out["slope"], out["offset0_ns"], out["x0_ns"]
+    wall_med, jumps = None, 0
+    if d["client"].size >= 2:
+        wall_med = float(np.median(d["wall"].astype(np.float64) - d["steady"].astype(np.float64)))
+        jumps = int(find_wall_jumps(d["wall"], d["steady"]).size)
+        if jumps:
+            warnings.append("server Wall clock jumped %d time(s) during the log; wall dates may be off" % jumps)
+    return {"method": method, "slope": float(slope), "drift_ppm": float(slope * 1e6),
+            "uncertainty_ms": float(out["uncertainty_ms_median"]), "n_samples": int(out["n_kept"]),
+            "n_rows": int(len(xs)), "span_s": float(xs.max() - xs.min()) / 1e9,
+            "client_first_ns": int(xs.min()), "client_last_ns": int(xs.max()),
+            "x0_ns": int(round(x0)), "offset_at_x0_ns": float(off0),
+            "wall_minus_steady_median_ns": wall_med, "instance_ids": insts,
+            "wall_jumps": jumps, "warnings": warnings}
+
+
+def map_client_to_server(fit, client_ns):
+    """Satellite steady ns (ints) -> laptop steady ns (ints), from a fit_mapping result."""
+    x0, off0, slope = fit["x0_ns"], fit["offset_at_x0_ns"], fit["slope"]
+    return [int(c) + int(round(off0 + slope * (int(c) - x0))) for c in client_ns]
+
+
 def compare_maps(pred, ref, grid):
     """Stats (ms) of pred(grid) - ref(grid)."""
     import numpy as np
@@ -229,22 +365,30 @@ def _read_csv(path):
     return rows
 
 
-def load_label(out_dir, label):
+def _arrays_from_rows(analog_rows, ping_rows):
+    """Parse csv rows (dicts) into arrays. Ping rows without trailer (t2 blank) count only for
+    rtt_client (t4 - t1 of every ping with a reply)."""
     import numpy as np
-    d = {"label": label}
-    ap = Path(out_dir) / f"{label}_analog.csv"
-    rows = _read_csv(ap) if ap.exists() else []
-    d["client"] = np.array([int(r["client_mono_ns"]) for r in rows], dtype=np.int64)
-    d["wall"] = np.array([int(r["server_wall_ns"]) for r in rows], dtype=np.int64)
-    d["steady"] = np.array([int(r["server_steady_ns"]) for r in rows], dtype=np.int64)
-    pp = Path(out_dir) / f"{label}_ping.csv"
-    rows = _read_csv(pp) if pp.exists() else []
-    d["ping_total"] = len(rows)
-    rows = [r for r in rows if r["t2"] != "" and r["instance_id"] != ""]
+    d = {}
+    d["client"] = np.array([int(r["client_mono_ns"]) for r in analog_rows], dtype=np.int64)
+    d["wall"] = np.array([int(r["server_wall_ns"]) for r in analog_rows], dtype=np.int64)
+    d["steady"] = np.array([int(r["server_steady_ns"]) for r in analog_rows], dtype=np.int64)
+    d["ping_total"] = len(ping_rows)
+    d["rtt_client"] = np.array([int(r["t4"]) - int(r["t1"]) for r in ping_rows
+                                if str(r["t1"]) != "" and str(r["t4"]) != ""], dtype=np.int64)
+    rows = [r for r in ping_rows if str(r["t2"]) != "" and str(r["instance_id"]) != ""]
     d["t1"] = np.array([int(r["t1"]) for r in rows], dtype=np.int64)
     d["rtt"] = np.array([int(r["rtt_ns"]) for r in rows], dtype=np.int64)
     d["offset"] = np.array([float(r["offset_ns"]) for r in rows], dtype=np.float64)
-    d["inst"] = [r["instance_id"] for r in rows]
+    d["inst"] = [str(r["instance_id"]) for r in rows]
+    return d
+
+
+def load_label(out_dir, label):
+    ap = Path(out_dir) / f"{label}_analog.csv"
+    pp = Path(out_dir) / f"{label}_ping.csv"
+    d = _arrays_from_rows(_read_csv(ap) if ap.exists() else [], _read_csv(pp) if pp.exists() else [])
+    d["label"] = label
     return d
 
 
@@ -258,12 +402,12 @@ def analyze_label(d):
     """Per-label fits (no reference comparison yet). Returns (result dict, predictors dict)."""
     import numpy as np
     res, preds = {}, {}
+    res["ping_rows"] = d["ping_total"]
     # NEW: keep only the most common server instance (a restart changes the server steady clock).
     if d["t1"].size:
         insts = sorted(set(d["inst"]), key=d["inst"].count, reverse=True)
         sel = np.array([i == insts[0] for i in d["inst"]])
         r = fit_new(d["t1"][sel], d["rtt"][sel], d["offset"][sel])
-        res["ping_rows"] = d["ping_total"]
         res["ping_with_reply"] = int(d["t1"].size)
         res["instance_ids"] = {i: d["inst"].count(i) for i in insts}
         if r:
@@ -279,6 +423,10 @@ def analyze_label(d):
         r = fit_current(d["client"], d["steady"])
         if r:
             res["current_steady"], preds["current_steady"] = r
+        r = fit_server_exe(d["client"], d["steady"], d["rtt_client"])
+        if r:
+            res["server_exe"], preds["server_exe"] = r
+            res["ping_round_trips_client_side"] = int(d["rtt_client"].size)
         jumps = find_wall_jumps(d["wall"], d["steady"])
         dd = d["wall"].astype(np.float64) - d["steady"].astype(np.float64)
         res["wall_jumps"] = {"count": int(jumps.size), "threshold_ms": WALL_JUMP_NS / 1e6,
@@ -322,8 +470,9 @@ def analyze_dir(out_dir, reference=None, truth_zero=False):
                     continue
                 results[l]["vs_reference"][m] = compare_maps(fn, ref_fn, grid)
     for l in labels:  # strip internal fields
-        if "new" in results[l]:
-            results[l]["new"].pop("x0_ns", None)
+        for m in ("new", "server_exe"):
+            for k in ("x0_ns", "offset0_ns", "slope"):
+                results[l].get(m, {}).pop(k, None)
     report = {"dir": str(out_dir), "reference": ref_name, "labels": results}
     Path(out_dir, "report.json").write_text(json.dumps(report, indent=2))
     text = format_report(report)
@@ -341,18 +490,22 @@ def format_report(rep):
          f"Reference: {rep['reference'] or 'none'}", ""]
     names = {"current_wall": "CURRENT (Wall vs client mono, fit_affine)",
              "current_steady": "CURRENT-STEADY (server steady vs client mono, fit_affine)",
-             "new": "NEW (min-RTT pings, Theil-Sen)"}
+             "new": "NEW (min-RTT pings, Theil-Sen)",
+             "server_exe": "SERVER-EXE (analog min-delay + half RTT, no trailer needed)"}
     for label, r in rep["labels"].items():
         L.append(f"=== {label} ===")
         L.append(f"analog rows: {r.get('analog_rows', 0)}   ping rows: {r.get('ping_rows', 0)} "
                  f"(with reply: {r.get('ping_with_reply', 0)})   instance IDs: {r.get('instance_ids', {})}")
-        for m in ("current_wall", "current_steady", "new"):
+        for m in ("current_wall", "current_steady", "new", "server_exe"):
             if m not in r:
                 L.append(f"{names[m]}: no data")
                 continue
             x = r[m]
             line = (f"{names[m]}: slope {x['slope_ppm']:+.3f} ppm, residual RMS {_f(x['rms_ms'], '{:.4f}')} ms, "
                     f"max {_f(x['max_ms'], '{:.4f}')} ms")
+            if m == "server_exe":
+                line += (f"; offset at start {x['offset_at_start_ms']:.4f} ms; kept {x['n_kept']}/{x['n_valid']}; "
+                         f"half RTT (1st percentile) {x['half_rtt_ms']:.4f} ms")
             if m == "new":
                 line += (f"; offset at start {x['offset_at_start_ms']:.4f} ms; kept {x['n_kept']}/{x['n_valid']}; "
                          f"uncertainty rtt/2 median {x['uncertainty_ms_median']:.4f} ms, max {x['uncertainty_ms_max']:.4f} ms")
@@ -371,7 +524,7 @@ def format_report(rep):
         if vr:
             L.append(f"Predicted mapping minus reference ({vr['reference']}), ms "
                      f"(Wall method converted to steady with the median Wall-steady):")
-            for m in ("current_wall", "current_steady", "new"):
+            for m in ("current_wall", "current_steady", "new", "server_exe"):
                 if m in vr:
                     s = vr[m]
                     L.append(f"  {names[m].split(' (')[0]:<15} median {s['median_ms']:+.4f}  RMS {s['rms_ms']:.4f}  max |.| {s['max_ms']:.4f}")
@@ -524,27 +677,81 @@ async def ping_loop(label, addr, rows, ev, stop, pings_per_s):
         backoff = min(backoff * 2, 10.0)
 
 
-async def run_logger(servers, out_dir, duration_s, pings_per_s, node_name):
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
-    ev = Events(out / "events.log")
-    stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stop.set)
-        except NotImplementedError:
+SERVE_NAME_RE = re.compile(r"^(?:[A-Za-z0-9_-]+_(?:analog|ping)\.csv|events\.log)$")
+DAY_RE = re.compile(r"^\d{8}$")
+
+
+def served_files(base, name, max_days=3):
+    """Bytes of `name` for the HTTP server: base/name and the same file in the last max_days day
+    folders (YYYYMMDD) of base, oldest first; the header line of a CSV is kept only once."""
+    base = Path(base)
+    days = sorted(p for p in base.iterdir() if p.is_dir() and DAY_RE.match(p.name))[-max_days:] if base.is_dir() else []
+    parts, header_seen = [], False
+    for folder in [base] + days:
+        f = folder / name
+        if not f.is_file():
+            continue
+        lines = f.read_bytes().splitlines(keepends=True)
+        if name.endswith(".csv") and lines:
+            if header_seen:
+                lines = lines[1:]
+            header_seen = True
+        parts.append(b"".join(lines if not lines or lines[-1].endswith(b"\n") else lines[:-1]))  # drop a half-written last row
+    return b"".join(parts) if parts else None
+
+
+def make_handler(base):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            name = self.path.split("?", 1)[0].lstrip("/")
+            if name == "":
+                names = sorted({p.name for d in [Path(base)] + [q for q in Path(base).glob("[0-9]" * 8) if q.is_dir()]
+                                for p in d.iterdir() if SERVE_NAME_RE.match(p.name)}) if Path(base).is_dir() else []
+                body = ("\n".join(names) + "\n").encode()
+            elif SERVE_NAME_RE.match(name):
+                body = served_files(base, name)
+            else:
+                body = None
+            if body is None:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
             pass
+    return Handler
+
+
+def start_http(base, host, port):
+    """Read-only HTTP server (stdlib) in a daemon thread; returns the server (call .shutdown())."""
+    srv = ThreadingHTTPServer((host, port), make_handler(base))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def _seconds_to_midnight():
+    now = time.localtime()
+    return 86400 - (now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec) + 0.5
+
+
+async def run_segment(servers, folder, seg_s, pings_per_s, node_name, stop):
+    """Log into `folder` until stop is set or seg_s seconds (None = no limit) have passed."""
+    folder.mkdir(parents=True, exist_ok=True)
+    ev = Events(folder / "events.log")
     writers, tasks = [], []
     for label, addr in servers:
-        a = Rows(out / f"{label}_analog.csv", ANALOG_COLS)
-        p = Rows(out / f"{label}_ping.csv", PING_COLS)
+        a = Rows(folder / f"{label}_analog.csv", ANALOG_COLS)
+        p = Rows(folder / f"{label}_ping.csv", PING_COLS)
         writers += [a, p]
         ev.log(label, f"measuring {addr} (monotonic_ns client clock), pings/s={pings_per_s}")
         tasks.append(asyncio.create_task(analog_loop(label, addr, a, ev, stop, node_name)))
         tasks.append(asyncio.create_task(ping_loop(label, addr, p, ev, stop, pings_per_s)))
     try:
-        await _sleep_or_stop(stop, duration_s if duration_s > 0 else None)
+        await _sleep_or_stop(stop, seg_s)
     finally:
         stop.set()
         for t in tasks:
@@ -554,7 +761,41 @@ async def run_logger(servers, out_dir, duration_s, pings_per_s, node_name):
             w.close()
         ev.log("all", "logger stopped")
         ev.f.close()
+
+
+async def run_logger(servers, out_dir, duration_s, pings_per_s, node_name, serve_port=None,
+                     serve_host="0.0.0.0"):
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    quit_ev = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, quit_ev.set)
+        except NotImplementedError:
+            pass
+    srv = start_http(out, serve_host, serve_port) if serve_port else None
+    if srv:
+        print(f"serving clock log of {out} on http://{serve_host}:{serve_port}/", flush=True)
+    try:
+        while not quit_ev.is_set():
+            seg = asyncio.Event()  # ends this segment; quit_ev ends the run
+            waiter = asyncio.create_task(_relay(quit_ev, seg))
+            if duration_s > 0:   # fixed run: one segment into DIR itself
+                await run_segment(servers, out, duration_s, pings_per_s, node_name, seg)
+                break
+            day = time.strftime("%Y%m%d")  # run until stopped: a new subfolder per local day
+            await run_segment(servers, out / day, _seconds_to_midnight(), pings_per_s, node_name, seg)
+            waiter.cancel()
+    finally:
+        if srv:
+            srv.shutdown()
     return 0
+
+
+async def _relay(src, dst):
+    await src.wait()
+    dst.set()
 
 
 def parse_server(s):
@@ -580,16 +821,20 @@ def main(argv=None):
         return 0
     ap = argparse.ArgumentParser(description="Log clock-mapping data from one or more Thalamus clock servers.")
     ap.add_argument("--server", action="append", type=parse_server, required=True, metavar="LABEL=HOST:PORT",
-                    help="repeatable, e.g. cable=192.168.50.20:50060")
+                    help="repeatable, e.g. laptop=192.168.50.20:50050")
     ap.add_argument("--out", required=True, help="output directory")
     ap.add_argument("--duration-s", type=float, default=0, help="0 = until Ctrl+C")
     ap.add_argument("--pings-per-s", type=float, default=5)
     ap.add_argument("--analog-node", default="", help="node name in the AnalogRequest (default empty)")
+    ap.add_argument("--serve-port", type=int, default=0,
+                    help="serve the CSVs and events.log read-only over HTTP on this port (default off; use 50061)")
+    ap.add_argument("--serve-host", default="0.0.0.0")
     args = ap.parse_args(argv)
     if len({l for l, _ in args.server}) != len(args.server):
         ap.error("duplicate label")
     try:
-        return asyncio.run(run_logger(args.server, args.out, args.duration_s, args.pings_per_s, args.analog_node))
+        return asyncio.run(run_logger(args.server, args.out, args.duration_s, args.pings_per_s, args.analog_node,
+                                      args.serve_port or None, args.serve_host))
     except KeyboardInterrupt:
         return 0
 
