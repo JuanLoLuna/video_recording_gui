@@ -158,7 +158,7 @@ not a true latency; only its drift and scatter are meaningful. Tests: `python -m
 
 Run inside the laptop's `thalamus` conda env while `launch_receiver.bat` is running and `sat_cam1` is Running:
 
-    python satellite\receiver_service.py start  --output-dir D:\recordings --serial 4103305000
+    python satellite\receiver_service.py --serial 4103305000 start --output-dir D:\recordings
     python satellite\receiver_service.py stop   --output-dir D:\recordings
     python satellite\receiver_service.py status --output-dir D:\recordings
 
