@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Satellite cameras window (phase 1): one status line, one Start/Stop button.
 
-Run on the receiving Windows laptop, inside the Thalamus conda env, while launch_receiver.bat (receiver
-Thalamus, node sat_cam1 Running) and the clock service (Sleeve server.exe or satellite\\clock_server.py)
-are running:
+Run on the receiving Windows laptop, inside the Thalamus conda env; nothing else needs starting by hand:
 
     python satellite\\satellite_window.py [--screenshot PATH --quit-after SECONDS]
 
-It does not launch those programs yet.  Start/Stop call receiver_service.ReceiverService in a worker
+On opening, a worker (a) starts the receiver Thalamus like launch_receiver.bat unless something already
+answers on receiver_address (its config is generated from receiver_config_template with satellite_address
+as the Address of every REMOTE node, written to configs/receiver.window.local.json; cwd and logs in
+satellite/logs/), (b) switches the camera node sat_cam1 on, (c) starts satellite\\clock_server.py unless
+something already answers on clock_server_port (e.g. Sleeve server.exe).  A child that dies shows red with
+the last log lines and is restarted by a later poll (at most once per 30 s).  On close only the children
+this window started are stopped.  Start/Stop call receiver_service.ReceiverService in a worker
 thread; the status line is polled every 2 s (receiver) and 10 s (satellite clock log).
 
 Settings: satellite/configs/window.local.json (git-ignored; created with these defaults on first run;
@@ -22,6 +26,12 @@ the "Settings..." button opens it in the OS editor; changes apply after restarti
   receiver_address   gRPC address of the receiver Thalamus on this laptop                "localhost:50070"
   certs_dir          folder with ca.pem, thalamus.internal.pem, thalamus.internal-key.pem;
                      "" = satellite/certs
+  start_receiver     start the receiver Thalamus here when nothing answers on receiver_address   true
+  show_thalamus_window  show the receiver Thalamus's own window (troubleshooting); false = it runs
+                     off screen (Qt offscreen platform), messages only in satellite/logs/receiver.log  false
+  start_clock_server start satellite/clock_server.py when nothing answers on clock_server_port  true
+  receiver_config_template  receiver Thalamus config to copy (relative to satellite/)            "configs/receiver.json"
+  clock_server_port  laptop port of the clock service (Sleeve server.exe uses 50050)            50050
 
 Colours: green = synced, receiver connected, (recording and file growing); orange = busy, or clock log's
 newest sample older than 10 s, or the recording file has not grown for 3 s; red = not synced, clock log
@@ -48,11 +58,11 @@ for _p in (str(_HERE.parent), str(_HERE)):
         sys.path.insert(0, _p)
 
 import window_logic as wl  # noqa: E402
+import window_processes as wp  # noqa: E402
 
 TICK_MS = 500
 RECEIVER_POLL_S = 2.0
 CLOCK_POLL_S = 10.0
-CONNECT_RETRY_S = 5.0
 COLORS = {wl.GREEN: "#2e9e44", wl.ORANGE: "#e08a00", wl.RED: "#d32f2f"}
 
 
@@ -75,9 +85,13 @@ class Controller:
         self.clock = wl.ClockMonitor(wl.clock_log_url(settings), settings["clock_label"])
         self.q: queue.Queue = queue.Queue()
         self.busy = None             # None | "starting" | "stopping"
-        self.connecting = False
+        self.supervising = False
         self.fetching = False
-        self.last_connect_try = -1e9
+        self.step = None             # what the setup worker is doing right now
+        self.camera_on = None
+        self.last_camera_try = -1e9
+        self.service_states: dict = {}
+        self.make_services()
         self.last_receiver_poll = -1e9
         self.last_clock_poll = -1e9
         self.receiver_error = None
@@ -91,6 +105,34 @@ class Controller:
         self.result_line = None      # (level, text) of the last start/stop
         self.close_after_stop = False
         self.settings_warning = None
+
+    def make_services(self):
+        s = self.settings
+        py = sys.executable
+        logs = _HERE / "logs"
+        no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        host, port = wp.split_address(s["receiver_address"])
+        certs = wl.certs_dir(s)
+        template, config_out = wp.resolve(s["receiver_config_template"]), _HERE / "configs" / "receiver.window.local.json"
+
+        def write_config():
+            import json
+            wp.write_json(config_out, wp.generate_receiver_config(
+                json.loads(template.read_text(encoding="utf-8")), s["satellite_address"]))
+
+        local = host in wp.LOCAL_HOSTS
+        recv_proc = wp.ManagedProcess(
+            "receiver", wp.receiver_command(py, config_out, certs, port), logs, logs / "receiver.log",
+            before_start=write_config, env=wp.receiver_env(bool(s["show_thalamus_window"])),
+            creationflags=0 if s["show_thalamus_window"] else no_window) if (s["start_receiver"] and local) else None
+        self.recv_svc = wp.Service("receiver", lambda: wp.port_open(host, port), recv_proc,
+                                   enabled=recv_proc is not None)
+        cport = int(s["clock_server_port"])
+        clock_proc = wp.ManagedProcess(
+            "clock server", wp.clock_server_command(py, _HERE / "clock_server.py", cport), logs,
+            logs / "clock_server.log", creationflags=no_window) if s["start_clock_server"] else None
+        self.clock_svc = wp.Service("clock server", lambda: wp.port_open("127.0.0.1", cport), clock_proc,
+                                    enabled=clock_proc is not None)
 
     def _default_service(self):
         s = self.settings
@@ -135,6 +177,9 @@ class Controller:
         if now - self.last_receiver_poll >= RECEIVER_POLL_S:
             self.last_receiver_poll = now
             self._poll_receiver(now)
+            if not self.supervising and self.busy is None:
+                self.supervising = True
+                self._spawn("supervise", self._supervise)
         if now - self.last_clock_poll >= CLOCK_POLL_S and not self.fetching:
             self.last_clock_poll = now
             self.fetching = True
@@ -149,12 +194,11 @@ class Controller:
             if name == "clock":
                 self.fetching = False
                 self.clock_result = res
-            elif name == "connect":
-                self.connecting = False
-                if res.get("ok"):
-                    self.receiver_error = None
-                else:
-                    self.receiver_error = res.get("error")
+            elif name == "supervise":
+                self.supervising = False
+                self.step = None
+                if res.get("error"):
+                    self.receiver_error = res["error"]
             elif name == "start":
                 self.busy = None
                 self.result_line = wl.start_result_line(res)
@@ -202,15 +246,37 @@ class Controller:
             if self.busy is None:
                 self.growth.reset()
                 self.rec_file = None
-        if not self.connected and not self.connecting and self.busy is None \
-                and now - self.last_connect_try >= CONNECT_RETRY_S:
-            self.last_connect_try = now
-            self.connecting = True
-            self._spawn("connect", self._connect)
+        try:
+            cam = c.get_node(self.rs.CAMERA_NODE) if self.connected else None
+            self.camera_on = None if cam is None else bool(cam.get("Running"))
+        except Exception:
+            self.camera_on = None
 
-    def _connect(self):
-        self.control.connect()   # bounded by its own 15 s timeout; raises ServiceError
-        return {"ok": True}
+    def _supervise(self):
+        """Worker: keep the clock server and receiver Thalamus up, connect, switch the camera on."""
+        now = time.monotonic()
+        step = None
+        states = {"clock": self.clock_svc.ensure(now), "receiver": self.recv_svc.ensure(now)}
+        self.service_states = states
+        if any(st["state"] == "starting" for st in states.values()):
+            step = " · ".join(st["text"] for st in states.values() if st["state"] == "starting")
+        self.step = step
+        err = None
+        if states["receiver"]["state"] in ("found", "started"):
+            try:
+                if not self.control.connected:
+                    self.step = "connecting to receiver…"
+                    self.control.connect()   # bounded by its own 15 s timeout; raises ServiceError
+                cam = self.control.get_node(self.rs.CAMERA_NODE)
+                if cam is None:
+                    err = "Thalamus has no node %r" % self.rs.CAMERA_NODE
+                elif not cam.get("Running") and now - self.last_camera_try >= 30.0:
+                    self.last_camera_try = now
+                    self.step = "switching camera on…"
+                    self.control.set_node_property(self.rs.CAMERA_NODE, "Running", True)
+            except Exception as exc:
+                err = wl._short(exc, 200)
+        return {"error": err}
 
     def _file_size(self):
         try:
@@ -227,12 +293,18 @@ class Controller:
     def view(self, now=None):
         now = time.monotonic() if now is None else now
         recording = self.recording or self.busy == "stopping"
+        states = dict(self.service_states)
+        service_errors = [st["text"] for st in states.values() if st["state"] == "error"]
         level, text = wl.decide_status({
             "busy": self.busy, "receiver_connected": self.connected, "recording": recording,
             "elapsed_s": (now - self.rec_t0) if self.rec_t0 is not None else 0,
             "rate_bps": self.growth.rate_bps, "stalled_s": self.growth.stalled_s(now),
-            "clock": self.clock_result})
+            "clock": self.clock_result, "step": self.step, "camera_on": self.camera_on,
+            "clock_server_note": next((st["text"] for k, st in states.items()
+                                       if k == "clock" and st["state"] in ("found", "started")), None),
+            "service_errors": service_errors})
         detail = [e for e in (self.settings_warning,
+                              *[st["error"] for st in states.values() if st["state"] == "error"],
                               None if self.connected else self.receiver_error,
                               (self.clock_result or {}).get("error")) if e]
         return {"level": level, "text": text, "detail": " | ".join(detail),
@@ -240,10 +312,16 @@ class Controller:
                 "button_enabled": self.busy is None, "result": self.result_line}
 
     def shutdown(self):
+        """Stop only the children this window started (receiver Thalamus, clock server)."""
         try:
             self.control.close()
         except Exception:
             pass
+        for svc in (self.recv_svc, self.clock_svc):
+            try:
+                svc.shutdown()
+            except Exception:
+                pass
 
 
 def build_window(ctrl: Controller, settings_path: Path):

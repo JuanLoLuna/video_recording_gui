@@ -208,25 +208,35 @@ line: includes the smallest transfer delay, no wall time).
 Offline: `python3 satellite/clock_logger.py analyze DIR` writes `report.txt/json` comparing CURRENT, CURRENT-STEADY, NEW and SERVER-EXE.
 A recording that spans midnight still works (the server joins the last 3 day folders).
 
-## Satellite window (phase 1)
+## Satellite window
 
-One small window instead of typing the receiver_service commands. It does NOT launch the receiver Thalamus or the clock
-service yet: start those as before (`clock_server.py` or server.exe, then `launch_receiver.bat` with `sat_cam1` Running), then in the
-`thalamus66` env:
+One window, one click: open it and nothing else needs starting by hand.
 
     python satellite\satellite_window.py
 
+On opening, a worker (the status line names each step) (1) starts the receiver Thalamus exactly like `launch_receiver.bat`, unless
+something already answers on `receiver_address` (then it is reused); its config is generated from `receiver_config_template` with
+`satellite_address` as the Address of every REMOTE node and written to `satellite/configs/receiver.window.local.json` (so cable or
+router is just the setting; `receiver.local.json` is not read); (2) switches the camera node `sat_cam1` on (the preview node stays
+off); (3) starts `clock_server.py` on `clock_server_port` unless something already answers there (for example Sleeve server.exe).
+Children run with their working folder and logs in `satellite/logs/` (git-ignored). A child that dies turns the line red with the
+last log lines; a later poll restarts it, at most once per 30 s. On close (after the "Stop recording?" question) only the children
+this window started are stopped; anything it found running is left alone. Set `start_receiver` / `start_clock_server` to false to
+turn the auto-start off.
+The receiver Thalamus runs with no window of its own (Qt offscreen platform); its messages go to `satellite/logs/receiver.log`.
+Set `show_thalamus_window` to true to see its window again for troubleshooting.
+
 The status line has a coloured dot: **green** = synced (clock fit with its uncertainty and the clock-log label), receiver connected,
-and while recording the file is growing; **orange** = starting/stopping, or the clock log's newest sample is over 10 s old, or the
-recording file has not grown for 3 s; **red** = not synced, clock log unreachable, or receiver not reachable (details in grey under it).
-One button starts or stops a recording (stop takes seconds: it converts the video and syncs the clock); a line below shows the result
-(frames, `synced +-x ms` or `NOT synced: reason`, output folder). The grey box is where the preview comes in phase 2. Closing the
-window while recording asks "Stop recording?".
+camera on, and while recording the file is growing; **orange** = a setup step running, starting/stopping, camera off, the clock log's
+newest sample over 10 s old, or the recording file not growing for 3 s; **red** = not synced, clock log unreachable, receiver not
+reachable, or a child process stopped (details in grey under it). One button starts or stops a recording (stop takes seconds: it
+converts the video and syncs the clock); a line below shows the result (frames, `synced +-x ms` or `NOT synced: reason`, output
+folder). The grey box is where the preview comes in a later phase.
 
 Settings live in `satellite/configs/window.local.json` (git-ignored, created with defaults on first run, opened by the "Settings..."
 button, applied after a restart); every key is described at the top of `satellite_window.py`. Logic without Qt is in
-`satellite/window_logic.py`; tests: `python -m unittest tests.test_window_logic`. Headless check:
-`QT_QPA_PLATFORM=offscreen python satellite/satellite_window.py --screenshot out.png --quit-after 5`.
+`window_logic.py` and `window_processes.py`; tests: `python -m unittest tests.test_window_logic tests.test_window_processes`.
+Headless check: `QT_QPA_PLATFORM=offscreen python satellite/satellite_window.py --screenshot out.png --quit-after 12`.
 
 ## Open items (UNVERIFIED unless stated)
 

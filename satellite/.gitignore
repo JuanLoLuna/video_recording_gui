@@ -3,3 +3,4 @@ certs/
 thalamus.db
 thalamus_*.log
 configs/*.local.json
+logs/
