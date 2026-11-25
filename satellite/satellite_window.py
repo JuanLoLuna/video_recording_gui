@@ -71,13 +71,6 @@ CLOCK_POLL_S = 10.0
 COLORS = {wl.GREEN: "#2e9e44", wl.ORANGE: "#e08a00", wl.RED: "#d32f2f"}
 
 
-def open_in_editor(path: Path) -> None:
-    if sys.platform.startswith("win"):
-        os.startfile(str(path))  # noqa: S606
-    else:
-        subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(path)])
-
-
 class Controller:
     """All state and background work; the Qt window only displays `view()` and calls the actions."""
 
@@ -385,16 +378,10 @@ def build_window(ctrl: Controller, settings_path: Path):
             self.preview_btn = QPushButton()
             self.preview_btn.setEnabled(ctrl.preview is not None)
             self.preview_btn.clicked.connect(self.toggle_preview)
-            self.settings_btn = QPushButton("Settings…")
-            self.settings_btn.clicked.connect(self.open_settings)
             row = QHBoxLayout()
             row.addWidget(self.button, 1)
             row.addWidget(self.preview_btn)
-            row.addWidget(self.settings_btn)
-            self.path_label = QLabel("Settings file: %s" % settings_path)
-            self.path_label.setStyleSheet("color: #777; font-size: 11px;")
-            self.path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            for w in (self.status, self.detail, row, self.result, self.preview, self.caption, self.path_label):
+            for w in (self.status, self.detail, row, self.result, self.preview, self.caption):
                 lay.addLayout(w) if isinstance(w, QHBoxLayout) else lay.addWidget(w)
             self.timer = QTimer(self)
             self.timer.timeout.connect(self.refresh)
@@ -459,14 +446,6 @@ def build_window(ctrl: Controller, settings_path: Path):
                 p.end()
                 pm = faded
             self.preview.setPixmap(pm)
-
-        def open_settings(self):
-            try:
-                wl.load_settings(settings_path)  # creates the file if missing
-                open_in_editor(settings_path)
-            except Exception as exc:
-                self.result.setText("Could not open %s: %s" % (settings_path, exc))
-                self.result.setStyleSheet("color: %s;" % COLORS[wl.RED])
 
         def maybe_close(self):
             if ctrl.close_after_stop and ctrl.busy is None and not ctrl.recording:

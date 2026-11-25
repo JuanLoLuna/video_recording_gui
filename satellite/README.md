@@ -239,8 +239,8 @@ Under the box: "picture 0.8 s old"; older than 5 s it greys out and says "no pic
 every 5 s. The status line shows `frames N/s` (frames arriving over the last 5 s); orange if the camera is on but no frames came for 5 s.
 It does not touch recording (a separate stream subscription).
 
-Settings live in `satellite/configs/window.local.json` (git-ignored, created with defaults on first run, opened by the "Settings..."
-button, applied after a restart); every key is described at the top of `satellite_window.py`. Logic without Qt is in
+Settings live in `satellite/configs/window.local.json` (git-ignored, created with defaults on first run; changes apply after a restart;
+a settings dialog will replace editing it); every key is described at the top of `satellite_window.py`. Logic without Qt is in
 `window_logic.py` and `window_processes.py`; tests: `python -m unittest tests.test_window_logic tests.test_window_processes`.
 Headless check: `QT_QPA_PLATFORM=offscreen python satellite/satellite_window.py --screenshot out.png --quit-after 12`.
 
