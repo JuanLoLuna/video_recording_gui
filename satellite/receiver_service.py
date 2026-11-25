@@ -273,7 +273,8 @@ class ReceiverService:
                  now: Callable[[], datetime] = datetime.now,
                  disk_usage: Callable[[str], Any] = shutil.disk_usage,
                  runner: Callable[..., Any] = subprocess.run,
-                 log: Callable[[str], None] = print):
+                 log: Callable[[str], None] = print,
+                 verify_start_s: float = 10.0):
         self.control = control
         self.storage_node = storage_node
         self.camera_node = camera_node
@@ -285,6 +286,9 @@ class ReceiverService:
             raise ValueError("camera serial %r cannot be used in a filename" % camera_serial)
         self.sleep, self.clock, self.now = sleep, clock, now
         self.disk_usage, self.runner, self.log = disk_usage, runner, log
+        # After Running=True, wait up to this long for STORAGE2's file to appear (0 = don't check).
+        # Thalamus 1.0.66 once accepted Running=True without ever opening a file (2026-11-24).
+        self.verify_start_s = verify_start_s
 
     # -- paths
     def session_paths(self, output_dir: Path, started_at: datetime) -> SessionPaths:
@@ -363,7 +367,26 @@ class ReceiverService:
         write_json_atomic(state_file, state)
         try:
             self.control.set_node_property(self.storage_node, "Output File", stem_path.as_posix())
+            if self.verify_start_s > 0:
+                self.sleep(0.5)  # let the new Output File settle before Running flips
             self.control.set_node_property(self.storage_node, "Running", True)
+            if self.verify_start_s > 0:
+                attempts = []
+                for attempt in (1, 2):
+                    if self._wait_for_file(staging, paths.stem, self.verify_start_s):
+                        break
+                    attempts.append(attempt)
+                    if attempt == 1:  # one retry: toggle Running off and on
+                        self.control.set_node_property(self.storage_node, "Running", False)
+                        self.sleep(1.0)
+                        self.control.set_node_property(self.storage_node, "Running", True)
+                else:
+                    self.control.set_node_property(self.storage_node, "Running", False)
+                    raise ServiceError(
+                        "storage is Running but no %s.YYYYMMDD.R file appeared in %s within %.0f s "
+                        "(tried twice); recording NOT started" % (paths.stem, staging, self.verify_start_s))
+                if attempts:
+                    result["warnings"].append("storage needed a restart before its file appeared")
         except ServiceError:
             with contextlib.suppress(OSError):
                 state_file.unlink()
@@ -371,6 +394,15 @@ class ReceiverService:
         result.update({"stem": paths.stem, "staging_dir": str(staging),
                        "output_file_set": stem_path.as_posix(), "state_file": str(state_file),
                        "started_at": state["started_at"]})
+
+    def _wait_for_file(self, staging: Path, stem: str, timeout_s: float) -> bool:
+        deadline = self.clock() + timeout_s
+        while True:
+            if find_recordings(staging, stem):
+                return True
+            if self.clock() >= deadline:
+                return False
+            self.sleep(0.25)
 
     # -- stop
     def locate_state(self, output_dir: Optional[Path]) -> tuple[Path, dict]:
@@ -601,6 +633,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--serial", help="satellite camera serial, used in the file tag (sat<serial>)")
     ap.add_argument("--expected-fps", type=float, default=DEFAULT_FPS)
     ap.add_argument("--bytes-per-hour", type=float, default=DEFAULT_BYTES_PER_HOUR)
+    ap.add_argument("--verify-start-s", type=float, default=10.0,
+                    help="seconds to wait for the recording file after start (0 = don't check)")
     sub = ap.add_subparsers(dest="command", required=True)
     s = sub.add_parser("start")
     s.add_argument("--output-dir", required=True)
@@ -618,7 +652,8 @@ def main(argv=None, control: Optional[ThalamusControlBase] = None) -> int:
     real = control is None
     control = control or ThalamusControl(a.address, a.certs)
     svc = ReceiverService(control, expected_fps=a.expected_fps,
-                          bytes_per_hour=int(a.bytes_per_hour), camera_serial=a.serial)
+                          bytes_per_hour=int(a.bytes_per_hour), camera_serial=a.serial,
+                          verify_start_s=a.verify_start_s)
     if a.command == "start":
         res = svc.start(a.output_dir, force=a.force)
     elif a.command == "stop":

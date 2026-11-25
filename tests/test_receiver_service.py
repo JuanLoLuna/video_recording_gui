@@ -68,7 +68,8 @@ def make_service(control, runner=ok_runner, free=10**12, sleep=lambda s: None, *
         return t[0]
     return rs.ReceiverService(
         control, camera_serial="4103305000", runner=runner, sleep=sleep, clock=clock,
-        disk_usage=lambda p: Usage(free * 2, free, free), log=lambda m: None, **kw)
+        disk_usage=lambda p: Usage(free * 2, free, free), log=lambda m: None,
+        **{"verify_start_s": 0, **kw})
 
 
 class StartTests(unittest.TestCase):
@@ -252,7 +253,7 @@ class StopTests(unittest.TestCase):
         self.assertIn("free_bytes", res)
 
     def test_cli_main_with_fake(self):
-        rc = rs.main(["--serial", "4103305000", "start", "--output-dir", str(self.out)], control=self.c)
+        rc = rs.main(["--serial", "4103305000", "--verify-start-s", "0", "start", "--output-dir", str(self.out)], control=self.c)
         self.assertEqual(rc, 0)
         self.assertTrue((self.out / "receiver_service_last.json").is_file())
 
@@ -277,6 +278,54 @@ class HelperTests(unittest.TestCase):
             finally:
                 rs.os.replace = real
             self.assertTrue(b.exists() and len(calls) == 3)
+
+
+
+class StartVerifyTests(unittest.TestCase):
+    """start() confirms STORAGE2 actually opened its file (Thalamus 1.0.66 once did not)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.out = Path(self.tmp.name) / "rec"
+        self.addCleanup(self.tmp.cleanup)
+        self.t = [0.0]
+
+    def _svc(self, control):
+        return make_service(control, verify_start_s=2.0)
+
+    def _writes_on_running(self, control, after_n_starts):
+        orig = control.set_node_property
+        starts = {"n": 0}
+
+        def set_prop(name, key, value):
+            orig(name, key, value)
+            if name == "storage" and key == "Running" and value is True:
+                starts["n"] += 1
+                if starts["n"] >= after_n_starts:
+                    stem = Path(control.nodes["storage"]["Output File"])
+                    Path(str(stem) + ".20261124.1").write_bytes(b"")
+        control.set_node_property = set_prop
+
+    def test_file_appears(self):
+        c = FakeControl()
+        self._writes_on_running(c, 1)
+        res = self._svc(c).start(self.out, started_at=T0)
+        self.assertTrue(res["ok"], res)
+        self.assertFalse(any("restart" in w for w in res["warnings"]))
+
+    def test_file_appears_after_one_restart(self):
+        c = FakeControl()
+        self._writes_on_running(c, 2)
+        res = self._svc(c).start(self.out, started_at=T0)
+        self.assertTrue(res["ok"], res)
+        self.assertTrue(any("restart" in w for w in res["warnings"]))
+
+    def test_no_file_is_an_error_and_storage_off(self):
+        c = FakeControl()
+        res = self._svc(c).start(self.out, started_at=T0)
+        self.assertFalse(res["ok"])
+        self.assertIn("NOT started", res["error"])
+        self.assertFalse(c.nodes["storage"]["Running"])
 
 
 if __name__ == "__main__":
