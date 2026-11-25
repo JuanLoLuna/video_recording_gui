@@ -31,6 +31,8 @@ the "Settings..." button opens it in the OS editor; changes apply after restarti
                      off screen (Qt offscreen platform), messages only in satellite/logs/receiver.log  false
   start_clock_server start satellite/clock_server.py when nothing answers on clock_server_port  true
   receiver_config_template  receiver Thalamus config to copy (relative to satellite/)            "configs/receiver.json"
+  preview_max_fps    keyframes decoded per second for the picture (0 = no preview); the picture comes
+                     from the H264 node sat_cam1 over the receiver connection, 640 px wide, grey   1
   clock_server_port  laptop port of the clock service (Sleeve server.exe uses 50050)            50050
 
 Colours: green = synced, receiver connected, (recording and file growing); orange = busy, or clock log's
@@ -59,6 +61,8 @@ for _p in (str(_HERE.parent), str(_HERE)):
 
 import window_logic as wl  # noqa: E402
 import window_processes as wp  # noqa: E402
+import preview as pv  # noqa: E402
+import preview_logic as pl  # noqa: E402
 
 TICK_MS = 500
 RECEIVER_POLL_S = 2.0
@@ -92,6 +96,8 @@ class Controller:
         self.last_camera_try = -1e9
         self.service_states: dict = {}
         self.make_services()
+        fps = float(settings.get("preview_max_fps", 1) or 0)
+        self.preview = pv.PreviewWorker(self.control, rs.CAMERA_NODE, fps) if fps > 0 else None
         self.last_receiver_poll = -1e9
         self.last_clock_poll = -1e9
         self.receiver_error = None
@@ -105,6 +111,10 @@ class Controller:
         self.result_line = None      # (level, text) of the last start/stop
         self.close_after_stop = False
         self.settings_warning = None
+
+    def start(self):
+        if self.preview:
+            self.preview.start()
 
     def make_services(self):
         s = self.settings
@@ -295,11 +305,13 @@ class Controller:
         recording = self.recording or self.busy == "stopping"
         states = dict(self.service_states)
         service_errors = [st["text"] for st in states.values() if st["state"] == "error"]
+        snap = self.preview.snapshot() if self.preview else None
+        stream = pl.stream_status(self.camera_on, snap["fps"], snap["frame_age_s"]) if snap else None
         level, text = wl.decide_status({
             "busy": self.busy, "receiver_connected": self.connected, "recording": recording,
             "elapsed_s": (now - self.rec_t0) if self.rec_t0 is not None else 0,
             "rate_bps": self.growth.rate_bps, "stalled_s": self.growth.stalled_s(now),
-            "clock": self.clock_result, "step": self.step, "camera_on": self.camera_on,
+            "clock": self.clock_result, "step": self.step, "camera_on": self.camera_on, "stream": stream,
             "clock_server_note": next((st["text"] for k, st in states.items()
                                        if k == "clock" and st["state"] in ("found", "started")), None),
             "service_errors": service_errors})
@@ -309,10 +321,12 @@ class Controller:
                               (self.clock_result or {}).get("error")) if e]
         return {"level": level, "text": text, "detail": " | ".join(detail),
                 "button": "Stop recording" if recording else "Start recording",
-                "button_enabled": self.busy is None, "result": self.result_line}
+                "button_enabled": self.busy is None, "result": self.result_line, "preview": snap}
 
     def shutdown(self):
         """Stop only the children this window started (receiver Thalamus, clock server)."""
+        if self.preview:
+            self.preview.stop()
         try:
             self.control.close()
         except Exception:
@@ -326,7 +340,7 @@ class Controller:
 
 def build_window(ctrl: Controller, settings_path: Path):
     from thalamus.qt import (QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QMessageBox,
-                             QTimer, Qt, QSizePolicy)
+                             QTimer, Qt, QSizePolicy, QImage, QPixmap, QPainter, QColor)
 
     class Window(QWidget):
         def __init__(self):
@@ -344,10 +358,13 @@ def build_window(ctrl: Controller, settings_path: Path):
             self.detail.setStyleSheet("color: #777;")
             self.result = QLabel("")
             self.result.setWordWrap(True)
-            self.preview = QLabel("preview — phase 2")
+            self.preview = QLabel("preview off")
             self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.preview.setFixedSize(640, 400)
             self.preview.setStyleSheet("background: #bdbdbd; color: #555; font-size: 18px;")
+            self.caption = QLabel("")
+            self.caption.setStyleSheet("color: #777;")
+            self.shown_seq = -1
             self.button = QPushButton()
             self.button.setMinimumHeight(40)
             self.button.clicked.connect(ctrl.toggle)
@@ -359,7 +376,7 @@ def build_window(ctrl: Controller, settings_path: Path):
             self.path_label = QLabel("Settings file: %s" % settings_path)
             self.path_label.setStyleSheet("color: #777; font-size: 11px;")
             self.path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            for w in (self.status, self.detail, row, self.result, self.preview, self.path_label):
+            for w in (self.status, self.detail, row, self.result, self.preview, self.caption, self.path_label):
                 lay.addLayout(w) if isinstance(w, QHBoxLayout) else lay.addWidget(w)
             self.timer = QTimer(self)
             self.timer.timeout.connect(self.refresh)
@@ -372,7 +389,8 @@ def build_window(ctrl: Controller, settings_path: Path):
                 v = ctrl.view()
             except Exception as exc:  # the window must never crash
                 v = {"level": wl.RED, "text": "internal error: %s" % wl._short(exc), "detail": "",
-                     "button": self.button.text() or "Start recording", "button_enabled": True, "result": None}
+                     "button": self.button.text() or "Start recording", "button_enabled": True, "result": None,
+                     "preview": None}
             self.status.setText('<span style="color:%s">●</span> %s' % (COLORS[v["level"]], v["text"]))
             self.detail.setText(v["detail"])
             self.detail.setVisible(bool(v["detail"]))
@@ -382,7 +400,35 @@ def build_window(ctrl: Controller, settings_path: Path):
                 lvl, txt = v["result"]
                 self.result.setText(txt)
                 self.result.setStyleSheet("color: %s;" % COLORS[lvl])
+            self.show_preview(v.get("preview"))
             self.maybe_close()
+
+        def show_preview(self, snap):
+            if snap is None:
+                return
+            age = snap["picture_age_s"]
+            self.caption.setText(pl.picture_caption(age, snap["error"]))
+            if snap["picture"] is None:
+                self.preview.setText(self.caption.text())
+                return
+            stale = pl.picture_state(age) == "stale"
+            key = (snap["picture_seq"], stale)
+            if key == self.shown_seq:
+                return
+            self.shown_seq = key
+            w, h, stride, data = snap["picture"]
+            img = QImage(data, w, h, stride, QImage.Format.Format_Grayscale8).copy()
+            pm = QPixmap.fromImage(img).scaled(self.preview.size(), Qt.AspectRatioMode.KeepAspectRatio,
+                                               Qt.TransformationMode.SmoothTransformation)
+            if stale:  # grey it out
+                faded = QPixmap(pm.size())
+                faded.fill(QColor("#bdbdbd"))
+                p = QPainter(faded)
+                p.setOpacity(0.3)
+                p.drawPixmap(0, 0, pm)
+                p.end()
+                pm = faded
+            self.preview.setPixmap(pm)
 
         def open_settings(self):
             try:
@@ -433,6 +479,7 @@ def main(argv=None) -> int:
     app = QApplication(sys.argv[:1])
     ctrl = Controller(settings)
     ctrl.settings_warning = warning
+    ctrl.start()
     win = build_window(ctrl, settings_path)
     win.show()
     if a.screenshot or a.quit_after:

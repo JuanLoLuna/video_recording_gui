@@ -231,7 +231,12 @@ camera on, and while recording the file is growing; **orange** = a setup step ru
 newest sample over 10 s old, or the recording file not growing for 3 s; **red** = not synced, clock log unreachable, receiver not
 reachable, or a child process stopped (details in grey under it). One button starts or stops a recording (stop takes seconds: it
 converts the video and syncs the clock); a line below shows the result (frames, `synced +-x ms` or `NOT synced: reason`, output
-folder). The grey box is where the preview comes in a later phase.
+folder). The box shows a slow live picture of the satellite camera: the window subscribes to the image stream of node `sat_cam1`
+(the H264 one the receiver already pulls) over its existing Thalamus connection, looks only for keyframes (about one per second),
+decodes at most `preview_max_fps` of them (default 1; 0 = preview off; needs PyAV, `pip install av`) and shows them 640 px wide in grey.
+Under the box: "picture 0.8 s old"; older than 5 s it greys out and says "no picture (reason)"; a dropped stream is resubscribed
+every 5 s. The status line shows `frames N/s` (frames arriving over the last 5 s); orange if the camera is on but no frames came for 5 s.
+It does not touch recording (a separate stream subscription).
 
 Settings live in `satellite/configs/window.local.json` (git-ignored, created with defaults on first run, opened by the "Settings..."
 button, applied after a restart); every key is described at the top of `satellite_window.py`. Logic without Qt is in

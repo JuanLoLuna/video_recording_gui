@@ -35,6 +35,7 @@ DEFAULTS = {
     "start_clock_server": True,
     "receiver_config_template": "configs/receiver.json",
     "clock_server_port": 50050,
+    "preview_max_fps": 1,
 }
 PREFERRED_LABEL = "router"
 CLOCK_TAIL_S = 120          # seconds of clock-log rows kept for the fit
@@ -232,6 +233,7 @@ def decide_status(s: dict) -> tuple[str, str]:
     """(level, text) from a status dict. Keys (all optional):
     busy None|'starting'|'stopping'; receiver_connected; recording; elapsed_s; rate_bps; stalled_s;
     clock None (not fetched yet) or the ClockMonitor.poll() dict;
+    stream (preview worker: {running, fps, age_s, arriving}; replaces camera_on);
     step (what the setup worker is doing, e.g. "starting receiver…": orange); camera_on True/False/None;
     clock_server_note ("clock server: started here"); service_errors (list of short texts: red).
     red = not synced / receiver not reachable / clock log unreachable;
@@ -269,7 +271,14 @@ def decide_status(s: dict) -> tuple[str, str]:
         worse(RED)
         parts.append("receiver not reachable")
 
-    if s.get("receiver_connected") and s.get("camera_on") is not None:
+    st = s.get("stream")
+    if s.get("receiver_connected") and st is not None:      # frames really arriving (preview worker)
+        if st["arriving"]:
+            parts.append("frames %.0f/s" % st["fps"])
+        else:
+            worse(ORANGE)
+            parts.append("camera on, no frames" if st.get("running") else "camera off, no frames")
+    elif s.get("receiver_connected") and s.get("camera_on") is not None:
         if s["camera_on"]:
             parts.append("camera on")
         else:
